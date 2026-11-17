@@ -323,11 +323,138 @@ static uint16_t read_line(char *buf, uint16_t max_len) {
     }
 }
 
+static char char_upper(char c) {
+    if (c >= 'a' && c <= 'z') return (char)(c - ('a' - 'A'));
+    return c;
+}
+
+static int wildcard_match(const char *pattern, const char *text) {
+    const char *p = pattern;
+    const char *t = text;
+    const char *p_star = 0;
+    const char *t_star = 0;
+
+    if (!pattern || !text) return 0;
+
+    /* Special case: "*.*" matches everything in FAT environments */
+    if (pattern[0] == '*' && pattern[1] == '.' && pattern[2] == '*' && pattern[3] == '\0') {
+        return 1;
+    }
+
+    while (*t) {
+        if (*p == '?') {
+            p++;
+            t++;
+        } else if (*p == '*') {
+            p_star = p++;
+            t_star = t;
+        } else if (char_upper(*p) == char_upper(*t)) {
+            p++;
+            t++;
+        } else if (p_star) {
+            p = p_star + 1;
+            t = ++t_star;
+        } else {
+            return 0;
+        }
+    }
+    while (*p == '*') {
+        p++;
+    }
+    return (*p == '\0');
+}
+
+static int has_wildcards(const char *str) {
+    if (!str) return 0;
+    while (*str) {
+        if (*str == '*' || *str == '?') return 1;
+        str++;
+    }
+    return 0;
+}
+
+static void split_path_pattern(const char *src, char out_dir[64], char out_pattern[16]) {
+    const char *last_sep = 0;
+    const char *p = src;
+    uint16_t i;
+
+    while (*p) {
+        if (*p == '/' || *p == '\\' || *p == ':') {
+            last_sep = p;
+        }
+        p++;
+    }
+
+    if (!last_sep) {
+        out_dir[0] = '\0';
+        i = 0;
+        while (src[i] != '\0' && i < 15) {
+            out_pattern[i] = src[i];
+            i++;
+        }
+        out_pattern[i] = '\0';
+    } else {
+        uint16_t dir_len = (uint16_t)(last_sep - src);
+        if (*last_sep == ':') {
+            dir_len++;
+        } else if (dir_len == 0 && (*last_sep == '/' || *last_sep == '\\')) {
+            dir_len = 1;
+        } else if (last_sep > src && *(last_sep - 1) == ':') {
+            dir_len++;
+        }
+        for (i = 0; i < dir_len && i < 63; i++) {
+            out_dir[i] = src[i];
+        }
+        out_dir[i] = '\0';
+
+        p = last_sep + 1;
+        i = 0;
+        while (p[i] != '\0' && i < 15) {
+            out_pattern[i] = p[i];
+            i++;
+        }
+        out_pattern[i] = '\0';
+    }
+}
+
+static void combine_dir_file(const char *dir, const char *file, char out_path[64]) {
+    uint16_t i = 0;
+    uint16_t f = 0;
+
+    if (dir && dir[0] != '\0') {
+        while (dir[i] != '\0' && i < 48) {
+            out_path[i] = dir[i];
+            i++;
+        }
+        if (i > 0 && out_path[i - 1] != '/' && out_path[i - 1] != '\\') {
+            out_path[i++] = '/';
+        }
+    }
+    while (file[f] != '\0' && i < 63) {
+        out_path[i++] = file[f++];
+    }
+    out_path[i] = '\0';
+}
+
 static void cmd_ls(const char *path) {
     os_dir_entry_t dent;
     uint16_t idx = 0;
-    const char *dir_arg = (path && path[0] != '\0') ? path : 0;
+    char dir_buf[64];
+    char pattern_buf[16];
+    const char *dir_arg = 0;
+    const char *pattern = 0;
     os_vol_info_t vinfo;
+    uint16_t match_count = 0;
+
+    if (path && path[0] != '\0') {
+        if (has_wildcards(path)) {
+            split_path_pattern(path, dir_buf, pattern_buf);
+            dir_arg = (dir_buf[0] != '\0') ? dir_buf : 0;
+            pattern = pattern_buf;
+        } else {
+            dir_arg = path;
+        }
+    }
 
     for (;;) {
         int rc = os_dir_entry_at(dir_arg, idx, (os_dir_entry_t __far *)FP_HERE(&dent));
@@ -339,6 +466,13 @@ static void cmd_ls(const char *path) {
             }
             break;
         }
+        idx++;
+
+        if (pattern && !wildcard_match(pattern, dent.name)) {
+            continue;
+        }
+        match_count++;
+
         os_puts("  ");
         os_puts(dent.name);
         if (dent.attr & OS_ATTR_DIRECTORY) {
@@ -348,7 +482,6 @@ static void cmd_ls(const char *path) {
             print_uint16((uint16_t)dent.size);
             os_puts(" B\n");
         }
-        idx++;
     }
 
     /* Print Volume Total and Free Space */
@@ -514,14 +647,65 @@ static void cmd_rm(const char *path) {
         os_puts("Usage: rm <path>\n");
         return;
     }
-    if (os_file_delete(path) == 0) {
-        os_puts("Deleted ");
-        os_puts(path);
-        os_putc('\n');
-    } else {
-        os_puts("Cannot delete file: ");
-        os_puts(path);
-        os_putc('\n');
+
+    if (!has_wildcards(path)) {
+        if (os_file_delete(path) == 0) {
+            os_puts("Deleted ");
+            os_puts(path);
+            os_putc('\n');
+        } else {
+            os_puts("Cannot delete file: ");
+            os_puts(path);
+            os_putc('\n');
+        }
+        return;
+    }
+
+    {
+        char dir_buf[64];
+        char pattern_buf[16];
+        const char *dir_arg;
+        os_dir_entry_t dent;
+        uint16_t idx = 0;
+        uint16_t del_count = 0;
+
+        split_path_pattern(path, dir_buf, pattern_buf);
+        dir_arg = (dir_buf[0] != '\0') ? dir_buf : 0;
+
+        while (os_dir_entry_at(dir_arg, idx, (os_dir_entry_t __far *)FP_HERE(&dent)) == 0) {
+            char full_path[64];
+
+            if (dent.attr & OS_ATTR_DIRECTORY) {
+                idx++;
+                continue;
+            }
+
+            if (wildcard_match(pattern_buf, dent.name)) {
+                combine_dir_file(dir_buf, dent.name, full_path);
+                if (os_file_delete(full_path) == 0) {
+                    os_puts("Deleted ");
+                    os_puts(full_path);
+                    os_putc('\n');
+                    del_count++;
+                } else {
+                    os_puts("Cannot delete: ");
+                    os_puts(full_path);
+                    os_putc('\n');
+                    idx++;
+                }
+            } else {
+                idx++;
+            }
+        }
+
+        if (del_count == 0) {
+            os_puts("No matching files found: ");
+            os_puts(path);
+            os_putc('\n');
+        } else {
+            print_uint16(del_count);
+            os_puts(" file(s) deleted.\n");
+        }
     }
 }
 
@@ -539,7 +723,7 @@ static int is_existing_dir(const char *path) {
 static const char *path_basename(const char *path) {
     const char *base = path;
     while (*path) {
-        if (*path == '/' || *path == '\\') {
+        if (*path == '/' || *path == '\\' || *path == ':') {
             if (path[1] != '\0') {
                 base = path + 1;
             }
@@ -660,6 +844,65 @@ static void cmd_cp(char *arg_line) {
 
     if (num_srcs == 0) {
         os_puts("Usage: cp <src>[+<src2>...] <dst>\n");
+        return;
+    }
+
+    /* Wildcard source copy */
+    if (num_srcs == 1 && has_wildcards(srcs[0])) {
+        char dir_buf[64];
+        char pattern_buf[16];
+        const char *dir_arg;
+        os_dir_entry_t dent;
+        uint16_t idx = 0;
+        uint16_t copied_count = 0;
+
+        if (!is_existing_dir(dst_arg)) {
+            os_puts("Destination must be an existing directory: ");
+            os_puts(dst_arg);
+            os_putc('\n');
+            return;
+        }
+
+        split_path_pattern(srcs[0], dir_buf, pattern_buf);
+        dir_arg = (dir_buf[0] != '\0') ? dir_buf : 0;
+
+        while (os_dir_entry_at(dir_arg, idx++, (os_dir_entry_t __far *)FP_HERE(&dent)) == 0) {
+            char full_src[64];
+            char full_dst[64];
+
+            if (dent.attr & OS_ATTR_DIRECTORY) {
+                continue;
+            }
+            if (wildcard_match(pattern_buf, dent.name)) {
+                combine_dir_file(dir_buf, dent.name, full_src);
+                resolve_dest_path(dent.name, dst_arg, full_dst);
+
+                if (!confirm_overwrite(full_dst)) {
+                    continue;
+                }
+                if (os_file_copy(full_src, (const char __far *)FP_HERE(full_dst), 0) == 0) {
+                    os_puts("  ");
+                    os_puts(dent.name);
+                    os_puts(" -> ");
+                    os_puts(full_dst);
+                    os_putc('\n');
+                    copied_count++;
+                } else {
+                    os_puts("Failed to copy: ");
+                    os_puts(full_src);
+                    os_putc('\n');
+                }
+            }
+        }
+
+        if (copied_count == 0) {
+            os_puts("No matching files found: ");
+            os_puts(srcs[0]);
+            os_putc('\n');
+        } else {
+            print_uint16(copied_count);
+            os_puts(" file(s) copied.\n");
+        }
         return;
     }
 
@@ -1006,10 +1249,10 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
 
     /* Built-ins */
     if (str_eq(cmd, "help")) {
-        os_puts("Commands: help, ls [dir], lsdisk, cd <dir>, pwd, mkdir <dir>, rmdir <dir>,\n");
-        os_puts("          cat <file>, write [-a] [file] \"<text>\", cp <s[+s2]> <d>, mv <s> <d>,\n");
-        os_puts("          rm <file>, edit <file>, forth, set [VAR=VAL], echo [text|on|off],\n");
-        os_puts("          keyb [us|fr|be], mem, cls, <DEV:> (switch drive, e.g. HD0A:)\n");
+        os_puts("Commands: help, ls [dir|pat], lsdisk, cd <dir>, pwd, mkdir <dir>, rmdir <dir>,\n");
+        os_puts("          cat <file>, write [-a] [file] \"<text>\", cp <src> <dst>, mv <s> <d>,\n");
+        os_puts("          rm <path>, edit <file>, forth, set [VAR=VAL], echo [text|on|off],\n");
+        os_puts("          keyb [us|fr|be], mem, cls, <DEV:> (cp/rm/ls support * and ? wildcards)\n");
     } else if (str_eq(cmd, "set")) {
         cmd_set(rest);
     } else if (str_eq(cmd, "ls") || str_eq(cmd, "dir")) {

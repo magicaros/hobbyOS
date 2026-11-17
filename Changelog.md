@@ -1,5 +1,17 @@
 # Changelog
 
+## Revision 0.9 (2026-11-17)
+
+- **Wildcard Pattern Support in User-Space File Management Commands (`user/shell.c`)**:
+  - Implemented iterative, non-recursive classic wildcard pattern matcher (`wildcard_match`) for `*` and `?` patterns:
+    - Case-insensitive ASCII matching.
+    - Handles standard wildcard conventions (`*`, `?`, `*.*` matching all files including extensionless entries).
+    - Zero stack recursion, strictly safe for Intel 8088 real-mode stack limits.
+  - **`ls` / `dir`**: Supports path patterns (e.g. `ls *.BIN`, `ls /BIN/*.BIN`, `ls SYS:KEYMAPS/*.MAP`) to filter directory listings while preserving total and free storage cluster reporting.
+  - **`cp`**: Supports source wildcards (e.g. `cp /KEYMAPS/*.MAP HD1A:`, `cp *.TXT DOCS/`) to batch copy all matching files into destination directory or volume root, preserving original filenames.
+  - **`rm`**: Supports wildcard deletion (e.g. `rm *.BAK`, `rm /TEST/*.MAP`) with batch deletion counter, properly handling FAT16 in-place directory entry traversal when entries are deleted.
+  - Enhanced path helpers (`path_basename`, `split_path_pattern`, `combine_dir_file`) supporting AmigaDOS device prefixes (e.g. `SYS:`, `HD0A:`) alongside directory paths.
+
 ## Revision 0.8 (2026-11-17)
 
 - **AmigaDOS-Style Volume Architecture & Dynamic Storage Detection (`kernel/fat16.c`, `kernel/entry.asm`, `kernel/kernel.h`, `kernel/syscall.c`, `kernel/main.c`, `include/hobbyos.h`, `user/shell.c`, `user/hello.c`, `boot/boot.asm`)**:
