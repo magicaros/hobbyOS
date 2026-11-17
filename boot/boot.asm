@@ -146,6 +146,7 @@ found_kernel:
     mov ax, 0x0E4B                      ; Print 'K' (Kernel loaded from FAT16)
     int 0x10
 
+    mov dl, [bpb_drive_num]
     jmp 0x9000:0000
 
 not_found:

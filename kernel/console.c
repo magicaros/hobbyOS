@@ -16,14 +16,90 @@
 #define CGA_COLS      80
 #define CGA_ROWS      25
 #define CGA_CELLS     (CGA_COLS * CGA_ROWS)
-#define CRTC_INDEX    0x3D4
-#define CRTC_DATA     0x3D5
 
 static uint8_t  cur_row  = 0;
 static uint8_t  cur_col  = 0;
 static uint8_t  cur_attr = ATTR_DEFAULT;
 static uint8_t  cursor_visible = 1;
 static uint16_t cga_shadow[CGA_CELLS];
+
+static uint16_t active_video_type = VIDEO_TYPE_CGA;
+static uint16_t crtc_index_port   = 0x03D4;
+static uint16_t crtc_data_port    = 0x03D5;
+
+uint16_t video_detect_type(void) {
+    uint16_t vga_dcc = bios_get_vga_dcc();
+    uint16_t ega_info;
+    uint8_t mode;
+    volatile uint16_t __far *bda_equip;
+    volatile uint16_t __far *bda_crtc;
+
+    /* 1. Check for VGA via Display Combination Code (AX=0x1A00) */
+    if ((vga_dcc & 0xFF) == 0x1A) {
+        return VIDEO_TYPE_VGA;
+    }
+
+    /* 2. Check for EGA (AH=0x12, BL=0x10) */
+    ega_info = bios_get_ega_info();
+    if ((ega_info & 0xFF) != 0x10) {
+        return VIDEO_TYPE_EGA;
+    }
+
+    /* 3. Distinguish CGA vs MDA */
+    mode = bios_get_video_mode();
+    if (mode == 0x07) {
+        return VIDEO_TYPE_MDA;
+    }
+
+    /* Check BIOS Data Area Equipment Word at 0040:0010 (bits 4-5) */
+    bda_equip = (volatile uint16_t __far *)MK_FP(0x0040, 0x0010);
+    if (((*bda_equip >> 4) & 0x03) == 0x03) {
+        return VIDEO_TYPE_MDA;
+    }
+
+    /* Check BDA CRTC port at 0040:0063 */
+    bda_crtc = (volatile uint16_t __far *)MK_FP(0x0040, 0x0063);
+    if (*bda_crtc == 0x03B4) {
+        return VIDEO_TYPE_MDA;
+    }
+
+    return VIDEO_TYPE_CGA;
+}
+
+uint16_t video_get_type(void) {
+    return active_video_type;
+}
+
+const char *video_get_name(void) {
+    return os_video_name(active_video_type);
+}
+
+static uint8_t translate_attr(uint8_t attr) {
+    if (active_video_type != VIDEO_TYPE_MDA) {
+        return attr;
+    }
+    /*
+     * MDA attribute mapping:
+     * 0x00 = Non-display / hidden
+     * 0x01 = Underline
+     * 0x07 = Normal white on black
+     * 0x0F = High intensity / Bold
+     * 0x70 = Reverse video
+     */
+    if ((attr & 0x0F) == 0) {
+        return 0x00;
+    }
+    if ((attr & 0x70) != 0) {
+        return 0x70; /* Reverse video if background is non-black */
+    }
+    if ((attr & 0x08) != 0 || (attr & 0x07) >= 0x03) {
+        return 0x0F; /* High intensity / Bold */
+    }
+    if ((attr & 0x07) == 0x01) {
+        return 0x01; /* Blue -> Underline */
+    }
+    return 0x07;
+}
 
 void serial_init(void) {
     outb(COM1_BASE + 1, 0x00); /* Disable interrupts */
@@ -55,10 +131,10 @@ static void update_hw_cursor(void) {
         pos = (uint16_t)cur_row * CGA_COLS + cur_col;
     }
 
-    outb(CRTC_INDEX, 0x0E);
-    outb(CRTC_DATA, (uint8_t)(pos >> 8));
-    outb(CRTC_INDEX, 0x0F);
-    outb(CRTC_DATA, (uint8_t)(pos & 0xFF));
+    outb(crtc_index_port, 0x0E);
+    outb(crtc_data_port, (uint8_t)(pos >> 8));
+    outb(crtc_index_port, 0x0F);
+    outb(crtc_data_port, (uint8_t)(pos & 0xFF));
 }
 
 static void scroll_up(void) {
@@ -85,7 +161,7 @@ void con_clear(uint8_t attr) {
     uint16_t i;
 
     if (attr != 0) {
-        cur_attr = attr;
+        cur_attr = translate_attr(attr);
     }
     blank = ((uint16_t)cur_attr << 8) | ' ';
     for (i = 0; i < CGA_CELLS; i++) {
@@ -98,13 +174,36 @@ void con_clear(uint8_t attr) {
 }
 
 void con_init(void) {
-    cur_attr = ATTR_DEFAULT;
+    active_video_type = video_detect_type();
+
+    if (active_video_type == VIDEO_TYPE_MDA) {
+        video_vram_seg    = 0xB000;
+        video_has_snow    = 0;
+        video_status_port = 0x03BA;
+        crtc_index_port   = 0x03B4;
+        crtc_data_port    = 0x03B5;
+    } else if (active_video_type == VIDEO_TYPE_CGA) {
+        video_vram_seg    = 0xB800;
+        video_has_snow    = 1;
+        video_status_port = 0x03DA;
+        crtc_index_port   = 0x03D4;
+        crtc_data_port    = 0x03D5;
+    } else {
+        /* EGA or VGA */
+        video_vram_seg    = 0xB800;
+        video_has_snow    = 0;
+        video_status_port = 0x03DA;
+        crtc_index_port   = 0x03D4;
+        crtc_data_port    = 0x03D5;
+    }
+
+    cur_attr = translate_attr(ATTR_DEFAULT);
     cursor_visible = 1;
-    con_clear(ATTR_DEFAULT);
+    con_clear(cur_attr);
 }
 
 void con_set_attr(uint8_t attr) {
-    cur_attr = attr;
+    cur_attr = translate_attr(attr);
 }
 
 void con_set_cursor(uint8_t row, uint8_t col) {

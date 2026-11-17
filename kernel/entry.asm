@@ -17,6 +17,7 @@ extern _xms_dispatch
 section _TEXT class=CODE
 
 global _start
+global _boot_drive_num
 _start:
     cli
     mov ax, cs
@@ -24,12 +25,22 @@ _start:
     mov es, ax
     mov ss, ax
     mov sp, 0xFFFE
+    mov [_boot_drive_num], dl
     sti
     cld
     call _kmain
 .hang:
     hlt
     jmp .hang
+
+_boot_drive_num: db 0x80
+
+; uint8_t bios_get_boot_drive(void)
+global _bios_get_boot_drive
+_bios_get_boot_drive:
+    mov al, [_boot_drive_num]
+    xor ah, ah
+    ret
 
 ; void outb(uint16_t port, uint8_t val)
 global _outb
@@ -82,7 +93,7 @@ _fpu_8087_init:
     pop bp
     ret
 
-; int bios_disk_rw(uint8_t is_write, uint16_t cyl, uint8_t head, uint8_t sec, void __far *buf)
+; int bios_disk_rw(uint8_t drive, uint8_t is_write, uint16_t cyl, uint8_t head, uint8_t sec, void __far *buf)
 global _bios_disk_rw
 _bios_disk_rw:
     push bp
@@ -92,23 +103,23 @@ _bios_disk_rw:
     push dx
     push es
 
-    mov ax, [bp+6]          ; cyl
+    mov ax, [bp+8]          ; cyl
     mov ch, al              ; low 8 bits of cylinder
     ror ah, 1
     ror ah, 1
     and ah, 0xC0
-    mov cl, [bp+10]         ; sector (1..63)
+    mov cl, [bp+12]         ; sector (1..63)
     and cl, 0x3F
     or  cl, ah              ; combine high 2 bits of cylinder
 
-    mov dh, [bp+8]          ; head
-    mov dl, 0x80            ; first HDD (XT-IDE)
+    mov dh, [bp+10]         ; head
+    mov dl, [bp+4]          ; drive (0x00, 0x80, 0x81, etc.)
 
-    mov bx, [bp+12]         ; buffer offset
-    mov es, [bp+14]         ; buffer segment
+    mov bx, [bp+14]         ; buffer offset
+    mov es, [bp+16]         ; buffer segment
 
     mov ah, 0x02            ; BIOS read sectors
-    cmp byte [bp+4], 0
+    cmp byte [bp+6], 0
     je  .do_io
     mov ah, 0x03            ; BIOS write sectors
 .do_io:
@@ -122,6 +133,158 @@ _bios_disk_rw:
     xor ah, ah
 .done:
     pop es
+    pop dx
+    pop cx
+    pop bx
+    pop bp
+    ret
+
+; int bios_disk_rw_lba(uint8_t drive, uint8_t is_write, uint32_t lba, uint16_t spt, uint16_t heads, void __far *buf)
+global _bios_disk_rw_lba
+_bios_disk_rw_lba:
+    push bp
+    mov bp, sp
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+
+    ; Divide 32-bit LBA by sectors_per_track
+    mov ax, [bp+8]          ; LBA low word
+    mov dx, [bp+10]         ; LBA high word
+    mov bx, [bp+12]         ; spt
+    div bx                  ; AX = track, DX = sector - 1
+    inc dx                  ; DX = sector (1..63)
+    push dx                 ; save sector on stack
+
+    ; Divide track (AX) by heads
+    xor dx, dx
+    mov bx, [bp+14]         ; heads
+    div bx                  ; AX = cylinder, DX = head
+    mov dh, dl              ; DH = head
+
+    pop cx                  ; CL = sector (1..63)
+    and cl, 0x3F
+
+    ; Encode CH/CL
+    mov ch, al              ; CH = low 8 bits of cylinder
+    ror ah, 1
+    ror ah, 1
+    and ah, 0xC0
+    or  cl, ah              ; combine high 2 bits of cylinder with sector
+
+    mov dl, [bp+4]          ; drive
+
+    mov bx, [bp+16]         ; buffer offset
+    mov es, [bp+18]         ; buffer segment
+
+    mov ah, 0x02            ; BIOS read sectors
+    cmp byte [bp+6], 0
+    je  .do_lba_io
+    mov ah, 0x03            ; BIOS write sectors
+.do_lba_io:
+    mov al, 0x01            ; 1 sector
+    int 0x13
+    jc  .lba_err
+    xor ax, ax
+    jmp .lba_done
+.lba_err:
+    mov al, ah
+    xor ah, ah
+    test ax, ax
+    jnz .lba_done
+    mov ax, 1
+.lba_done:
+    pop es
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop bp
+    ret
+
+; int bios_get_drive_params(uint8_t drive, uint16_t *cyls, uint8_t *heads, uint8_t *spt, uint8_t *drives)
+global _bios_get_drive_params
+_bios_get_drive_params:
+    push bp
+    mov bp, sp
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push es
+
+    mov dl, [bp+4]          ; drive
+    mov ah, 0x08            ; Get Drive Parameters
+    xor di, di
+    mov es, di
+    int 0x13
+    jc  .err
+
+    push dx                 ; [sp+2] = DX (DH=max head, DL=num drives)
+    push cx                 ; [sp]   = CX (CH=cyl low, CL=cyl hi + spt)
+
+    ; Calculate total cylinders: max_cyl + 1
+    mov al, cl
+    rol al, 1
+    rol al, 1
+    and ax, 0x0003
+    mov ah, al
+    mov al, ch
+    inc ax                  ; AX = total cylinders
+
+    mov si, [bp+6]          ; cyls ptr
+    test si, si
+    jz  .no_cyls
+    mov [si], ax
+.no_cyls:
+
+    pop cx                  ; restore CX
+    pop dx                  ; restore DX
+
+    ; Calculate heads: DH + 1
+    mov al, dh
+    inc al
+    mov si, [bp+8]          ; heads ptr
+    test si, si
+    jz  .no_heads
+    mov [si], al
+.no_heads:
+
+    ; Calculate spt: CL & 0x3F
+    mov al, cl
+    and al, 0x3F
+    mov si, [bp+10]         ; spt ptr
+    test si, si
+    jz  .no_spt
+    mov [si], al
+.no_spt:
+
+    ; Number of drives: DL
+    mov al, dl
+    mov si, [bp+12]         ; drives ptr
+    test si, si
+    jz  .no_drives
+    mov [si], al
+.no_drives:
+
+    xor ax, ax              ; return 0 (success)
+    jmp .done
+
+.err:
+    mov al, ah              ; return BIOS error status in AX
+    xor ah, ah
+    test ax, ax
+    jnz .done
+    mov ax, 1               ; ensure non-zero if AH was 0
+.done:
+    pop es
+    pop di
+    pop si
     pop dx
     pop cx
     pop bx
@@ -325,8 +488,17 @@ _isr_int09:
     pop es
     iret
 
+; Video controller dynamic state (updated by con_init)
+global _video_vram_seg
+global _video_has_snow
+global _video_status_port
+
+_video_vram_seg:    dw 0xB800
+_video_has_snow:    dw 1
+_video_status_port: dw 0x03DA
+
 ; void cga_write_cell(uint16_t cell_idx, uint16_t cell_val)
-; Writes 1 character/attribute word to 0xB800 during CGA vertical or horizontal retrace
+; Writes 1 character/attribute word to text VRAM (0xB800 for CGA/VGA or 0xB000 for MDA)
 global _cga_write_cell
 _cga_write_cell:
     push bp
@@ -336,12 +508,16 @@ _cga_write_cell:
     push di
     push es
 
-    mov ax, 0xB800
+    mov ax, [_video_vram_seg]
     mov es, ax
     mov di, [bp+4]          ; cell_idx (0..1999)
     shl di, 1               ; byte offset in VRAM
     mov bx, [bp+6]          ; cell_val ((attr << 8) | ch)
-    mov dx, 0x03DA          ; CGA status register
+
+    cmp word [_video_has_snow], 0
+    je .write_now           ; On MDA, EGA, VGA: direct fast write without snow wait
+
+    mov dx, [_video_status_port]
 
 .wait_active:
     in  al, dx
@@ -367,7 +543,7 @@ _cga_write_cell:
     ret
 
 ; void cga_sync_copy(const uint16_t *src, uint16_t word_count)
-; Copies shadow buffer words from DS:src to 0xB800:0000 synchronized to CGA retrace
+; Copies shadow buffer words from DS:src to text VRAM
 global _cga_sync_copy
 _cga_sync_copy:
     push bp
@@ -379,12 +555,21 @@ _cga_sync_copy:
     push di
     push es
 
-    mov ax, 0xB800
+    mov ax, [_video_vram_seg]
     mov es, ax
     xor di, di
     mov si, [bp+4]          ; src pointer in kernel DS
     mov cx, [bp+6]          ; word_count
-    mov dx, 0x03DA          ; CGA status register
+
+    cmp word [_video_has_snow], 0
+    jne .snow_copy
+
+    cld
+    rep movsw
+    jmp .done
+
+.snow_copy:
+    mov dx, [_video_status_port]
 
 .copy_loop:
     mov bx, [si]            ; Pre-fetch word from system RAM before waiting for retrace
@@ -408,11 +593,62 @@ _cga_sync_copy:
     add di, 2
     loop .copy_loop
 
+.done:
     pop es
     pop di
     pop si
     pop dx
     pop cx
+    pop bx
+    pop bp
+    ret
+
+; uint16_t bios_get_vga_dcc(void) -> returns AL=0x1A, AH=BL if VGA present, 0 otherwise
+global _bios_get_vga_dcc
+_bios_get_vga_dcc:
+    push bp
+    mov bp, sp
+    push bx
+    mov ax, 0x1A00
+    int 0x10
+    cmp al, 0x1A
+    jne .not_vga
+    mov ah, bl
+    pop bx
+    pop bp
+    ret
+.not_vga:
+    xor ax, ax
+    pop bx
+    pop bp
+    ret
+
+; uint16_t bios_get_ega_info(void) -> returns AL=BL, AH=BH (if AL != 0x10, EGA present)
+global _bios_get_ega_info
+_bios_get_ega_info:
+    push bp
+    mov bp, sp
+    push bx
+    push cx
+    mov ah, 0x12
+    mov bl, 0x10
+    int 0x10
+    mov al, bl
+    mov ah, bh
+    pop cx
+    pop bx
+    pop bp
+    ret
+
+; uint8_t bios_get_video_mode(void) -> returns current video mode in AL
+global _bios_get_video_mode
+_bios_get_video_mode:
+    push bp
+    mov bp, sp
+    push bx
+    mov ah, 0x0F
+    int 0x10
+    xor ah, ah
     pop bx
     pop bp
     ret

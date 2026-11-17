@@ -33,6 +33,7 @@ typedef signed long    int32_t;
 #define SYS_FPU_PRESENT  0x09
 #define SYS_CURSOR_VISIBLE 0x0A
 #define SYS_CPU_TYPE     0x0B
+#define SYS_VIDEO_TYPE   0x0C
 
 /* CPU Types detected by hobbyOS */
 #define CPU_TYPE_8088     0  /* Intel 8088 (8-bit bus, 4-byte prefetch queue) */
@@ -43,6 +44,13 @@ typedef signed long    int32_t;
 #define CPU_TYPE_80186    5  /* Intel 80186 (16-bit bus, 6-byte prefetch queue) */
 #define CPU_TYPE_80286    6  /* Intel 80286 */
 #define CPU_TYPE_80386    7  /* Intel 80386+ */
+
+/* Video Card Types detected by hobbyOS */
+#define VIDEO_TYPE_UNKNOWN 0
+#define VIDEO_TYPE_MDA     1  /* IBM MDA / Monochrome (segment 0xB000, 80x25 text only) */
+#define VIDEO_TYPE_CGA     2  /* IBM CGA / Book8088 V1 (segment 0xB800, snow prevention active) */
+#define VIDEO_TYPE_EGA     3  /* IBM EGA (segment 0xB800, snow-free) */
+#define VIDEO_TYPE_VGA     4  /* IBM VGA / Book8088 V2 (segment 0xB800, snow-free) */
 
 #define SYS_FILE_READ    0x10
 #define SYS_FILE_WRITE   0x11
@@ -56,6 +64,8 @@ typedef signed long    int32_t;
 #define SYS_FILE_APPEND  0x19
 #define SYS_FILE_COPY    0x1A
 #define SYS_FILE_RENAME  0x1B
+#define SYS_VOL_INFO     0x1C
+#define SYS_VOL_SPACE    0x1D
 
 #define SYS_EXEC         0x20
 #define SYS_GET_PATH     0x21
@@ -121,6 +131,19 @@ typedef struct {
     uint8_t  attr;       /* FAT attribute byte */
     uint32_t size;       /* File size in bytes */
 } os_dir_entry_t;
+
+/* Volume info returned by SYS_VOL_INFO */
+typedef struct {
+    char     name[8];              /* Volume name (e.g. "HD0A", "SYS", "HD0") */
+    uint8_t  bios_drive;           /* BIOS drive number (0x80, 0x81, 0x00) */
+    uint8_t  part_idx;             /* Partition index (0..3, or 0xFF if raw/alias) */
+    uint8_t  is_alias;             /* 1 if volume is an alias */
+    char     target_name[8];       /* Target volume name if alias */
+    uint16_t total_clusters;       /* Total data clusters */
+    uint16_t free_clusters;        /* Free data clusters */
+    uint16_t sectors_per_cluster;  /* Sectors per cluster */
+    uint16_t bytes_per_sector;     /* Bytes per sector (512) */
+} os_vol_info_t;
 
 /* Keyboard layout translation table (.MAP file format, 392 bytes) */
 typedef struct {
@@ -258,6 +281,22 @@ static __inline const char *os_cpu_name(uint16_t type) {
     }
 }
 
+uint16_t os_video_type(void);
+#pragma aux os_video_type = \
+    "mov ah, 0x0C" \
+    "int 0x21" \
+    value [ax];
+
+static __inline const char *os_video_name(uint16_t type) {
+    switch (type) {
+    case VIDEO_TYPE_MDA: return "IBM MDA (Monochrome 80x25, 0xB000)";
+    case VIDEO_TYPE_CGA: return "IBM CGA (Color 80x25, 0xB800)";
+    case VIDEO_TYPE_EGA: return "IBM EGA (Color 80x25, 0xB800)";
+    case VIDEO_TYPE_VGA: return "IBM VGA (Color 80x25, 0xB800)";
+    default:             return "Unknown Video";
+    }
+}
+
 static __inline void os_require_fpu(void) {
     if (!os_fpu_present()) {
         os_puts("FPU not present\n");
@@ -343,6 +382,12 @@ int os_file_rename(const char *src_path, const char __far *dst_path);
     "mov ah, 0x1B" \
     "int 0x21" \
     parm [bx] [es di] value [ax];
+
+int os_vol_info(uint8_t index, os_vol_info_t __far *info);
+#pragma aux os_vol_info = \
+    "mov ah, 0x1C" \
+    "int 0x21" \
+    parm [bl] [es di] value [ax];
 
 int os_exec(const char *filename, const char *args);
 #pragma aux os_exec = \

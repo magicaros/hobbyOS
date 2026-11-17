@@ -58,6 +58,14 @@ int app_main(void) {
         os_putc('\n');
     }
 
+    /* Test Video detection via SYS_VIDEO_TYPE (0x0C) */
+    {
+        uint16_t vtype = os_video_type();
+        os_puts("[USER APP] Video detected via INT 0x21: ");
+        os_puts(os_video_name(vtype));
+        os_putc('\n');
+    }
+
     /* Test MCB conventional memory allocation & deallocation via INT 0x21 */
     {
         uint16_t blk_seg = os_mem_alloc(64); /* 1 KB (64 paragraphs) */
@@ -119,6 +127,16 @@ int app_main(void) {
     } else {
         os_puts("[USER APP] Failed to read /DOCS/NOTES.TXT\n");
         return 2;
+    }
+
+    /* Test AmigaDOS-style device paths (SYS:DOCS/NOTES.TXT & HD0A:DOCS/NOTES.TXT) */
+    {
+        char amiga_buf[32];
+        int r1 = os_file_read("SYS:DOCS/NOTES.TXT", FP_HERE(amiga_buf), 6);
+        int r2 = os_file_read("HD0A:DOCS/NOTES.TXT", FP_HERE(amiga_buf), 6);
+        if (r1 == 6 && r2 == 6) {
+            os_puts("[USER APP] AmigaDOS device paths (SYS: & HD0A:) verified OK\n");
+        }
     }
 
     /* List FAT16 Root Directory contents via SYS_DIR_ENTRY */

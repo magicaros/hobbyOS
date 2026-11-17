@@ -23,6 +23,16 @@
 static uint8_t cur_video_mode = OS_MODE_TEXT_80x25;
 
 int gfx_set_mode(uint8_t mode) {
+    if (video_get_type() == VIDEO_TYPE_MDA) {
+        if (mode == OS_MODE_TEXT_80x25 || mode == 0x07) {
+            bios_set_video_mode(0x07);
+            cur_video_mode = 0x07;
+            con_init();
+            return 0;
+        }
+        return -1; /* MDA does not support CGA color graphics modes */
+    }
+
     if (mode != OS_MODE_TEXT_80x25 &&
         mode != OS_MODE_CGA_320x200 &&
         mode != OS_MODE_CGA_320x200_ALT &&

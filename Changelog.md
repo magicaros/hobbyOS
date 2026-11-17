@@ -1,5 +1,47 @@
 # Changelog
 
+## Revision 0.8 (2026-11-17)
+
+- **AmigaDOS-Style Volume Architecture & Dynamic Storage Detection (`kernel/fat16.c`, `kernel/entry.asm`, `kernel/kernel.h`, `kernel/syscall.c`, `kernel/main.c`, `include/hobbyos.h`, `user/shell.c`, `user/hello.c`, `boot/boot.asm`)**:
+  - Implemented dynamic drive detection and AmigaDOS-style device naming:
+    - Floppy drives: `FD0:`, `FD1:` (BIOS drives 0x00, 0x01).
+    - Hard drives with MBR partitions: `HD0A:`–`HD0D:`, `HD1A:`–`HD1D:` (BIOS drives 0x80, 0x81; MBR partitions 0–3).
+    - Raw whole-drive / superfloppy volumes: `HD0:`, `HD1:`.
+    - Logical boot alias: **`SYS:`** pointing automatically to the boot volume.
+  - Path parsing supports both AmigaDOS conventions (`DEV:PATH` and `DEV:/PATH`), defaulting to the active volume when the device prefix is omitted.
+  - Per-volume current working directory tracking; switching devices with `cd DEV:` or entering `DEV:` alone at the shell prompt switches the active device.
+  - BIOS dynamic geometry discovery using pure 8086 `INT 0x13, AH=0x08` (extracting cylinders, heads, spt without 186+ instructions).
+  - Pure 8086 assembly 32-bit LBA disk read/write translation (`_bios_disk_rw_lba` in `kernel/entry.asm`) utilizing hardware `div bx` to eliminate runtime 32-bit math helpers (`__U4D`, `__I4D`, `__U4M`).
+  - Syscall `SYS_VOL_INFO` (`0x1C` / `os_vol_info()`) and `os_vol_info_t` struct returning volume name, BIOS drive, partition index, alias target, total clusters/KB, and free clusters/KB.
+  - Added `lsdisk` shell command listing discovered drives, partitions, aliases, sizes, and free space.
+  - `ls` / `dir` displays volume total clusters/KB and free clusters/KB summary line.
+  - Accelerated `vol_get_free_clusters` with sequential sector-level FAT scanning (100x speedup on 4.77 MHz 8088 hardware).
+  - Verified in `user/hello.c` with cross-device path reads (`SYS:DOCS/NOTES.TXT` and `HD0A:DOCS/NOTES.TXT`).
+
+## Revision 0.7 (2026-11-17)
+
+- **Video Controller Detection Hierarchy & MDA Fallback Subsystem (`kernel/console.c`, `kernel/entry.asm`, `kernel/gfx.c`, `kernel/syscall.c`, `kernel/main.c`, `include/hobbyos.h`, `user/mem.c`, `user/hello.c`)**:
+  - Implemented real-mode video controller probe hierarchy distinguishing VGA, EGA, CGA, and MDA:
+    - **VGA Check**: Calls BIOS `INT 0x10, AX=0x1A00` (Display Combination Code). If `AL == 0x1A` and active display `BL` is valid (`0x07` or `0x08`), identified as VGA (supports Book8088 V2 with Trident VGA as well as modern VGA clones).
+    - **EGA Check**: Calls BIOS `INT 0x10, AH=0x12, BL=0x10` (Get EGA Configuration). If `BL != 0x10` and `BL <= 3`, identified as EGA.
+    - **CGA vs. MDA Determination**:
+      - Inspects BIOS video mode via `INT 0x10, AH=0x0F` (Mode 7 is MDA monochrome text).
+      - Checks BIOS Data Area Equipment Word (`0x0040:0x0010` bits 4–5: `11b` = monochrome 80x25 at `0xB000`, `10b`/`01b` = CGA 80x25 / 40x25 at `0xB800`).
+      - Confirms via BDA CRTC base I/O port address (`0x0040:0x0063`: `0x3B4` for MDA, `0x3D4` for CGA).
+  - **Dynamic Video Subsystem & Zero-Snow Direct Copy**:
+    - Console and low-level routines use dynamic video parameters: `_video_vram_seg` (`0xB800` for CGA/EGA/VGA, `0xB000` for MDA), `_video_status_port` (`0x3DA` for CGA, `0x3BA` for MDA), and `_video_has_snow` (1 for discrete CGA, 0 for VGA/EGA/MDA).
+    - `_cga_sync_copy` dynamically checks `[_video_has_snow]`. On VGA, EGA, and MDA cards where video memory is dual-ported or snow-free, screen redraw bypasses retrace polling loops and executes a fast `cld; rep movsw`, dramatically speeding up full-screen updates.
+    - Hardware cursor manipulation (`update_hw_cursor`) dynamically addresses `0x3B4`/`0x3B5` on MDA or `0x3D4`/`0x3D5` on CGA/EGA/VGA.
+  - **MDA Monochrome Attribute Translation**:
+    - Automatically maps 16-color CGA text attributes to MDA hardware attributes (0x07 normal white on black, 0x0F bright white on black, 0x01 underline, 0x70 reverse video black on white, and preserve blinking bit 7) to ensure clean readability on monochrome monitors.
+  - **Graphics Guarding on MDA**:
+    - Guarded `gfx_set_mode` (`SYS_GFX_SET_MODE`) to reject CGA color graphics modes (0x04, 0x05, 0x06) when running on MDA hardware, returning `-1` error.
+    - Process exit restoration safely checks and restores Mode 7 text if running under MDA.
+  - **Public API & Diagnostics**:
+    - Added `SYS_VIDEO_TYPE` (`0x0C` / `os_video_type()`), constants `VIDEO_TYPE_UNKNOWN` (0), `VIDEO_TYPE_MDA` (1), `VIDEO_TYPE_CGA` (2), `VIDEO_TYPE_EGA` (3), `VIDEO_TYPE_VGA` (4), and helper `os_video_name()` in `include/hobbyos.h`.
+    - Boot banner displays detected video adapter model and snow-suppression status (`[VIDEO] Detected: IBM CGA (Color 80x25, 0xB800) (snow prevention active)` or `[VIDEO] Detected: IBM MDA (Monochrome 80x25, 0xB000) (monochrome text at 0xB000)`).
+    - Added `Video Adapter:` display to `/BIN/MEM.BIN` and self-test verification to `/BIN/HELLO.BIN`.
+
 ## Revision 0.6 (2026-11-16)
 
 - ** Changed i8087 FPU to x87 FPU detected at boot banner an in /BIN/MEM.BIN as we just check the fpu is present, unlike dectecting the CPU type, however fpu usually match there respective CPU.

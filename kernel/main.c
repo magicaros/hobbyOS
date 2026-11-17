@@ -56,6 +56,18 @@ void kmain(void) {
         con_puts("\n");
     }
 
+    con_puts("[VIDEO] Detected: ");
+    con_puts(video_get_name());
+    if (video_get_type() == VIDEO_TYPE_CGA) {
+        con_puts(" (snow prevention active)\n");
+    } else if (video_get_type() == VIDEO_TYPE_VGA || video_get_type() == VIDEO_TYPE_EGA) {
+        con_puts(" (snow-free)\n");
+    } else if (video_get_type() == VIDEO_TYPE_MDA) {
+        con_puts(" (monochrome text at 0xB000)\n");
+    } else {
+        con_puts("\n");
+    }
+
     mem_init();
     con_puts("[MEM MCB] Conventional arena 0x0060..0x8FFF initialized (");
     con_put_uint((uint32_t)(mem_avail_paragraphs() >> 6));
@@ -92,9 +104,31 @@ void kmain(void) {
     }
 
     if (fat16_init() == 0) {
-        con_puts("[FAT16 FS] Mounted HOBBYOS volume OK\n");
+        int v, total_v = vol_get_count();
+        con_puts("[STORAGE] Mounted volumes: ");
+        for (v = 0; v < total_v; v++) {
+            os_volume_t *vol = vol_get((uint8_t)v);
+            if (vol && vol->active) {
+                con_puts(vol->name);
+                con_putc(':');
+                if (vol->is_alias) {
+                    con_puts("->");
+                    if (vol->target_vol_idx < MAX_VOLUMES) {
+                        os_volume_t *tgt = vol_get(vol->target_vol_idx);
+                        if (tgt) {
+                            con_puts(tgt->name);
+                            con_putc(':');
+                        }
+                    }
+                }
+                if (v + 1 < total_v) {
+                    con_puts(", ");
+                }
+            }
+        }
+        con_puts(" OK\n");
     } else {
-        con_puts("[FAT16 FS] Mount FAILED\n");
+        con_puts("[STORAGE] Mount FAILED\n");
     }
 
     syscall_init();

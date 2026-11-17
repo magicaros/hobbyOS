@@ -48,6 +48,22 @@ static void print_uint16(uint16_t val) {
     }
 }
 
+static void print_hex_byte(uint8_t val) {
+    static const char hex[] = "0123456789ABCDEF";
+    os_putc(hex[(val >> 4) & 0x0F]);
+    os_putc(hex[val & 0x0F]);
+}
+
+static uint16_t clusters_to_kb(uint16_t clusters, uint8_t spc) {
+    uint16_t kb = clusters;
+    if (spc >= 2) {
+        kb *= (spc >> 1);
+    } else {
+        kb >>= 1;
+    }
+    return kb;
+}
+
 static int str_eq(const char *a, const char *b) {
     while (*a && *b) {
         if (*a != *b) {
@@ -311,6 +327,7 @@ static void cmd_ls(const char *path) {
     os_dir_entry_t dent;
     uint16_t idx = 0;
     const char *dir_arg = (path && path[0] != '\0') ? path : 0;
+    os_vol_info_t vinfo;
 
     for (;;) {
         int rc = os_dir_entry_at(dir_arg, idx, (os_dir_entry_t __far *)FP_HERE(&dent));
@@ -332,6 +349,55 @@ static void cmd_ls(const char *path) {
             os_puts(" B\n");
         }
         idx++;
+    }
+
+    /* Print Volume Total and Free Space */
+    if (os_vol_info(0xFF, (os_vol_info_t __far *)FP_HERE(&vinfo)) == 0) {
+        uint16_t total_kb = clusters_to_kb(vinfo.total_clusters, (uint8_t)vinfo.sectors_per_cluster);
+        uint16_t free_kb  = clusters_to_kb(vinfo.free_clusters, (uint8_t)vinfo.sectors_per_cluster);
+        os_puts("Volume ");
+        os_puts(vinfo.name);
+        os_puts(": ");
+        print_uint16(vinfo.total_clusters);
+        os_puts(" clusters (");
+        print_uint16(total_kb);
+        os_puts(" KB), ");
+        print_uint16(vinfo.free_clusters);
+        os_puts(" free (");
+        print_uint16(free_kb);
+        os_puts(" KB free)\n");
+    }
+}
+
+static void cmd_lsdisk(void) {
+    os_vol_info_t vinfo;
+    uint8_t i = 0;
+    os_puts("Discovered Storage Volumes:\n");
+    while (os_vol_info(i++, (os_vol_info_t __far *)FP_HERE(&vinfo)) == 0) {
+        os_puts("  ");
+        os_puts(vinfo.name);
+        os_puts(":\t");
+        if (vinfo.is_alias) {
+            os_puts("-> ");
+            os_puts(vinfo.target_name);
+            os_puts(": (Alias)\n");
+        } else {
+            uint16_t total_kb = clusters_to_kb(vinfo.total_clusters, (uint8_t)vinfo.sectors_per_cluster);
+            uint16_t free_kb  = clusters_to_kb(vinfo.free_clusters, (uint8_t)vinfo.sectors_per_cluster);
+            os_puts("Drive 0x");
+            print_hex_byte(vinfo.bios_drive);
+            if (vinfo.part_idx != 0xFF) {
+                os_puts(", Part ");
+                print_uint16((uint16_t)vinfo.part_idx);
+            } else {
+                os_puts(", Raw");
+            }
+            os_puts(" | ");
+            print_uint16(total_kb);
+            os_puts(" KB total (");
+            print_uint16(free_kb);
+            os_puts(" KB free)\n");
+        }
     }
 }
 
@@ -940,14 +1006,16 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
 
     /* Built-ins */
     if (str_eq(cmd, "help")) {
-        os_puts("Commands: help, ls [dir], cd <dir>, pwd, mkdir <dir>, rmdir <dir>,\n");
+        os_puts("Commands: help, ls [dir], lsdisk, cd <dir>, pwd, mkdir <dir>, rmdir <dir>,\n");
         os_puts("          cat <file>, write [-a] [file] \"<text>\", cp <s[+s2]> <d>, mv <s> <d>,\n");
         os_puts("          rm <file>, edit <file>, forth, set [VAR=VAL], echo [text|on|off],\n");
-        os_puts("          keyb [us|fr|be], mem, cls\n");
+        os_puts("          keyb [us|fr|be], mem, cls, <DEV:> (switch drive, e.g. HD0A:)\n");
     } else if (str_eq(cmd, "set")) {
         cmd_set(rest);
     } else if (str_eq(cmd, "ls") || str_eq(cmd, "dir")) {
         cmd_ls(rest);
+    } else if (str_eq(cmd, "lsdisk")) {
+        cmd_lsdisk();
     } else if (str_eq(cmd, "cd")) {
         cmd_cd(rest);
     } else if (str_eq(cmd, "pwd")) {
@@ -970,6 +1038,8 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
         cmd_run(rest);
     } else if (str_eq(cmd, "cls")) {
         os_cls(ATTR_DEFAULT);
+    } else if (cmd[0] != '\0' && cmd[str_len(cmd) - 1] == ':') {
+        cmd_cd(cmd);
     } else {
         /* Check for VAR=VAL shorthand */
         char *eq = cmd;
@@ -1116,11 +1186,10 @@ int app_main(void) {
 
     for (;;) {
         if (os_getcwd((char __far *)FP_HERE(cwd), sizeof(cwd)) != 0) {
-            cwd[0] = '/';
-            cwd[1] = '\0';
+            cwd[0] = 'S'; cwd[1] = 'Y'; cwd[2] = 'S'; cwd[3] = ':';
+            cwd[4] = '/'; cwd[5] = '\0';
         }
 
-        os_puts("hobbyOS:");
         os_puts(cwd);
         os_puts("> ");
 

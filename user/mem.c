@@ -277,5 +277,9 @@ int app_main(void) {
         os_puts("Not present (emulation required)\n");
     }
 
+    os_puts("Video Adapter:                   ");
+    os_puts(os_video_name(os_video_type()));
+    os_putc('\n');
+
     return 0;
 }

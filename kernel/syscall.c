@@ -91,7 +91,7 @@ static int resolve_exec_target(const char __far *input, char out_buf[48], const 
     }
 
     while (input[len] != '\0' && len < 24) {
-        if (input[len] == '/' || input[len] == '\\') {
+        if (input[len] == '/' || input[len] == '\\' || input[len] == ':') {
             has_slash = 1;
             has_dot   = 0;
         } else if (input[len] == '.') {
@@ -193,7 +193,7 @@ int exec_program(const char __far *filename, const char __far *args) {
         rc = proc_exec_far(user_seg, USER_INIT_SP);
 
         /* Restore 80x25 text console if the process exited while in CGA graphics mode */
-        if (gfx_get_mode() != OS_MODE_TEXT_80x25) {
+        if (gfx_get_mode() != OS_MODE_TEXT_80x25 && gfx_get_mode() != 0x07) {
             gfx_set_mode(OS_MODE_TEXT_80x25);
         } else {
             con_set_cursor_visible(1);
@@ -267,6 +267,10 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
 
     case SYS_CPU_TYPE:
         regs->ax = cpu_get_type();
+        break;
+
+    case SYS_VIDEO_TYPE:
+        regs->ax = video_get_type();
         break;
 
     case SYS_FILE_READ: {
@@ -356,6 +360,13 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         const char __far *src_path = (const char __far *)MK_FP(regs->ds, regs->bx);
         const char __far *dst_path = (const char __far *)MK_FP(regs->es, regs->di);
         regs->ax = (fat16_rename_file(src_path, dst_path) == 0) ? 0 : 0xFFFF;
+        break;
+    }
+
+    case SYS_VOL_INFO: {
+        os_vol_info_t __far *info = (os_vol_info_t __far *)MK_FP(regs->es, regs->di);
+        int res = vol_get_info((uint8_t)(regs->bx & 0xFF), info);
+        regs->ax = (res < 0) ? 0xFFFF : 0;
         break;
     }
 

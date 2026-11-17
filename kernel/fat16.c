@@ -7,8 +7,9 @@
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
  *
- * FAT16 hierarchical file system driver (subdirectories, CWD, path resolution,
- * read, write, create, delete, mkdir, rmdir, chdir, directory listing, and
+ * AmigaDOS-style storage volume manager and FAT16 hierarchical file system
+ * driver (dynamic BPB/MBR parsing, device paths DEV:PATH, subdirectories, CWD,
+ * read, write, append, create, delete, mkdir, rmdir, chdir, copy, rename, and
  * executable loading).
  */
 
@@ -29,6 +30,19 @@ typedef struct {
     uint16_t fst_clus_lo;
     uint32_t file_size;
 } fat16_dirent_t;
+
+typedef struct {
+    uint8_t  boot_indicator;
+    uint8_t  start_head;
+    uint8_t  start_sector;
+    uint8_t  start_cylinder;
+    uint8_t  part_type;
+    uint8_t  end_head;
+    uint8_t  end_sector;
+    uint8_t  end_cylinder;
+    uint32_t start_lba;
+    uint32_t total_sectors;
+} mbr_partition_t;
 #pragma pack(pop)
 
 #define FAT_ATTR_READ_ONLY 0x01
@@ -38,92 +52,86 @@ typedef struct {
 #define FAT_ATTR_DIRECTORY 0x10
 #define FAT_ATTR_ARCHIVE   0x20
 
-static uint16_t bpb_bytes_per_sector    = 512;
-static uint8_t  bpb_sectors_per_cluster = 4;
-static uint16_t bpb_reserved_sectors    = 1;
-static uint8_t  bpb_num_fats            = 2;
-static uint16_t bpb_root_entries        = 512;
-static uint16_t bpb_total_sectors       = 20808;
-static uint16_t bpb_sectors_per_fat     = 21;
-static uint16_t bpb_sectors_per_track   = 17;
-static uint16_t bpb_num_heads           = 4;
-static uint16_t bpb_hidden_sectors      = 0;
+static os_volume_t volumes[MAX_VOLUMES];
+static uint8_t     num_volumes     = 0;
+static uint8_t     current_vol_idx = 0;
+static uint8_t     fs_mounted      = 0;
 
-static uint16_t fat_lba        = 1;
-static uint16_t root_lba       = 43;
-static uint16_t root_sectors   = 32;
-static uint16_t data_lba       = 75;
-static uint16_t total_clusters = 5183;
-static uint8_t  fs_mounted     = 0;
+static uint8_t     cached_fat_vol  = 0xFF;
+static uint16_t    cached_fat_sec  = 0xFFFF;
+static uint8_t     fat_dirty       = 0;
 
-static uint16_t cwd_cluster    = 0; /* 0 = Root Directory (/) */
-static char     cwd_path[64]   = "/";
+static uint8_t     io_buf[512]     = {0};
+static uint8_t     fat_buf[512]    = {0};
 
-static uint8_t  io_buf[512]    = {0};
-static uint8_t  fat_buf[512]   = {0};
-static uint16_t cached_fat_sec = 0xFFFF;
-static uint8_t  fat_dirty      = 0;
+/* Forward declarations */
+static os_volume_t *resolve_vol_alias(os_volume_t *vol);
+static int fat_flush(void);
+static int fat_load_sector(os_volume_t *vol, uint16_t fat_sec_idx);
+static uint16_t fat_get_cluster(os_volume_t *vol, uint16_t cluster);
+static int fat_set_cluster(os_volume_t *vol, uint16_t cluster, uint16_t val);
+static int dir_get_sector_lba(os_volume_t *vol, uint16_t dir_cluster, uint16_t sec_idx, uint32_t *out_lba);
 
-static int disk_rw_lba(uint8_t is_write, uint16_t lba, void __far *buf) {
-    uint16_t track = lba / bpb_sectors_per_track;
-    uint16_t sec   = (lba % bpb_sectors_per_track) + 1;
-    uint16_t cyl   = track / bpb_num_heads;
-    uint16_t head  = track % bpb_num_heads;
-    return bios_disk_rw(is_write, cyl, head, sec, buf);
-}
+/* --- Low-Level Disk I/O Helpers --- */
 
 static uint16_t rd_le16(const uint8_t *p) {
     return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
 }
 
-static int fat_flush(void) {
-    uint8_t f;
-    if (!fat_dirty || cached_fat_sec == 0xFFFF) {
+static uint32_t rd_le32(const uint8_t *p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+static int vol_rw_lba(os_volume_t *vol, uint8_t is_write, uint32_t rel_lba, void __far *buf) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    return bios_disk_rw_lba(vol->bios_drive, is_write, vol->start_lba + rel_lba,
+                             vol->sectors_per_track, vol->num_heads, buf);
+}
+
+/* --- Volume Management Functions --- */
+
+int vol_get_count(void) {
+    return (int)num_volumes;
+}
+
+os_volume_t *vol_get(uint8_t idx) {
+    if (idx >= MAX_VOLUMES || !volumes[idx].active) {
         return 0;
     }
-    for (f = 0; f < bpb_num_fats; f++) {
-        uint16_t lba = fat_lba + (uint16_t)f * bpb_sectors_per_fat + cached_fat_sec;
-        if (disk_rw_lba(1, lba, MK_FP(KERNEL_SEG, fat_buf)) != 0) {
-            return -1;
+    return &volumes[idx];
+}
+
+os_volume_t *vol_get_current(void) {
+    if (current_vol_idx >= MAX_VOLUMES || !volumes[current_vol_idx].active) {
+        return 0;
+    }
+    return &volumes[current_vol_idx];
+}
+
+int vol_set_current(uint8_t idx) {
+    if (idx >= MAX_VOLUMES || !volumes[idx].active) {
+        return -1;
+    }
+    current_vol_idx = idx;
+    return 0;
+}
+
+static os_volume_t *resolve_vol_alias(os_volume_t *vol) {
+    int hops = 0;
+    while (vol && vol->active && vol->is_alias && hops < 4) {
+        if (vol->target_vol_idx >= MAX_VOLUMES) {
+            break;
         }
+        vol = &volumes[vol->target_vol_idx];
+        hops++;
     }
-    fat_dirty = 0;
-    return 0;
-}
-
-static int fat_load_sector(uint16_t fat_sec_idx) {
-    if (cached_fat_sec == fat_sec_idx) {
-        return 0;
-    }
-    if (fat_flush() != 0) {
-        return -1;
-    }
-    if (disk_rw_lba(0, fat_lba + fat_sec_idx, MK_FP(KERNEL_SEG, fat_buf)) != 0) {
-        return -1;
-    }
-    cached_fat_sec = fat_sec_idx;
-    return 0;
-}
-
-static uint16_t fat_get_cluster(uint16_t cluster) {
-    uint16_t sec_idx = cluster >> 8;
-    uint16_t off     = (cluster & 0xFF) << 1;
-    if (fat_load_sector(sec_idx) != 0) {
-        return 0xFFFF;
-    }
-    return (uint16_t)fat_buf[off] | ((uint16_t)fat_buf[off + 1] << 8);
-}
-
-static int fat_set_cluster(uint16_t cluster, uint16_t val) {
-    uint16_t sec_idx = cluster >> 8;
-    uint16_t off     = (cluster & 0xFF) << 1;
-    if (fat_load_sector(sec_idx) != 0) {
-        return -1;
-    }
-    fat_buf[off]     = (uint8_t)(val & 0xFF);
-    fat_buf[off + 1] = (uint8_t)(val >> 8);
-    fat_dirty = 1;
-    return 0;
+    return vol;
 }
 
 static char to_upper(char c) {
@@ -137,7 +145,233 @@ static int is_sep(char c) {
     return (c == '/' || c == '\\');
 }
 
-/* Convert a single path component ("foo.txt", ".", "..") into 11-byte 8.3 name */
+/* Compare two volume names ignoring case */
+static int vol_name_match(const char *name_in_vol, const char *name_query) {
+    int i = 0;
+    while (name_in_vol[i] != '\0' && name_query[i] != '\0') {
+        if (to_upper(name_in_vol[i]) != to_upper(name_query[i])) {
+            return 0;
+        }
+        i++;
+    }
+    return (name_in_vol[i] == '\0' && name_query[i] == '\0');
+}
+
+/*
+ * Resolve a path into its target volume and subpath.
+ * Supports:
+ *   "SYS:BIN/EDIT.BIN"   -> vol = SYS,   subpath = "/BIN/EDIT.BIN"
+ *   "HD0A:DOCS/TEST"     -> vol = HD0A,  subpath = "/DOCS/TEST"
+ *   "HD0A:"              -> vol = HD0A,  subpath = ""
+ *   "/BIN/EDIT.BIN"      -> vol = current, subpath = "/BIN/EDIT.BIN"
+ *   "EDIT.BIN"           -> vol = current, subpath = "EDIT.BIN"
+ */
+int vol_resolve_path(const char __far *path, os_volume_t **out_vol, const char __far **out_subpath) {
+    uint16_t colon_pos = 0xFFFF;
+    uint16_t i;
+    char dev_name[8];
+    uint8_t v;
+
+    if (!fs_mounted || !out_vol || !out_subpath) {
+        return -1;
+    }
+    if (!path || path[0] == '\0') {
+        *out_vol     = vol_get_current();
+        *out_subpath = "";
+        return (*out_vol != 0) ? 0 : -1;
+    }
+
+    /* Check for colon ':' in the path */
+    for (i = 0; i < 16 && path[i] != '\0'; i++) {
+        if (path[i] == ':') {
+            colon_pos = i;
+            break;
+        }
+    }
+
+    if (colon_pos != 0xFFFF) {
+        if (colon_pos >= sizeof(dev_name)) {
+            return -1;
+        }
+        for (i = 0; i < colon_pos; i++) {
+            dev_name[i] = path[i];
+        }
+        dev_name[colon_pos] = '\0';
+
+        /* Look up volume name */
+        for (v = 0; v < MAX_VOLUMES; v++) {
+            if (volumes[v].active && vol_name_match(volumes[v].name, dev_name)) {
+                *out_vol     = &volumes[v];
+                *out_subpath = path + colon_pos + 1;
+                return 0;
+            }
+        }
+        return -1; /* Unknown device */
+    }
+
+    /* No colon: use active volume */
+    *out_vol     = vol_get_current();
+    *out_subpath = path;
+    return (*out_vol != 0) ? 0 : -1;
+}
+
+uint16_t vol_get_free_clusters(os_volume_t *vol) {
+    uint16_t num_fat_secs;
+    uint16_t sec;
+    uint16_t free_count = 0;
+
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active || vol->total_clusters == 0) {
+        return 0;
+    }
+
+    num_fat_secs = (vol->total_clusters + 2 + 255) >> 8;
+    for (sec = 0; sec < num_fat_secs; sec++) {
+        uint16_t *entries;
+        int i;
+        int start_i = 0;
+        int end_i = 256;
+
+        if (fat_load_sector(vol, sec) != 0) {
+            break;
+        }
+        entries = (uint16_t *)fat_buf;
+        if (sec == 0) {
+            start_i = 2;
+        }
+        if (sec == num_fat_secs - 1) {
+            end_i = (vol->total_clusters + 2) & 0xFF;
+            if (end_i == 0) end_i = 256;
+        }
+        for (i = start_i; i < end_i; i++) {
+            if (entries[i] == 0x0000) {
+                free_count++;
+            }
+        }
+    }
+    return free_count;
+}
+
+int vol_get_info(uint8_t idx, os_vol_info_t __far *out_info) {
+    os_volume_t *vol;
+    os_volume_t *target;
+    int i;
+
+    if (!out_info) {
+        return -1;
+    }
+
+    if (idx == 0xFF) {
+        vol = vol_get_current();
+    } else if (idx < MAX_VOLUMES && volumes[idx].active) {
+        vol = &volumes[idx];
+    } else {
+        return -1;
+    }
+
+    if (!vol || !vol->active) {
+        return -1;
+    }
+
+    for (i = 0; i < 8; i++) {
+        out_info->name[i] = vol->name[i];
+    }
+    out_info->bios_drive = vol->bios_drive;
+    out_info->part_idx   = vol->part_idx;
+    out_info->is_alias   = vol->is_alias;
+
+    target = resolve_vol_alias(vol);
+    if (vol->is_alias && target) {
+        for (i = 0; i < 8; i++) {
+            out_info->target_name[i] = target->name[i];
+        }
+    } else {
+        out_info->target_name[0] = '\0';
+    }
+
+    if (target) {
+        out_info->total_clusters      = target->total_clusters;
+        out_info->free_clusters       = vol_get_free_clusters(target);
+        out_info->sectors_per_cluster = target->sectors_per_cluster;
+        out_info->bytes_per_sector    = target->bytes_per_sector;
+    } else {
+        out_info->total_clusters      = 0;
+        out_info->free_clusters       = 0;
+        out_info->sectors_per_cluster = 0;
+        out_info->bytes_per_sector    = 512;
+    }
+
+    return 0;
+}
+
+/* --- FAT Cache Management --- */
+
+static int fat_flush(void) {
+    uint8_t f;
+    os_volume_t *vol;
+    if (!fat_dirty || cached_fat_sec == 0xFFFF || cached_fat_vol >= MAX_VOLUMES) {
+        return 0;
+    }
+    vol = resolve_vol_alias(&volumes[cached_fat_vol]);
+    if (!vol || !vol->active) {
+        fat_dirty = 0;
+        return -1;
+    }
+    for (f = 0; f < vol->num_fats; f++) {
+        uint32_t lba = (uint32_t)vol->fat_lba + (uint16_t)((uint16_t)f * vol->sectors_per_fat) + cached_fat_sec;
+        if (vol_rw_lba(vol, 1, lba, MK_FP(KERNEL_SEG, fat_buf)) != 0) {
+            return -1;
+        }
+    }
+    fat_dirty = 0;
+    return 0;
+}
+
+static int fat_load_sector(os_volume_t *vol, uint16_t fat_sec_idx) {
+    uint8_t v_idx;
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    v_idx = (uint8_t)(vol - volumes);
+
+    if (cached_fat_sec == fat_sec_idx && cached_fat_vol == v_idx) {
+        return 0;
+    }
+    if (fat_flush() != 0) {
+        return -1;
+    }
+    if (vol_rw_lba(vol, 0, (uint32_t)vol->fat_lba + fat_sec_idx, MK_FP(KERNEL_SEG, fat_buf)) != 0) {
+        return -1;
+    }
+    cached_fat_sec = fat_sec_idx;
+    cached_fat_vol = v_idx;
+    return 0;
+}
+
+static uint16_t fat_get_cluster(os_volume_t *vol, uint16_t cluster) {
+    uint16_t sec_idx = cluster >> 8;
+    uint16_t off     = (cluster & 0xFF) << 1;
+    if (fat_load_sector(vol, sec_idx) != 0) {
+        return 0xFFFF;
+    }
+    return (uint16_t)fat_buf[off] | ((uint16_t)fat_buf[off + 1] << 8);
+}
+
+static int fat_set_cluster(os_volume_t *vol, uint16_t cluster, uint16_t val) {
+    uint16_t sec_idx = cluster >> 8;
+    uint16_t off     = (cluster & 0xFF) << 1;
+    if (fat_load_sector(vol, sec_idx) != 0) {
+        return -1;
+    }
+    fat_buf[off]     = (uint8_t)(val & 0xFF);
+    fat_buf[off + 1] = (uint8_t)(val >> 8);
+    fat_dirty = 1;
+    return 0;
+}
+
+/* --- Directory & Path Resolution Helpers --- */
+
 static int make_83_component(const char *comp, uint8_t out_name[11]) {
     int i;
     int pos = 0;
@@ -148,6 +382,7 @@ static int make_83_component(const char *comp, uint8_t out_name[11]) {
     for (i = 0; i < 11; i++) {
         out_name[i] = ' ';
     }
+
     if (comp[0] == '.' && comp[1] == '\0') {
         out_name[0] = '.';
         return 0;
@@ -228,81 +463,65 @@ static void fill_dirent_meta(fat16_dirent_t *ent, const uint8_t name83[11],
     ent->file_size      = size;
 }
 
-/* Map the sec_idx-th sector of directory dir_cluster (0 = Root, >=2 = Subdir) to LBA */
-static int dir_get_sector_lba(uint16_t dir_cluster, uint16_t sec_idx, uint16_t *out_lba) {
+static uint32_t cluster_to_lba(os_volume_t *vol, uint16_t cluster) {
+    uint32_t clus_offset;
+    uint8_t spc;
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return 0;
+    }
+    clus_offset = (uint32_t)(cluster - 2);
+    spc = vol->sectors_per_cluster;
+    while (spc > 1) {
+        clus_offset <<= 1;
+        spc >>= 1;
+    }
+    return (uint32_t)vol->data_lba + clus_offset;
+}
+
+static int dir_get_sector_lba(os_volume_t *vol, uint16_t dir_cluster, uint16_t sec_idx, uint32_t *out_lba) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
     if (dir_cluster == 0) {
-        if (sec_idx >= root_sectors) {
+        if (sec_idx >= vol->root_sectors) {
             return -1;
         }
-        *out_lba = root_lba + sec_idx;
+        *out_lba = (uint32_t)vol->root_lba + sec_idx;
         return 0;
     } else {
-        uint16_t clus_steps = sec_idx / bpb_sectors_per_cluster;
-        uint16_t sec_offset = sec_idx % bpb_sectors_per_cluster;
+        uint16_t clus_steps = sec_idx / vol->sectors_per_cluster;
+        uint16_t sec_offset = sec_idx % vol->sectors_per_cluster;
         uint16_t cur        = dir_cluster;
         while (clus_steps > 0) {
             if (cur < 2 || cur >= 0xFFF8) {
                 return -1;
             }
-            cur = fat_get_cluster(cur);
+            cur = fat_get_cluster(vol, cur);
             clus_steps--;
         }
         if (cur < 2 || cur >= 0xFFF8) {
             return -1;
         }
-        *out_lba = data_lba + (cur - 2) * bpb_sectors_per_cluster + sec_offset;
+        *out_lba = cluster_to_lba(vol, cur) + sec_offset;
         return 0;
     }
 }
 
-int fat16_init(void) {
-    if (disk_rw_lba(0, 0, MK_FP(KERNEL_SEG, io_buf)) != 0) {
-        return -1;
-    }
-    if (io_buf[510] != 0x55 || io_buf[511] != 0xAA) {
-        return -1;
-    }
-
-    bpb_bytes_per_sector    = rd_le16(&io_buf[11]);
-    bpb_sectors_per_cluster = io_buf[13];
-    bpb_reserved_sectors    = rd_le16(&io_buf[14]);
-    bpb_num_fats            = io_buf[16];
-    bpb_root_entries        = rd_le16(&io_buf[17]);
-    bpb_total_sectors       = rd_le16(&io_buf[19]);
-    bpb_sectors_per_fat     = rd_le16(&io_buf[22]);
-    bpb_sectors_per_track   = rd_le16(&io_buf[24]);
-    bpb_num_heads           = rd_le16(&io_buf[26]);
-    bpb_hidden_sectors      = rd_le16(&io_buf[28]);
-
-    if (bpb_bytes_per_sector != 512 || bpb_sectors_per_cluster == 0) {
-        return -1;
-    }
-
-    fat_lba        = bpb_reserved_sectors + bpb_hidden_sectors;
-    root_lba       = fat_lba + (uint16_t)bpb_num_fats * bpb_sectors_per_fat;
-    root_sectors   = (bpb_root_entries * 32) / 512;
-    data_lba       = root_lba + root_sectors;
-    total_clusters = (bpb_total_sectors - data_lba) / bpb_sectors_per_cluster;
-    cached_fat_sec = 0xFFFF;
-    fat_dirty      = 0;
-    cwd_cluster    = 0;
-    cwd_path[0]    = '/';
-    cwd_path[1]    = '\0';
-    fs_mounted     = 1;
-    return 0;
-}
-
-static int find_dir_entry(uint16_t dir_cluster, const uint8_t name83[11],
-                          fat16_dirent_t *out_entry, uint16_t *out_sec_lba, uint16_t *out_idx) {
-    uint16_t s, i, sec_lba;
+static int find_dir_entry(os_volume_t *vol, uint16_t dir_cluster, const uint8_t name83[11],
+                          fat16_dirent_t *out_entry, uint32_t *out_sec_lba, uint16_t *out_idx) {
+    uint16_t s, i;
+    uint32_t sec_lba;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
 
-    if (!fs_mounted) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
         return -1;
     }
 
-    for (s = 0; dir_get_sector_lba(dir_cluster, s, &sec_lba) == 0; s++) {
-        if (disk_rw_lba(0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    for (s = 0; dir_get_sector_lba(vol, dir_cluster, s, &sec_lba) == 0; s++) {
+        if (vol_rw_lba(vol, 0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
         for (i = 0; i < 16; i++) {
@@ -324,43 +543,18 @@ static int find_dir_entry(uint16_t dir_cluster, const uint8_t name83[11],
     return -1;
 }
 
-static uint16_t alloc_free_cluster(uint16_t start_search) {
-    uint16_t c;
-    if (start_search < 2) {
-        start_search = 2;
-    }
-    for (c = start_search; c < total_clusters + 2; c++) {
-        if (fat_get_cluster(c) == 0x0000) {
-            if (fat_set_cluster(c, 0xFFFF) != 0) {
-                return 0;
-            }
-            return c;
-        }
-    }
-    return 0;
-}
-
-static int zero_cluster_sectors(uint16_t clus) {
-    uint16_t first_lba = data_lba + (clus - 2) * bpb_sectors_per_cluster;
-    uint16_t i;
-    uint8_t s;
-    for (i = 0; i < 512; i++) {
-        io_buf[i] = 0;
-    }
-    for (s = 0; s < bpb_sectors_per_cluster; s++) {
-        if (disk_rw_lba(1, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
-            return -1;
-        }
-    }
-    return 0;
-}
-
-static int find_free_dir_slot(uint16_t dir_cluster, uint16_t *out_sec_lba, uint16_t *out_idx) {
-    uint16_t s, i, sec_lba;
+static int find_free_dir_slot(os_volume_t *vol, uint16_t dir_cluster, uint32_t *out_sec_lba, uint16_t *out_idx) {
+    uint16_t s, i;
+    uint32_t sec_lba;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
 
-    for (s = 0; dir_get_sector_lba(dir_cluster, s, &sec_lba) == 0; s++) {
-        if (disk_rw_lba(0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+
+    for (s = 0; dir_get_sector_lba(vol, dir_cluster, s, &sec_lba) == 0; s++) {
+        if (vol_rw_lba(vol, 0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
         for (i = 0; i < 16; i++) {
@@ -372,41 +566,66 @@ static int find_free_dir_slot(uint16_t dir_cluster, uint16_t *out_sec_lba, uint1
             }
         }
     }
-
-    /* If a subdirectory is full, extend its cluster chain by 1 cluster */
-    if (dir_cluster >= 2) {
-        uint16_t cur = dir_cluster;
-        uint16_t new_clus;
-        while ( cur >= 2 ) {
-            uint16_t next = fat_get_cluster(cur);
-            if (next >= 0xFFF8 || next < 2) {
-                break;
-            }
-            cur = next;
-        }
-        new_clus = alloc_free_cluster(2);
-        if (new_clus == 0) {
-            return -1;
-        }
-        if (fat_set_cluster(cur, new_clus) != 0 || fat_flush() != 0) {
-            return -1;
-        }
-        if (zero_cluster_sectors(new_clus) != 0) {
-            return -1;
-        }
-        *out_sec_lba = data_lba + (new_clus - 2) * bpb_sectors_per_cluster;
-        *out_idx     = 0;
-        return 0;
-    }
-
     return -1;
 }
 
-static int free_cluster_chain(uint16_t start_cluster) {
+static uint16_t alloc_free_cluster(os_volume_t *vol, uint16_t start_hint) {
+    uint16_t c;
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active || vol->total_clusters == 0) {
+        return 0;
+    }
+    if (start_hint < 2 || start_hint >= vol->total_clusters + 2) {
+        start_hint = 2;
+    }
+    for (c = start_hint; c < vol->total_clusters + 2; c++) {
+        if (fat_get_cluster(vol, c) == 0x0000) {
+            if (fat_set_cluster(vol, c, 0xFFFF) != 0) {
+                return 0;
+            }
+            return c;
+        }
+    }
+    for (c = 2; c < start_hint; c++) {
+        if (fat_get_cluster(vol, c) == 0x0000) {
+            if (fat_set_cluster(vol, c, 0xFFFF) != 0) {
+                return 0;
+            }
+            return c;
+        }
+    }
+    return 0;
+}
+
+static int zero_cluster_sectors(os_volume_t *vol, uint16_t cluster) {
+    uint32_t first_lba;
+    uint8_t s;
+    int j;
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active || cluster < 2) {
+        return -1;
+    }
+    for (j = 0; j < 512; j++) {
+        io_buf[j] = 0;
+    }
+    first_lba = cluster_to_lba(vol, cluster);
+    for (s = 0; s < vol->sectors_per_cluster; s++) {
+        if (vol_rw_lba(vol, 1, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int free_cluster_chain(os_volume_t *vol, uint16_t start_cluster) {
     uint16_t cur = start_cluster;
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
     while (cur >= 2 && cur < 0xFFF8) {
-        uint16_t next = fat_get_cluster(cur);
-        if (fat_set_cluster(cur, 0x0000) != 0) {
+        uint16_t next = fat_get_cluster(vol, cur);
+        if (fat_set_cluster(vol, cur, 0x0000) != 0) {
             return -1;
         }
         cur = next;
@@ -414,8 +633,7 @@ static int free_cluster_chain(uint16_t start_cluster) {
     return fat_flush();
 }
 
-/* Step from dir_cluster into child directory component `comp` */
-static int step_into_dir(uint16_t cur_cluster, const char *comp, uint16_t *out_next_cluster) {
+static int step_into_dir(os_volume_t *vol, uint16_t cur_cluster, const char *comp, uint16_t *out_next_cluster) {
     uint8_t name83[11];
     fat16_dirent_t ent;
 
@@ -429,7 +647,7 @@ static int step_into_dir(uint16_t cur_cluster, const char *comp, uint16_t *out_n
             return 0;
         }
         make_83_component("..", name83);
-        if (find_dir_entry(cur_cluster, name83, &ent, 0, 0) != 0) {
+        if (find_dir_entry(vol, cur_cluster, name83, &ent, 0, 0) != 0) {
             *out_next_cluster = 0;
             return 0;
         }
@@ -440,7 +658,7 @@ static int step_into_dir(uint16_t cur_cluster, const char *comp, uint16_t *out_n
     if (make_83_component(comp, name83) != 0) {
         return -1;
     }
-    if (find_dir_entry(cur_cluster, name83, &ent, 0, 0) != 0) {
+    if (find_dir_entry(vol, cur_cluster, name83, &ent, 0, 0) != 0) {
         return -1;
     }
     if ((ent.attr & FAT_ATTR_DIRECTORY) == 0) {
@@ -451,47 +669,53 @@ static int step_into_dir(uint16_t cur_cluster, const char *comp, uint16_t *out_n
 }
 
 /*
- * Resolve a path into its parent directory cluster and 11-byte 8.3 leaf name.
- * Supports '/', '\', absolute paths, relative paths, '.', and '..'.
+ * Resolve a volume subpath into its parent directory cluster and 8.3 leaf name.
+ * Handles:
+ *   - Absolute paths (starting with '/' or '\') -> rooted at cluster 0
+ *   - Volume paths (from "DEV:PATH") -> rooted at cluster 0
+ *   - Relative paths -> relative to vol->cwd_cluster
  */
-static int resolve_parent_and_leaf(const char __far *path, uint16_t *out_parent_clus, uint8_t out_leaf83[11]) {
+static int resolve_parent_and_leaf(os_volume_t *vol, const char __far *subpath,
+                                   uint16_t *out_parent_clus, uint8_t out_leaf83[11],
+                                   uint8_t is_volume_rooted) {
     uint16_t cur_clus;
     uint16_t pos = 0;
     char comp[16];
 
-    if (!fs_mounted || !path || path[0] == '\0') {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active || !subpath || subpath[0] == '\0') {
         return -1;
     }
 
-    if (is_sep(path[0])) {
+    if (is_sep(subpath[0]) || is_volume_rooted) {
         cur_clus = 0;
-        while (is_sep(path[pos])) {
+        while (is_sep(subpath[pos])) {
             pos++;
         }
     } else {
-        cur_clus = cwd_cluster;
+        cur_clus = vol->cwd_cluster;
     }
 
-    if (path[pos] == '\0') {
+    if (subpath[pos] == '\0') {
         return -1;
     }
 
     for (;;) {
         uint16_t k = 0;
-        while (path[pos] != '\0' && !is_sep(path[pos])) {
+        while (subpath[pos] != '\0' && !is_sep(subpath[pos])) {
             if (k >= 14) {
                 return -1;
             }
-            comp[k++] = path[pos++];
+            comp[k++] = subpath[pos++];
         }
         comp[k] = '\0';
 
-        while (is_sep(path[pos])) {
+        while (is_sep(subpath[pos])) {
             pos++;
         }
 
-        if (path[pos] == '\0') {
-            /* Final component */
+        if (subpath[pos] == '\0') {
+            /* Leaf component */
             if (make_83_component(comp, out_leaf83) != 0) {
                 return -1;
             }
@@ -500,7 +724,7 @@ static int resolve_parent_and_leaf(const char __far *path, uint16_t *out_parent_
         }
 
         /* Intermediate directory component */
-        if (step_into_dir(cur_clus, comp, &cur_clus) != 0) {
+        if (step_into_dir(vol, cur_clus, comp, &cur_clus) != 0) {
             return -1;
         }
     }
@@ -535,43 +759,313 @@ static void canon_push(char *canon, const char *comp) {
     canon[len] = '\0';
 }
 
+/* --- Dynamic BPB & MBR Parsing / Initialization --- */
+
+/* Safe cluster calculation avoiding 32-bit division in C */
+static uint16_t calc_clusters(uint32_t total_sec, uint16_t data_lba, uint8_t spc) {
+    uint32_t rem;
+    uint16_t shift = 0;
+    if (total_sec <= data_lba || spc == 0) {
+        return 0;
+    }
+    rem = total_sec - data_lba;
+    while ((1 << shift) < spc && shift < 8) {
+        shift++;
+    }
+    return (uint16_t)(rem >> shift);
+}
+
+static int parse_bpb(os_volume_t *vol, const uint8_t *buf) {
+    vol->bytes_per_sector    = rd_le16(&buf[11]);
+    vol->sectors_per_cluster = buf[13];
+    vol->reserved_sectors    = rd_le16(&buf[14]);
+    vol->num_fats            = buf[16];
+    vol->root_entries        = rd_le16(&buf[17]);
+    vol->total_sectors       = rd_le16(&buf[19]);
+    if (vol->total_sectors == 0) {
+        vol->total_sectors   = rd_le32(&buf[32]);
+    }
+    vol->sectors_per_fat     = rd_le16(&buf[22]);
+
+    if (vol->sectors_per_track == 0) {
+        vol->sectors_per_track = rd_le16(&buf[24]);
+    }
+    if (vol->num_heads == 0) {
+        vol->num_heads = rd_le16(&buf[26]);
+    }
+
+    if (vol->bytes_per_sector != 512 || vol->sectors_per_cluster == 0) {
+        return -1;
+    }
+
+    vol->fat_lba        = vol->reserved_sectors;
+    vol->root_lba       = vol->fat_lba + (uint16_t)vol->num_fats * vol->sectors_per_fat;
+    vol->root_sectors   = (vol->root_entries * 32) / 512;
+    vol->data_lba       = vol->root_lba + vol->root_sectors;
+    vol->total_clusters = calc_clusters(vol->total_sectors, vol->data_lba, vol->sectors_per_cluster);
+
+    vol->cwd_cluster    = 0;
+    vol->cwd_path[0]    = '/';
+    vol->cwd_path[1]    = '\0';
+    vol->active         = 1;
+    return 0;
+}
+
+static void probe_drive(uint8_t drive_num, const char *base_name) {
+    uint16_t cyls = 0;
+    uint8_t  heads = 0;
+    uint8_t  spt = 0;
+    uint8_t  drives = 0;
+    mbr_partition_t *parts;
+    int is_mbr = 0;
+    int p;
+    int valid_parts = 0;
+    uint8_t first_part_idx = 0xFF;
+
+    if (bios_get_drive_params(drive_num, &cyls, &heads, &spt, &drives) != 0) {
+        return;
+    }
+    if (spt == 0 || heads == 0) {
+        return;
+    }
+
+    /* Read Sector 0 (LBA 0) */
+    if (bios_disk_rw_lba(drive_num, 0, 0, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        return;
+    }
+    if (io_buf[510] != 0x55 || io_buf[511] != 0xAA) {
+        return;
+    }
+
+    /* Check if MBR: inspect partition table at 0x01BE */
+    parts = (mbr_partition_t *)&io_buf[0x01BE];
+    for (p = 0; p < 4; p++) {
+        uint8_t pt = parts[p].part_type;
+        if ((pt == 0x04 || pt == 0x06 || pt == 0x0E || pt == 0x01) &&
+            parts[p].start_lba > 0 && parts[p].total_sectors > 0) {
+            valid_parts++;
+        }
+    }
+    /* If offset 0x36 contains "FAT", this is a raw superfloppy VBR, not an MBR */
+    if (io_buf[0x36] == 'F' && io_buf[0x37] == 'A' && io_buf[0x38] == 'T') {
+        is_mbr = 0;
+    } else if (valid_parts > 0) {
+        is_mbr = 1;
+    }
+
+    if (is_mbr) {
+        for (p = 0; p < 4 && num_volumes < MAX_VOLUMES; p++) {
+            uint8_t pt = parts[p].part_type;
+            if (pt == 0x04 || pt == 0x06 || pt == 0x0E || pt == 0x01) {
+                uint8_t v_idx = num_volumes;
+                os_volume_t *vol = &volumes[v_idx];
+                int i;
+
+                vol->name[0] = base_name[0];
+                vol->name[1] = base_name[1];
+                vol->name[2] = base_name[2];
+                vol->name[3] = (char)('A' + p);
+                vol->name[4] = '\0';
+
+                vol->bios_drive        = drive_num;
+                vol->part_idx          = (uint8_t)p;
+                vol->start_lba         = parts[p].start_lba;
+                vol->sectors_per_track = spt;
+                vol->num_heads         = heads;
+                vol->is_alias          = 0;
+                vol->target_vol_idx    = 0;
+
+                /* Read VBR of partition */
+                if (bios_disk_rw_lba(drive_num, 0, vol->start_lba, spt, heads, MK_FP(KERNEL_SEG, io_buf)) == 0 &&
+                    io_buf[510] == 0x55 && io_buf[511] == 0xAA) {
+                    if (parse_bpb(vol, io_buf) == 0) {
+                        if (first_part_idx == 0xFF) {
+                            first_part_idx = v_idx;
+                        }
+                        num_volumes++;
+                    }
+                }
+            }
+        }
+        /* Add whole-drive alias e.g. "HD0" -> "HD0A" */
+        if (first_part_idx != 0xFF && num_volumes < MAX_VOLUMES) {
+            os_volume_t *alias = &volumes[num_volumes];
+            *alias = volumes[first_part_idx];
+            alias->name[0]        = base_name[0];
+            alias->name[1]        = base_name[1];
+            alias->name[2]        = base_name[2];
+            alias->name[3]        = '\0';
+            alias->part_idx       = 0xFF;
+            alias->is_alias       = 1;
+            alias->target_vol_idx = first_part_idx;
+            alias->active         = 1;
+            alias->cwd_cluster    = 0;
+            alias->cwd_path[0]    = '/';
+            alias->cwd_path[1]    = '\0';
+            num_volumes++;
+        }
+    } else {
+        /* Raw disk (superfloppy): mount LBA 0 */
+        if (num_volumes < MAX_VOLUMES) {
+            uint8_t raw_idx = num_volumes;
+            os_volume_t *vol = &volumes[raw_idx];
+
+            vol->name[0]           = base_name[0];
+            vol->name[1]           = base_name[1];
+            vol->name[2]           = base_name[2];
+            vol->name[3]           = '\0';
+            vol->bios_drive        = drive_num;
+            vol->part_idx          = 0xFF;
+            vol->start_lba         = 0;
+            vol->sectors_per_track = spt;
+            vol->num_heads         = heads;
+            vol->is_alias          = 0;
+
+            if (parse_bpb(vol, io_buf) == 0) {
+                num_volumes++;
+
+                /* Add alias e.g. "HD0A" -> "HD0" */
+                if (num_volumes < MAX_VOLUMES) {
+                    os_volume_t *alias = &volumes[num_volumes];
+                    *alias = volumes[raw_idx];
+                    alias->name[0]        = base_name[0];
+                    alias->name[1]        = base_name[1];
+                    alias->name[2]        = base_name[2];
+                    alias->name[3]        = 'A';
+                    alias->name[4]        = '\0';
+                    alias->part_idx       = 0;
+                    alias->is_alias       = 1;
+                    alias->target_vol_idx = raw_idx;
+                    alias->active         = 1;
+                    alias->cwd_cluster    = 0;
+                    alias->cwd_path[0]    = '/';
+                    alias->cwd_path[1]    = '\0';
+                    num_volumes++;
+                }
+            }
+        }
+    }
+}
+
+int fat16_init(void) {
+    uint8_t boot_drive;
+    uint8_t v;
+    uint8_t boot_vol_idx = 0xFF;
+
+    num_volumes     = 0;
+    current_vol_idx = 0;
+    cached_fat_vol  = 0xFF;
+    cached_fat_sec  = 0xFFFF;
+    fat_dirty       = 0;
+
+    boot_drive = bios_get_boot_drive();
+
+    /* Probe Hard Disk 0 (0x80) */
+    probe_drive(0x80, "HD0");
+
+    /* Probe Hard Disk 1 (0x81) */
+    probe_drive(0x81, "HD1");
+
+    if (num_volumes == 0) {
+        fs_mounted = 0;
+        return -1;
+    }
+
+    /* Find volume matching boot_drive */
+    for (v = 0; v < num_volumes; v++) {
+        if (volumes[v].active && !volumes[v].is_alias && volumes[v].bios_drive == boot_drive) {
+            boot_vol_idx = v;
+            break;
+        }
+    }
+    if (boot_vol_idx == 0xFF) {
+        boot_vol_idx = 0;
+    }
+
+    /* Register SYS: as an alias pointing to boot volume */
+    if (num_volumes < MAX_VOLUMES) {
+        os_volume_t *sys = &volumes[num_volumes];
+        *sys = volumes[boot_vol_idx];
+        sys->name[0]        = 'S';
+        sys->name[1]        = 'Y';
+        sys->name[2]        = 'S';
+        sys->name[3]        = '\0';
+        sys->is_alias       = 1;
+        sys->target_vol_idx = boot_vol_idx;
+        sys->active         = 1;
+        sys->cwd_cluster    = 0;
+        sys->cwd_path[0]    = '/';
+        sys->cwd_path[1]    = '\0';
+        current_vol_idx     = num_volumes;
+        num_volumes++;
+    } else {
+        current_vol_idx = boot_vol_idx;
+    }
+
+    fs_mounted = 1;
+    return 0;
+}
+
+/* --- Public Syscall Implementations --- */
+
 int fat16_chdir(const char __far *path) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t cur_clus;
     uint16_t pos = 0;
     char new_path[64];
     char comp[16];
     int i;
+    uint8_t is_vol_root;
 
     if (!fs_mounted || !path || path[0] == '\0') {
         return -1;
     }
 
-    if (is_sep(path[0])) {
+    if (vol_resolve_path(path, &vol, &subpath) != 0) {
+        return -1;
+    }
+
+    /* If switching volume alone (e.g. "cd HD0A:" or "cd SYS:") */
+    if (subpath[0] == '\0') {
+        uint8_t v_idx = (uint8_t)(vol - volumes);
+        return vol_set_current(v_idx);
+    }
+
+    /* Also switch active volume to the specified volume */
+    {
+        uint8_t v_idx = (uint8_t)(vol - volumes);
+        vol_set_current(v_idx);
+    }
+
+    is_vol_root = (uint8_t)(path != subpath);
+
+    if (is_sep(subpath[0]) || is_vol_root) {
         cur_clus    = 0;
         new_path[0] = '/';
         new_path[1] = '\0';
-        while (is_sep(path[pos])) {
+        while (is_sep(subpath[pos])) {
             pos++;
         }
     } else {
-        cur_clus = cwd_cluster;
+        cur_clus = vol->cwd_cluster;
         for (i = 0; i < 64; i++) {
-            new_path[i] = cwd_path[i];
-            if (cwd_path[i] == '\0') break;
+            new_path[i] = vol->cwd_path[i];
+            if (vol->cwd_path[i] == '\0') break;
         }
     }
 
-    while (path[pos] != '\0') {
+    while (subpath[pos] != '\0') {
         uint16_t k = 0;
-        while (path[pos] != '\0' && !is_sep(path[pos])) {
+        while (subpath[pos] != '\0' && !is_sep(subpath[pos])) {
             if (k >= 14) {
                 return -1;
             }
-            comp[k++] = path[pos++];
+            comp[k++] = subpath[pos++];
         }
         comp[k] = '\0';
 
-        while (is_sep(path[pos])) {
+        while (is_sep(subpath[pos])) {
             pos++;
         }
 
@@ -579,99 +1073,133 @@ int fat16_chdir(const char __far *path) {
             continue;
         }
         if (comp[0] == '.' && comp[1] == '.' && comp[2] == '\0') {
-            if (step_into_dir(cur_clus, "..", &cur_clus) != 0) {
+            if (step_into_dir(vol, cur_clus, "..", &cur_clus) != 0) {
                 return -1;
             }
             canon_pop(new_path);
             continue;
         }
 
-        if (step_into_dir(cur_clus, comp, &cur_clus) != 0) {
+        if (step_into_dir(vol, cur_clus, comp, &cur_clus) != 0) {
             return -1;
         }
         canon_push(new_path, comp);
     }
 
-    cwd_cluster = cur_clus;
+    vol->cwd_cluster = cur_clus;
     for (i = 0; i < 64; i++) {
-        cwd_path[i] = new_path[i];
+        vol->cwd_path[i] = new_path[i];
         if (new_path[i] == '\0') break;
+    }
+    if (vol->is_alias) {
+        os_volume_t *target = resolve_vol_alias(vol);
+        if (target) {
+            target->cwd_cluster = cur_clus;
+            for (i = 0; i < 64; i++) {
+                target->cwd_path[i] = new_path[i];
+                if (new_path[i] == '\0') break;
+            }
+        }
     }
     return 0;
 }
 
 int fat16_getcwd(char __far *buf, uint16_t max_len) {
-    uint16_t i = 0;
-    if (!buf || max_len == 0) {
+    os_volume_t *vol = vol_get_current();
+    uint16_t pos = 0;
+    int i;
+
+    if (!vol || !buf || max_len < 8) {
         return -1;
     }
-    while (cwd_path[i] != '\0' && i + 1 < max_len) {
-        buf[i] = cwd_path[i];
-        i++;
+
+    /* Prefix with volume name + colon, e.g. "SYS:" or "HD0A:" */
+    for (i = 0; vol->name[i] != '\0' && pos + 1 < max_len; i++) {
+        buf[pos++] = vol->name[i];
     }
-    buf[i] = '\0';
+    if (pos + 1 < max_len) {
+        buf[pos++] = ':';
+    }
+
+    /* Append cwd_path */
+    for (i = 0; vol->cwd_path[i] != '\0' && pos + 1 < max_len; i++) {
+        buf[pos++] = vol->cwd_path[i];
+    }
+    buf[pos] = '\0';
     return 0;
 }
 
 int fat16_mkdir(const char __far *path) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t parent_clus;
     uint8_t name83[11];
     uint8_t dot83[11];
-    uint16_t dir_sec_lba, dir_idx;
+    uint32_t dir_sec_lba;
+    uint16_t dir_idx;
     uint16_t new_clus;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
+    uint32_t first_lba;
 
-    if (resolve_parent_and_leaf(path, &parent_clus, name83) != 0) {
+    if (vol_resolve_path(path, &vol, &subpath) != 0) {
+        return -1;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(path != subpath)) != 0) {
         return -1;
     }
     if (name83[0] == '.') {
         return -1;
     }
-    if (find_dir_entry(parent_clus, name83, 0, 0, 0) == 0) {
-        return -1; /* Already exists */
+    if (find_dir_entry(vol, parent_clus, name83, 0, 0, 0) == 0) {
+        return -1;
     }
-    if (find_free_dir_slot(parent_clus, &dir_sec_lba, &dir_idx) != 0) {
+    if (find_free_dir_slot(vol, parent_clus, &dir_sec_lba, &dir_idx) != 0) {
         return -1;
     }
 
-    new_clus = alloc_free_cluster(2);
+    new_clus = alloc_free_cluster(vol, 2);
     if (new_clus == 0) {
         return -1;
     }
     if (fat_flush() != 0) {
         return -1;
     }
-    if (zero_cluster_sectors(new_clus) != 0) {
+    if (zero_cluster_sectors(vol, new_clus) != 0) {
         return -1;
     }
 
-    /* Populate '.' and '..' entries in sector 0 of new_clus */
+    /* Populate '.' and '..' */
     make_83_component(".", dot83);
     fill_dirent_meta(&entries[0], dot83, FAT_ATTR_DIRECTORY, new_clus, 0);
     make_83_component("..", dot83);
     fill_dirent_meta(&entries[1], dot83, FAT_ATTR_DIRECTORY, parent_clus, 0);
-    if (disk_rw_lba(1, data_lba + (new_clus - 2) * bpb_sectors_per_cluster,
-                    MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    first_lba = cluster_to_lba(vol, new_clus);
+    if (vol_rw_lba(vol, 1, first_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
 
-    /* Write new directory entry in parent directory */
-    if (disk_rw_lba(0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    /* Write entry in parent directory */
+    if (vol_rw_lba(vol, 0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
     fill_dirent_meta(&entries[dir_idx], name83, FAT_ATTR_DIRECTORY, new_clus, 0);
-    if (disk_rw_lba(1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
     return 0;
 }
 
-static int is_dir_empty(uint16_t dir_cluster) {
-    uint16_t s, i, sec_lba;
+static int is_dir_empty(os_volume_t *vol, uint16_t dir_cluster) {
+    uint16_t s, i;
+    uint32_t sec_lba;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
 
-    for (s = 0; dir_get_sector_lba(dir_cluster, s, &sec_lba) == 0; s++) {
-        if (disk_rw_lba(0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    for (s = 0; dir_get_sector_lba(vol, dir_cluster, s, &sec_lba) == 0; s++) {
+        if (vol_rw_lba(vol, 0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return 0;
         }
         for (i = 0; i < 16; i++) {
@@ -689,53 +1217,71 @@ static int is_dir_empty(uint16_t dir_cluster) {
 }
 
 int fat16_rmdir(const char __far *path) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t parent_clus;
     uint8_t name83[11];
     fat16_dirent_t entry;
-    uint16_t dir_sec_lba = 0;
+    uint32_t dir_sec_lba = 0;
     uint16_t dir_idx     = 0;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
 
-    if (resolve_parent_and_leaf(path, &parent_clus, name83) != 0) {
+    if (vol_resolve_path(path, &vol, &subpath) != 0) {
+        return -1;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(path != subpath)) != 0) {
         return -1;
     }
     if (name83[0] == '.') {
         return -1;
     }
-    if (find_dir_entry(parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) != 0) {
+    if (find_dir_entry(vol, parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) != 0) {
         return -1;
     }
     if ((entry.attr & FAT_ATTR_DIRECTORY) == 0) {
         return -1;
     }
-    if (entry.fst_clus_lo == 0 || entry.fst_clus_lo == cwd_cluster) {
+    if (entry.fst_clus_lo == 0 || entry.fst_clus_lo == vol->cwd_cluster) {
         return -1;
     }
-    if (!is_dir_empty(entry.fst_clus_lo)) {
+    if (!is_dir_empty(vol, entry.fst_clus_lo)) {
         return -1;
     }
-    if (free_cluster_chain(entry.fst_clus_lo) != 0) {
+    if (free_cluster_chain(vol, entry.fst_clus_lo) != 0) {
         return -1;
     }
-    if (disk_rw_lba(0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
     entries[dir_idx].name[0] = 0xE5;
-    if (disk_rw_lba(1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
     return 0;
 }
 
 int32_t fat16_file_size(const char __far *filename) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t parent_clus;
     uint8_t name83[11];
     fat16_dirent_t entry;
 
-    if (resolve_parent_and_leaf(filename, &parent_clus, name83) != 0) {
+    if (vol_resolve_path(filename, &vol, &subpath) != 0) {
         return -1;
     }
-    if (find_dir_entry(parent_clus, name83, &entry, 0, 0) != 0) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
+        return -1;
+    }
+    if (find_dir_entry(vol, parent_clus, name83, &entry, 0, 0) != 0) {
         return -1;
     }
     if (entry.attr & FAT_ATTR_DIRECTORY) {
@@ -745,6 +1291,8 @@ int32_t fat16_file_size(const char __far *filename) {
 }
 
 int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_bytes) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t parent_clus;
     uint8_t name83[11];
     fat16_dirent_t entry;
@@ -753,10 +1301,17 @@ int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_b
     uint16_t bytes_read = 0;
     uint8_t __far *out_ptr = (uint8_t __far *)dest;
 
-    if (resolve_parent_and_leaf(filename, &parent_clus, name83) != 0) {
+    if (vol_resolve_path(filename, &vol, &subpath) != 0) {
         return -1;
     }
-    if (find_dir_entry(parent_clus, name83, &entry, 0, 0) != 0) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
+        return -1;
+    }
+    if (find_dir_entry(vol, parent_clus, name83, &entry, 0, 0) != 0) {
         return -1;
     }
     if (entry.attr & FAT_ATTR_DIRECTORY) {
@@ -769,15 +1324,15 @@ int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_b
     cluster = entry.fst_clus_lo;
 
     while (cluster >= 2 && cluster < 0xFFF8 && bytes_read < target_bytes) {
-        uint16_t first_lba = data_lba + (cluster - 2) * bpb_sectors_per_cluster;
+        uint32_t first_lba = cluster_to_lba(vol, cluster);
         uint8_t s;
-        for (s = 0; s < bpb_sectors_per_cluster && bytes_read < target_bytes; s++) {
+        for (s = 0; s < vol->sectors_per_cluster && bytes_read < target_bytes; s++) {
             uint16_t chunk = target_bytes - bytes_read;
             uint16_t j;
             if (chunk > 512) {
                 chunk = 512;
             }
-            if (disk_rw_lba(0, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+            if (vol_rw_lba(vol, 0, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
                 return -1;
             }
             for (j = 0; j < chunk; j++) {
@@ -785,13 +1340,15 @@ int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_b
             }
             bytes_read += chunk;
         }
-        cluster = fat_get_cluster(cluster);
+        cluster = fat_get_cluster(vol, cluster);
     }
 
     return (int)bytes_read;
 }
 
 int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_t *out_size) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t parent_clus;
     uint8_t name83[11];
     fat16_dirent_t entry;
@@ -800,10 +1357,17 @@ int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_
     uint16_t cur_off = 0x0000;
     uint32_t remaining;
 
-    if (resolve_parent_and_leaf(filename, &parent_clus, name83) != 0) {
+    if (vol_resolve_path(filename, &vol, &subpath) != 0) {
         return -1;
     }
-    if (find_dir_entry(parent_clus, name83, &entry, 0, 0) != 0) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
+        return -1;
+    }
+    if (find_dir_entry(vol, parent_clus, name83, &entry, 0, 0) != 0) {
         return -1;
     }
     if ((entry.attr & FAT_ATTR_DIRECTORY) || entry.file_size == 0) {
@@ -814,10 +1378,10 @@ int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_
     cluster   = entry.fst_clus_lo;
 
     while (cluster >= 2 && cluster < 0xFFF8 && remaining > 0) {
-        uint16_t first_lba = data_lba + (cluster - 2) * bpb_sectors_per_cluster;
+        uint32_t first_lba = cluster_to_lba(vol, cluster);
         uint8_t s;
-        for (s = 0; s < bpb_sectors_per_cluster && remaining > 0; s++) {
-            if (disk_rw_lba(0, first_lba + s, MK_FP(cur_seg, cur_off)) != 0) {
+        for (s = 0; s < vol->sectors_per_cluster && remaining > 0; s++) {
+            if (vol_rw_lba(vol, 0, first_lba + s, MK_FP(cur_seg, cur_off)) != 0) {
                 return -1;
             }
             if (remaining >= 512) {
@@ -830,7 +1394,7 @@ int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_
                 cur_seg += 0x1000;
             }
         }
-        cluster = fat_get_cluster(cluster);
+        cluster = fat_get_cluster(vol, cluster);
     }
 
     if (out_size) {
@@ -840,10 +1404,12 @@ int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_
 }
 
 int fat16_write_file(const char __far *filename, const void __far *src, uint16_t size) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t parent_clus;
     uint8_t name83[11];
     fat16_dirent_t entry;
-    uint16_t dir_sec_lba   = 0;
+    uint32_t dir_sec_lba   = 0;
     uint16_t dir_idx       = 0;
     uint16_t first_cluster = 0;
     uint16_t prev_cluster  = 0;
@@ -852,31 +1418,38 @@ int fat16_write_file(const char __far *filename, const void __far *src, uint16_t
     const uint8_t __far *in_ptr = (const uint8_t __far *)src;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
 
-    if (resolve_parent_and_leaf(filename, &parent_clus, name83) != 0) {
+    if (vol_resolve_path(filename, &vol, &subpath) != 0) {
+        return -1;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
         return -1;
     }
     if (name83[0] == '.') {
         return -1;
     }
 
-    if (find_dir_entry(parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) == 0) {
+    if (find_dir_entry(vol, parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) == 0) {
         if (entry.attr & FAT_ATTR_DIRECTORY) {
             return -1;
         }
         if (entry.fst_clus_lo >= 2) {
-            if (free_cluster_chain(entry.fst_clus_lo) != 0) {
+            if (free_cluster_chain(vol, entry.fst_clus_lo) != 0) {
                 return -1;
             }
         }
     } else {
-        if (find_free_dir_slot(parent_clus, &dir_sec_lba, &dir_idx) != 0) {
+        if (find_free_dir_slot(vol, parent_clus, &dir_sec_lba, &dir_idx) != 0) {
             return -1;
         }
     }
 
     while (written < size) {
-        uint16_t clus = alloc_free_cluster(search_hint);
-        uint16_t first_lba;
+        uint16_t clus = alloc_free_cluster(vol, search_hint);
+        uint32_t first_lba;
         uint8_t s;
 
         if (clus == 0) {
@@ -887,14 +1460,14 @@ int fat16_write_file(const char __far *filename, const void __far *src, uint16_t
         if (first_cluster == 0) {
             first_cluster = clus;
         } else {
-            if (fat_set_cluster(prev_cluster, clus) != 0) {
+            if (fat_set_cluster(vol, prev_cluster, clus) != 0) {
                 return -1;
             }
         }
         prev_cluster = clus;
 
-        first_lba = data_lba + (clus - 2) * bpb_sectors_per_cluster;
-        for (s = 0; s < bpb_sectors_per_cluster; s++) {
+        first_lba = cluster_to_lba(vol, clus);
+        for (s = 0; s < vol->sectors_per_cluster; s++) {
             uint16_t j;
             for (j = 0; j < 512; j++) {
                 if (written < size) {
@@ -903,7 +1476,7 @@ int fat16_write_file(const char __far *filename, const void __far *src, uint16_t
                     io_buf[j] = 0;
                 }
             }
-            if (disk_rw_lba(1, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+            if (vol_rw_lba(vol, 1, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
                 return -1;
             }
         }
@@ -913,11 +1486,11 @@ int fat16_write_file(const char __far *filename, const void __far *src, uint16_t
         return -1;
     }
 
-    if (disk_rw_lba(0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
     fill_dirent_meta(&entries[dir_idx], name83, FAT_ATTR_ARCHIVE, first_cluster, (uint32_t)size);
-    if (disk_rw_lba(1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
 
@@ -925,10 +1498,12 @@ int fat16_write_file(const char __far *filename, const void __far *src, uint16_t
 }
 
 int fat16_append_file(const char __far *filename, const void __far *src, uint16_t size) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t parent_clus;
     uint8_t name83[11];
     fat16_dirent_t entry;
-    uint16_t dir_sec_lba = 0;
+    uint32_t dir_sec_lba = 0;
     uint16_t dir_idx     = 0;
     uint16_t last_clus;
     uint16_t cluster_bytes;
@@ -938,15 +1513,21 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
     const uint8_t __far *in_ptr = (const uint8_t __far *)src;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
 
-    if (resolve_parent_and_leaf(filename, &parent_clus, name83) != 0) {
+    if (vol_resolve_path(filename, &vol, &subpath) != 0) {
+        return -1;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
         return -1;
     }
     if (name83[0] == '.') {
         return -1;
     }
 
-    /* If file does not exist or is empty, create/write it from scratch */
-    if (find_dir_entry(parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) != 0 ||
+    if (find_dir_entry(vol, parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) != 0 ||
         entry.file_size == 0 || entry.fst_clus_lo < 2) {
         return fat16_write_file(filename, src, size);
     }
@@ -958,29 +1539,27 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
         return 0;
     }
 
-    /* Walk to the last cluster in the existing file's chain */
     last_clus = entry.fst_clus_lo;
     while (last_clus >= 2 && last_clus < 0xFFF8) {
-        uint16_t next = fat_get_cluster(last_clus);
+        uint16_t next = fat_get_cluster(vol, last_clus);
         if (next >= 0xFFF8 || next < 2) {
             break;
         }
         last_clus = next;
     }
 
-    cluster_bytes = (uint16_t)bpb_sectors_per_cluster * 512;
+    cluster_bytes = (uint16_t)vol->sectors_per_cluster * 512;
     off_in_clus   = (uint16_t)(entry.file_size & (cluster_bytes - 1));
 
-    /* Fill remaining space in the last allocated cluster if not on a cluster boundary */
     if (off_in_clus != 0) {
-        uint16_t first_lba   = data_lba + (last_clus - 2) * bpb_sectors_per_cluster;
+        uint32_t first_lba   = cluster_to_lba(vol, last_clus);
         uint8_t  sec_in_clus = (uint8_t)(off_in_clus >> 9);
         uint16_t off_in_sec  = off_in_clus & 511;
         uint8_t  s;
 
         if (off_in_sec != 0) {
             uint16_t j;
-            if (disk_rw_lba(0, first_lba + sec_in_clus, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+            if (vol_rw_lba(vol, 0, first_lba + sec_in_clus, MK_FP(KERNEL_SEG, io_buf)) != 0) {
                 return -1;
             }
             for (j = off_in_sec; j < 512; j++) {
@@ -990,13 +1569,13 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
                     io_buf[j] = 0;
                 }
             }
-            if (disk_rw_lba(1, first_lba + sec_in_clus, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+            if (vol_rw_lba(vol, 1, first_lba + sec_in_clus, MK_FP(KERNEL_SEG, io_buf)) != 0) {
                 return -1;
             }
             sec_in_clus++;
         }
 
-        for (s = sec_in_clus; s < bpb_sectors_per_cluster && written < size; s++) {
+        for (s = sec_in_clus; s < vol->sectors_per_cluster && written < size; s++) {
             uint16_t j;
             for (j = 0; j < 512; j++) {
                 if (written < size) {
@@ -1005,29 +1584,28 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
                     io_buf[j] = 0;
                 }
             }
-            if (disk_rw_lba(1, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+            if (vol_rw_lba(vol, 1, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
                 return -1;
             }
         }
     }
 
-    /* Allocate additional clusters if more data remains */
     while (written < size) {
-        uint16_t clus = alloc_free_cluster(search_hint);
-        uint16_t first_lba;
+        uint16_t clus = alloc_free_cluster(vol, search_hint);
+        uint32_t first_lba;
         uint8_t  s;
 
         if (clus == 0) {
             return -1;
         }
         search_hint = clus + 1;
-        if (fat_set_cluster(last_clus, clus) != 0) {
+        if (fat_set_cluster(vol, last_clus, clus) != 0) {
             return -1;
         }
         last_clus = clus;
 
-        first_lba = data_lba + (clus - 2) * bpb_sectors_per_cluster;
-        for (s = 0; s < bpb_sectors_per_cluster; s++) {
+        first_lba = cluster_to_lba(vol, clus);
+        for (s = 0; s < vol->sectors_per_cluster; s++) {
             uint16_t j;
             for (j = 0; j < 512; j++) {
                 if (written < size) {
@@ -1036,7 +1614,7 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
                     io_buf[j] = 0;
                 }
             }
-            if (disk_rw_lba(1, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+            if (vol_rw_lba(vol, 1, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
                 return -1;
             }
         }
@@ -1046,12 +1624,11 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
         return -1;
     }
 
-    /* Update directory entry with the new file size */
-    if (disk_rw_lba(0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
     entries[dir_idx].file_size = entry.file_size + (uint32_t)size;
-    if (disk_rw_lba(1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
 
@@ -1059,32 +1636,41 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
 }
 
 int fat16_delete_file(const char __far *filename) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t parent_clus;
     uint8_t name83[11];
     fat16_dirent_t entry;
-    uint16_t dir_sec_lba = 0;
+    uint32_t dir_sec_lba = 0;
     uint16_t dir_idx     = 0;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
 
-    if (resolve_parent_and_leaf(filename, &parent_clus, name83) != 0) {
+    if (vol_resolve_path(filename, &vol, &subpath) != 0) {
         return -1;
     }
-    if (find_dir_entry(parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) != 0) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
+        return -1;
+    }
+    if (find_dir_entry(vol, parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) != 0) {
         return -1;
     }
     if (entry.attr & FAT_ATTR_DIRECTORY) {
         return -1;
     }
     if (entry.fst_clus_lo >= 2) {
-        if (free_cluster_chain(entry.fst_clus_lo) != 0) {
+        if (free_cluster_chain(vol, entry.fst_clus_lo) != 0) {
             return -1;
         }
     }
-    if (disk_rw_lba(0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
     entries[dir_idx].name[0] = 0xE5;
-    if (disk_rw_lba(1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    if (vol_rw_lba(vol, 1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
         return -1;
     }
     return 0;
@@ -1092,6 +1678,9 @@ int fat16_delete_file(const char __far *filename) {
 
 int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint8_t append) {
     static uint8_t copy_buf[512];
+    os_volume_t *src_vol, *dst_vol;
+    const char __far *src_sub;
+    const char __far *dst_sub;
     uint16_t src_parent, dst_parent;
     uint8_t  src_name83[11], dst_name83[11];
     fat16_dirent_t src_entry;
@@ -1099,23 +1688,30 @@ int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint
     uint16_t cur_clus;
     uint8_t  first_chunk = (uint8_t)(!append);
 
-    if (resolve_parent_and_leaf(src_path, &src_parent, src_name83) != 0) {
+    if (vol_resolve_path(src_path, &src_vol, &src_sub) != 0) {
         return -1;
     }
-    if (find_dir_entry(src_parent, src_name83, &src_entry, 0, 0) != 0) {
+    if (resolve_parent_and_leaf(src_vol, src_sub, &src_parent, src_name83, (uint8_t)(src_path != src_sub)) != 0) {
+        return -1;
+    }
+    if (find_dir_entry(src_vol, src_parent, src_name83, &src_entry, 0, 0) != 0) {
         return -1;
     }
     if (src_entry.attr & FAT_ATTR_DIRECTORY) {
         return -1;
     }
 
-    if (resolve_parent_and_leaf(dst_path, &dst_parent, dst_name83) != 0) {
+    if (vol_resolve_path(dst_path, &dst_vol, &dst_sub) != 0) {
+        return -1;
+    }
+    if (resolve_parent_and_leaf(dst_vol, dst_sub, &dst_parent, dst_name83, (uint8_t)(dst_path != dst_sub)) != 0) {
         return -1;
     }
     if (dst_name83[0] == '.') {
         return -1;
     }
-    if (!append && src_parent == dst_parent && name_equals(src_name83, dst_name83)) {
+    if (!append && resolve_vol_alias(src_vol) == resolve_vol_alias(dst_vol) &&
+        src_parent == dst_parent && name_equals(src_name83, dst_name83)) {
         return 0;
     }
 
@@ -1130,15 +1726,15 @@ int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint
     }
 
     while (cur_clus >= 2 && cur_clus < 0xFFF8 && remaining > 0) {
-        uint16_t first_lba = data_lba + (cur_clus - 2) * bpb_sectors_per_cluster;
-        uint16_t next_clus = fat_get_cluster(cur_clus);
+        uint32_t first_lba = cluster_to_lba(src_vol, cur_clus);
+        uint16_t next_clus = fat_get_cluster(src_vol, cur_clus);
         uint8_t  s;
 
-        for (s = 0; s < bpb_sectors_per_cluster && remaining > 0; s++) {
+        for (s = 0; s < src_vol->sectors_per_cluster && remaining > 0; s++) {
             uint16_t chunk = (remaining > 512) ? 512 : (uint16_t)remaining;
             int rc;
 
-            if (disk_rw_lba(0, first_lba + s, MK_FP(KERNEL_SEG, copy_buf)) != 0) {
+            if (vol_rw_lba(src_vol, 0, first_lba + s, MK_FP(KERNEL_SEG, copy_buf)) != 0) {
                 return -1;
             }
             if (first_chunk) {
@@ -1159,25 +1755,41 @@ int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint
 }
 
 int fat16_rename_file(const char __far *src_path, const char __far *dst_path) {
+    os_volume_t *src_vol, *dst_vol;
+    const char __far *src_sub;
+    const char __far *dst_sub;
     uint16_t src_parent, dst_parent;
     uint8_t  src_name83[11], dst_name83[11];
     fat16_dirent_t src_entry, dst_entry;
-    uint16_t src_sec_lba = 0, src_idx = 0;
-    uint16_t dst_sec_lba = 0, dst_idx = 0;
+    uint32_t src_sec_lba = 0;
+    uint16_t src_idx     = 0;
+    uint32_t dst_sec_lba = 0;
+    uint16_t dst_idx     = 0;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
     int i;
 
-    if (resolve_parent_and_leaf(src_path, &src_parent, src_name83) != 0) {
+    if (vol_resolve_path(src_path, &src_vol, &src_sub) != 0) {
         return -1;
     }
-    if (find_dir_entry(src_parent, src_name83, &src_entry, &src_sec_lba, &src_idx) != 0) {
+    if (resolve_parent_and_leaf(src_vol, src_sub, &src_parent, src_name83, (uint8_t)(src_path != src_sub)) != 0) {
+        return -1;
+    }
+    if (find_dir_entry(src_vol, src_parent, src_name83, &src_entry, &src_sec_lba, &src_idx) != 0) {
         return -1;
     }
     if (src_entry.attr & FAT_ATTR_DIRECTORY) {
         return -1;
     }
 
-    if (resolve_parent_and_leaf(dst_path, &dst_parent, dst_name83) != 0) {
+    if (vol_resolve_path(dst_path, &dst_vol, &dst_sub) != 0) {
+        return -1;
+    }
+    if (resolve_vol_alias(src_vol) != resolve_vol_alias(dst_vol)) {
+        /* Cannot rename across physical volumes */
+        return -1;
+    }
+
+    if (resolve_parent_and_leaf(dst_vol, dst_sub, &dst_parent, dst_name83, (uint8_t)(dst_path != dst_sub)) != 0) {
         return -1;
     }
     if (dst_name83[0] == '.') {
@@ -1187,17 +1799,17 @@ int fat16_rename_file(const char __far *src_path, const char __far *dst_path) {
         return 0;
     }
 
-    if (find_dir_entry(dst_parent, dst_name83, &dst_entry, &dst_sec_lba, &dst_idx) == 0) {
+    if (find_dir_entry(dst_vol, dst_parent, dst_name83, &dst_entry, &dst_sec_lba, &dst_idx) == 0) {
         if (dst_entry.attr & FAT_ATTR_DIRECTORY) {
             return -1;
         }
         if (dst_entry.fst_clus_lo >= 2) {
-            if (free_cluster_chain(dst_entry.fst_clus_lo) != 0) {
+            if (free_cluster_chain(dst_vol, dst_entry.fst_clus_lo) != 0) {
                 return -1;
             }
         }
     } else {
-        if (find_free_dir_slot(dst_parent, &dst_sec_lba, &dst_idx) != 0) {
+        if (find_free_dir_slot(dst_vol, dst_parent, &dst_sec_lba, &dst_idx) != 0) {
             return -1;
         }
     }
@@ -1207,28 +1819,28 @@ int fat16_rename_file(const char __far *src_path, const char __far *dst_path) {
     }
 
     if (dst_sec_lba == src_sec_lba) {
-        if (disk_rw_lba(0, dst_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        if (vol_rw_lba(dst_vol, 0, dst_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
         entries[src_idx].name[0] = 0xE5;
         entries[dst_idx] = src_entry;
-        if (disk_rw_lba(1, dst_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        if (vol_rw_lba(dst_vol, 1, dst_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
     } else {
-        if (disk_rw_lba(0, dst_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        if (vol_rw_lba(dst_vol, 0, dst_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
         entries[dst_idx] = src_entry;
-        if (disk_rw_lba(1, dst_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        if (vol_rw_lba(dst_vol, 1, dst_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
 
-        if (disk_rw_lba(0, src_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        if (vol_rw_lba(src_vol, 0, src_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
         entries[src_idx].name[0] = 0xE5;
-        if (disk_rw_lba(1, src_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        if (vol_rw_lba(src_vol, 1, src_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
     }
@@ -1236,43 +1848,44 @@ int fat16_rename_file(const char __far *src_path, const char __far *dst_path) {
     return 0;
 }
 
-static int resolve_dir_cluster(const char __far *path, uint16_t *out_cluster) {
+static int resolve_dir_cluster(os_volume_t *vol, const char __far *subpath, uint16_t *out_cluster, uint8_t is_vol_root) {
     uint16_t cur_clus;
     uint16_t pos = 0;
     char comp[16];
 
-    if (!fs_mounted) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
         return -1;
     }
-    if (!path || path[0] == '\0') {
-        *out_cluster = cwd_cluster;
+    if (!subpath || subpath[0] == '\0') {
+        *out_cluster = vol->cwd_cluster;
         return 0;
     }
 
-    if (is_sep(path[0])) {
+    if (is_sep(subpath[0]) || is_vol_root) {
         cur_clus = 0;
-        while (is_sep(path[pos])) {
+        while (is_sep(subpath[pos])) {
             pos++;
         }
     } else {
-        cur_clus = cwd_cluster;
+        cur_clus = vol->cwd_cluster;
     }
 
-    while (path[pos] != '\0') {
+    while (subpath[pos] != '\0') {
         uint16_t k = 0;
-        while (path[pos] != '\0' && !is_sep(path[pos])) {
+        while (subpath[pos] != '\0' && !is_sep(subpath[pos])) {
             if (k >= 14) {
                 return -1;
             }
-            comp[k++] = path[pos++];
+            comp[k++] = subpath[pos++];
         }
         comp[k] = '\0';
 
-        while (is_sep(path[pos])) {
+        while (is_sep(subpath[pos])) {
             pos++;
         }
 
-        if (step_into_dir(cur_clus, comp, &cur_clus) != 0) {
+        if (step_into_dir(vol, cur_clus, comp, &cur_clus) != 0) {
             return -1;
         }
     }
@@ -1282,20 +1895,30 @@ static int resolve_dir_cluster(const char __far *path, uint16_t *out_cluster) {
 }
 
 int fat16_dir_entry(const char __far *path, uint16_t index, os_dir_entry_t __far *out_info) {
+    os_volume_t *vol;
+    const char __far *subpath;
     uint16_t target_clus;
-    uint16_t s, i, sec_lba;
+    uint16_t s, i;
+    uint32_t sec_lba;
     uint16_t cur_idx = 0;
     fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
 
     if (!fs_mounted || !out_info) {
         return -1;
     }
-    if (resolve_dir_cluster(path, &target_clus) != 0) {
+    if (vol_resolve_path(path, &vol, &subpath) != 0) {
+        return -2;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -2;
+    }
+    if (resolve_dir_cluster(vol, subpath, &target_clus, (uint8_t)(path != subpath)) != 0) {
         return -2;
     }
 
-    for (s = 0; dir_get_sector_lba(target_clus, s, &sec_lba) == 0; s++) {
-        if (disk_rw_lba(0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+    for (s = 0; dir_get_sector_lba(vol, target_clus, s, &sec_lba) == 0; s++) {
+        if (vol_rw_lba(vol, 0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
             return -1;
         }
         for (i = 0; i < 16; i++) {
