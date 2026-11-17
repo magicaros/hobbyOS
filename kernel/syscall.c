@@ -339,7 +339,8 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
 
     case SYS_CHDIR: {
         const char __far *path = (const char __far *)MK_FP(regs->ds, regs->bx);
-        regs->ax = (fat16_chdir(path) == 0) ? 0 : 0xFFFF;
+        int res = fat16_chdir(path);
+        regs->ax = (res < 0) ? (uint16_t)res : 0;
         break;
     }
 
@@ -370,6 +371,21 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         break;
     }
 
+    case SYS_DISKCHANGE: {
+        const char __far *dev = regs->bx ? (const char __far *)MK_FP(regs->ds, regs->bx) : 0;
+        regs->ax = (vol_diskchange(dev) == 0) ? 0 : 0xFFFF;
+        break;
+    }
+
+    case SYS_VOL_FORMAT: {
+        const char __far *dev   = regs->bx ? (const char __far *)MK_FP(regs->ds, regs->bx) : 0;
+        const char __far *label = (regs->es != 0 && regs->di != 0) ? (const char __far *)MK_FP(regs->es, regs->di) : 0;
+        uint16_t flags = regs->cx;
+        int res = fat16_format_volume(dev, label, flags);
+        regs->ax = (res < 0) ? (uint16_t)res : 0;
+        break;
+    }
+
     case SYS_EXEC: {
         const char __far *fname = (const char __far *)MK_FP(regs->ds, regs->bx);
         const char __far *args  = regs->di ? (const char __far *)MK_FP(regs->es, regs->di) : 0;
@@ -387,6 +403,28 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
     case SYS_SET_PATH: {
         const char __far *p = (const char __far *)MK_FP(regs->es, regs->di);
         regs->ax = (path_set(p) == 0) ? 0 : 0xFFFF;
+        break;
+    }
+
+    case SYS_DISK_GET_GEOM: {
+        os_disk_geom_t __far *geom = (os_disk_geom_t __far *)MK_FP(regs->es, regs->di);
+        int res = disk_get_geom((uint8_t)(regs->bx & 0xFF), geom);
+        regs->ax = (res < 0) ? 0xFFFF : 0;
+        break;
+    }
+
+    case SYS_PART_READ: {
+        os_part_table_t __far *table = (os_part_table_t __far *)MK_FP(regs->es, regs->di);
+        int res = disk_part_read((uint8_t)(regs->bx & 0xFF), table);
+        regs->ax = (res < 0) ? 0xFFFF : 0;
+        break;
+    }
+
+    case SYS_PART_WRITE: {
+        const os_part_table_t __far *table = (const os_part_table_t __far *)MK_FP(regs->es, regs->di);
+        uint16_t write_mbr = regs->cx;
+        int res = disk_part_write((uint8_t)(regs->bx & 0xFF), table, write_mbr);
+        regs->ax = (res < 0) ? 0xFFFF : 0;
         break;
     }
 

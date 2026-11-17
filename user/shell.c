@@ -32,6 +32,36 @@ static uint16_t    var_count = 0;
 static uint16_t    last_exit_code = 0;
 static int         script_echo_on = 1;
 
+static uint16_t u32_div10(uint32_t *val) {
+    uint16_t hi = (uint16_t)(*val >> 16);
+    uint16_t lo = (uint16_t)(*val & 0xFFFF);
+    uint16_t q_hi = hi / 10;
+    uint16_t r_hi = hi % 10;
+    uint16_t d_hi = (r_hi << 4) + (lo >> 12);
+    uint16_t q_mid = d_hi / 10;
+    uint16_t r_mid = d_hi % 10;
+    uint16_t d_lo = (r_mid << 12) + (lo & 0x0FFF);
+    uint16_t q_lo = d_lo / 10;
+    uint16_t rem  = d_lo % 10;
+    *val = ((uint32_t)q_hi << 16) | ((uint32_t)(q_mid << 12) + q_lo);
+    return rem;
+}
+
+static void print_uint32(uint32_t val) {
+    char buf[12];
+    int i = 0;
+    if (val == 0) {
+        os_putc('0');
+        return;
+    }
+    while (val > 0 && i < 11) {
+        buf[i++] = (char)('0' + u32_div10(&val));
+    }
+    while (i > 0) {
+        os_putc(buf[--i]);
+    }
+}
+
 static void print_uint16(uint16_t val) {
     char buf[8];
     int i = 0;
@@ -54,10 +84,16 @@ static void print_hex_byte(uint8_t val) {
     os_putc(hex[val & 0x0F]);
 }
 
-static uint16_t clusters_to_kb(uint16_t clusters, uint8_t spc) {
-    uint16_t kb = clusters;
+static uint32_t clusters_to_kb(uint16_t clusters, uint8_t spc) {
+    uint32_t kb = clusters;
+    uint8_t mult;
+    if (spc == 0) spc = 1;
+    mult = (uint8_t)(spc >> 1);
     if (spc >= 2) {
-        kb *= (spc >> 1);
+        while (mult > 1) {
+            kb <<= 1;
+            mult >>= 1;
+        }
     } else {
         kb >>= 1;
     }
@@ -459,10 +495,16 @@ static void cmd_ls(const char *path) {
     for (;;) {
         int rc = os_dir_entry_at(dir_arg, idx, (os_dir_entry_t __far *)FP_HERE(&dent));
         if (rc != 0) {
-            if (idx == 0 && rc == -2) {
-                os_puts("Directory not found: ");
-                os_puts(path);
-                os_putc('\n');
+            if (idx == 0) {
+                if (rc == -3) {
+                    os_puts("Drive not ready / No disk in drive\n");
+                    return;
+                } else if (rc == -2) {
+                    os_puts("Directory not found: ");
+                    os_puts(path ? path : "");
+                    os_putc('\n');
+                    return;
+                }
             }
             break;
         }
@@ -486,18 +528,18 @@ static void cmd_ls(const char *path) {
 
     /* Print Volume Total and Free Space */
     if (os_vol_info(0xFF, (os_vol_info_t __far *)FP_HERE(&vinfo)) == 0) {
-        uint16_t total_kb = clusters_to_kb(vinfo.total_clusters, (uint8_t)vinfo.sectors_per_cluster);
-        uint16_t free_kb  = clusters_to_kb(vinfo.free_clusters, (uint8_t)vinfo.sectors_per_cluster);
+        uint32_t total_kb = clusters_to_kb(vinfo.total_clusters, (uint8_t)vinfo.sectors_per_cluster);
+        uint32_t free_kb  = clusters_to_kb(vinfo.free_clusters, (uint8_t)vinfo.sectors_per_cluster);
         os_puts("Volume ");
         os_puts(vinfo.name);
         os_puts(": ");
         print_uint16(vinfo.total_clusters);
         os_puts(" clusters (");
-        print_uint16(total_kb);
+        print_uint32(total_kb);
         os_puts(" KB), ");
         print_uint16(vinfo.free_clusters);
         os_puts(" free (");
-        print_uint16(free_kb);
+        print_uint32(free_kb);
         os_puts(" KB free)\n");
     }
 }
@@ -515,22 +557,51 @@ static void cmd_lsdisk(void) {
             os_puts(vinfo.target_name);
             os_puts(": (Alias)\n");
         } else {
-            uint16_t total_kb = clusters_to_kb(vinfo.total_clusters, (uint8_t)vinfo.sectors_per_cluster);
-            uint16_t free_kb  = clusters_to_kb(vinfo.free_clusters, (uint8_t)vinfo.sectors_per_cluster);
             os_puts("Drive 0x");
             print_hex_byte(vinfo.bios_drive);
-            if (vinfo.part_idx != 0xFF) {
+            if (vinfo.is_removable) {
+                os_puts(", Floppy");
+            } else if (vinfo.part_idx != 0xFF) {
                 os_puts(", Part ");
                 print_uint16((uint16_t)vinfo.part_idx);
             } else {
                 os_puts(", Raw");
             }
-            os_puts(" | ");
-            print_uint16(total_kb);
-            os_puts(" KB total (");
-            print_uint16(free_kb);
-            os_puts(" KB free)\n");
+
+            if (vinfo.is_removable && !vinfo.is_mounted) {
+                os_puts(" | [No disk inserted]\n");
+            } else if (!vinfo.is_mounted) {
+                os_puts(" | [Unformatted]\n");
+            } else {
+                uint32_t total_kb = clusters_to_kb(vinfo.total_clusters, (uint8_t)vinfo.sectors_per_cluster);
+                uint32_t free_kb  = clusters_to_kb(vinfo.free_clusters, (uint8_t)vinfo.sectors_per_cluster);
+                os_puts(vinfo.fat_type == 1 ? " (FAT12) | " : " (FAT16) | ");
+                print_uint32(total_kb);
+                os_puts(" KB total (");
+                print_uint32(free_kb);
+                os_puts(" KB free)\n");
+            }
         }
+    }
+}
+
+static void cmd_diskchange(const char *arg) {
+    if (arg && arg[0] != '\0') {
+        if (os_diskchange(arg) == 0) {
+            uint16_t len = str_len(arg);
+            os_puts(arg);
+            if (len == 0 || arg[len - 1] != ':') {
+                os_putc(':');
+            }
+            os_puts(" Remount pending / disk change signaled.\n");
+        } else {
+            os_puts("Device not found or not removable: ");
+            os_puts(arg);
+            os_putc('\n');
+        }
+    } else {
+        os_diskchange(0);
+        os_puts("Removable media reset / remount pending.\n");
     }
 }
 
@@ -544,7 +615,11 @@ static void cmd_cat(const char *path) {
     }
     n = os_file_read(path, FP_HERE(file_buf), 512);
     if (n < 0) {
-        os_puts("File not found: ");
+        if (n == -3) {
+            os_puts("Drive not ready / No disk in drive: ");
+        } else {
+            os_puts("File not found: ");
+        }
         os_puts(path);
         os_putc('\n');
         return;
@@ -971,12 +1046,18 @@ static void cmd_mv(char *arg_line) {
 }
 
 static void cmd_cd(const char *path) {
+    int rc;
     if (!path || path[0] == '\0') {
         os_puts("Usage: cd <dir>\n");
         return;
     }
-    if (os_chdir(path) != 0) {
-        os_puts("Directory not found: ");
+    rc = os_chdir(path);
+    if (rc != 0) {
+        if (rc == -3) {
+            os_puts("Drive not ready / No disk in drive: ");
+        } else {
+            os_puts("Directory not found: ");
+        }
         os_puts(path);
         os_putc('\n');
     }
@@ -1252,13 +1333,15 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
         os_puts("Commands: help, ls [dir|pat], lsdisk, cd <dir>, pwd, mkdir <dir>, rmdir <dir>,\n");
         os_puts("          cat <file>, write [-a] [file] \"<text>\", cp <src> <dst>, mv <s> <d>,\n");
         os_puts("          rm <path>, edit <file>, forth, set [VAR=VAL], echo [text|on|off],\n");
-        os_puts("          keyb [us|fr|be], mem, cls, <DEV:> (cp/rm/ls support * and ? wildcards)\n");
+        os_puts("          keyb [us|fr|be], mem, cls, format [dev:] [/s], fdisk, diskchange, <DEV:>\n");
     } else if (str_eq(cmd, "set")) {
         cmd_set(rest);
     } else if (str_eq(cmd, "ls") || str_eq(cmd, "dir")) {
         cmd_ls(rest);
     } else if (str_eq(cmd, "lsdisk")) {
         cmd_lsdisk();
+    } else if (str_eq(cmd, "diskchange")) {
+        cmd_diskchange(rest);
     } else if (str_eq(cmd, "cd")) {
         cmd_cd(rest);
     } else if (str_eq(cmd, "pwd")) {

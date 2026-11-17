@@ -66,10 +66,22 @@ typedef signed long    int32_t;
 #define SYS_FILE_RENAME  0x1B
 #define SYS_VOL_INFO     0x1C
 #define SYS_VOL_SPACE    0x1D
+#define SYS_DISKCHANGE   0x1E
+#define SYS_VOL_FORMAT   0x1F
+
+#define FAT_TYPE_FAT12   1
+#define FAT_TYPE_FAT16   2
+
+#define OS_ERR_NOT_FOUND     -1
+#define OS_ERR_DIR_NOT_FOUND -2
+#define OS_ERR_NO_MEDIA      -3
 
 #define SYS_EXEC         0x20
 #define SYS_GET_PATH     0x21
 #define SYS_SET_PATH     0x22
+#define SYS_DISK_GET_GEOM 0x23
+#define SYS_PART_READ     0x24
+#define SYS_PART_WRITE    0x25
 
 #define SYS_MEM_ALLOC    0x30
 #define SYS_MEM_FREE     0x31
@@ -132,10 +144,19 @@ typedef struct {
     uint32_t size;       /* File size in bytes */
 } os_dir_entry_t;
 
+/* Volume format flags & geometry types */
+#define FORMAT_TYPE_AUTO   0
+#define FORMAT_TYPE_1440   1  /* 1.44 MB 3.5" (80 cyls, 2 heads, 18 spt) */
+#define FORMAT_TYPE_720    2  /* 720 KB 3.5" (80 cyls, 2 heads, 9 spt) */
+#define FORMAT_TYPE_1200   3  /* 1.2 MB 5.25" (80 cyls, 2 heads, 15 spt) */
+#define FORMAT_TYPE_360    4  /* 360 KB 5.25" (40 cyls, 2 heads, 9 spt) */
+
+#define FORMAT_FLAG_QUICK  0x8000
+
 /* Volume info returned by SYS_VOL_INFO */
 typedef struct {
-    char     name[8];              /* Volume name (e.g. "HD0A", "SYS", "HD0") */
-    uint8_t  bios_drive;           /* BIOS drive number (0x80, 0x81, 0x00) */
+    char     name[8];              /* Volume name (e.g. "HD0A", "SYS", "HD0", "FD0") */
+    uint8_t  bios_drive;           /* BIOS drive number (0x80, 0x81, 0x00, 0x01) */
     uint8_t  part_idx;             /* Partition index (0..3, or 0xFF if raw/alias) */
     uint8_t  is_alias;             /* 1 if volume is an alias */
     char     target_name[8];       /* Target volume name if alias */
@@ -143,7 +164,41 @@ typedef struct {
     uint16_t free_clusters;        /* Free data clusters */
     uint16_t sectors_per_cluster;  /* Sectors per cluster */
     uint16_t bytes_per_sector;     /* Bytes per sector (512) */
+    uint8_t  is_removable;         /* 1 if removable media (floppy) */
+    uint8_t  is_mounted;           /* 1 if media is mounted and BPB parsed */
+    uint8_t  fat_type;             /* FAT_TYPE_FAT12 or FAT_TYPE_FAT16 */
 } os_vol_info_t;
+
+/* Physical disk geometry returned by SYS_DISK_GET_GEOM */
+typedef struct {
+    uint8_t  bios_drive;        /* 0x80, 0x81, etc. */
+    uint8_t  num_drives;        /* Total number of fixed hard drives detected */
+    uint16_t cyls;              /* Physical / translation cylinders */
+    uint8_t  heads;             /* Physical / translation heads */
+    uint8_t  spt;               /* Sectors per track */
+    uint32_t total_sectors;     /* Total addressable sectors */
+} os_disk_geom_t;
+
+/* Partition record within an MBR partition table */
+typedef struct {
+    uint8_t  boot_indicator;    /* 0x80 = Active / Bootable, 0x00 = Inactive */
+    uint8_t  start_head;
+    uint8_t  start_sector;
+    uint8_t  start_cylinder;
+    uint8_t  part_type;         /* 0x06 = FAT16B, 0x04 = FAT16A, 0x01 = FAT12, 0x00 = Empty */
+    uint8_t  end_head;
+    uint8_t  end_sector;
+    uint8_t  end_cylinder;
+    uint32_t start_lba;         /* LBA start sector */
+    uint32_t total_sectors;     /* Sector count */
+} os_partition_t;
+
+/* Complete MBR partition table returned/written by SYS_PART_READ / SYS_PART_WRITE */
+typedef struct {
+    os_partition_t parts[4];
+    uint8_t        is_valid_mbr;  /* 1 if sector 0 has 0x55AA signature */
+    uint8_t        has_boot_code; /* 1 if sector 0 has non-zero bootstrap code */
+} os_part_table_t;
 
 /* Keyboard layout translation table (.MAP file format, 392 bytes) */
 typedef struct {
@@ -389,6 +444,25 @@ int os_vol_info(uint8_t index, os_vol_info_t __far *info);
     "int 0x21" \
     parm [bl] [es di] value [ax];
 
+int os_diskchange(const char *dev);
+#pragma aux os_diskchange = \
+    "mov ah, 0x1E" \
+    "int 0x21" \
+    parm [bx] value [ax];
+
+int os_vol_format(const char *dev, const char __far *label);
+#pragma aux os_vol_format = \
+    "xor cx, cx" \
+    "mov ah, 0x1F" \
+    "int 0x21" \
+    parm [bx] [es di] value [ax] modify [cx];
+
+int os_vol_format_ex(const char *dev, const char __far *label, uint16_t flags);
+#pragma aux os_vol_format_ex = \
+    "mov ah, 0x1F" \
+    "int 0x21" \
+    parm [bx] [es di] [cx] value [ax];
+
 int os_exec(const char *filename, const char *args);
 #pragma aux os_exec = \
     "push ds" \
@@ -408,6 +482,24 @@ int os_set_path(const char __far *path);
     "mov ah, 0x22" \
     "int 0x21" \
     parm [es di] value [ax];
+
+int os_disk_get_geom(uint8_t drive, os_disk_geom_t __far *out_geom);
+#pragma aux os_disk_get_geom = \
+    "mov ah, 0x23" \
+    "int 0x21" \
+    parm [bl] [es di] value [ax];
+
+int os_part_read(uint8_t drive, os_part_table_t __far *out_table);
+#pragma aux os_part_read = \
+    "mov ah, 0x24" \
+    "int 0x21" \
+    parm [bl] [es di] value [ax];
+
+int os_part_write(uint8_t drive, const os_part_table_t __far *table, uint16_t write_mbr_code);
+#pragma aux os_part_write = \
+    "mov ah, 0x25" \
+    "int 0x21" \
+    parm [bl] [es di] [cx] value [ax];
 
 uint16_t os_mem_alloc(uint16_t paragraphs);
 #pragma aux os_mem_alloc = \

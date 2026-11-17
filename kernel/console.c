@@ -110,6 +110,12 @@ void serial_init(void) {
     outb(COM1_BASE + 4, 0x03); /* DTR + RTS */
 }
 
+static void serial_putc(char c) {
+    uint16_t timeout = 5000;
+    while ((inb(COM1_BASE + 5) & 0x20) == 0 && --timeout > 0);
+    outb(COM1_BASE, (uint8_t)c);
+}
+
 static void put_cell(uint16_t idx, uint16_t val) {
     if (cga_shadow[idx] != val) {
         cga_shadow[idx] = val;
@@ -225,6 +231,7 @@ void con_set_cursor_visible(uint8_t visible) {
 }
 
 static void putc_no_cursor(char c) {
+    serial_putc(c);
     if (c == '\r') {
         cur_col = 0;
     } else if (c == '\n') {

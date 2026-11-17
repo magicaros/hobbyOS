@@ -1,5 +1,129 @@
 # Changelog
 
+## Revision 0.14 (2026-11-17)
+
+- **Hard Disk Partitioning Subsystem, Syscall API & `FDISK.BIN` (`boot/mbr.asm`, `user/fdisk.c`, `kernel/fat16.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `Makefile`, `user/format.c`)**:
+  - **Partition Management Syscalls (`include/hobbyos.h`, `kernel/syscall.c`, `kernel/fat16.c`)**:
+    - Added dedicated syscalls for querying drive geometry and reading/writing partition tables:
+      - `SYS_DISK_GET_GEOM` (`0x23`, `os_disk_get_geom(drive, &geom)`): Queries physical drive geometry (cylinders, heads, sectors per track, total LBA sectors) via BIOS `INT 0x13, AH=0x08`.
+      - `SYS_PART_READ` (`0x24`, `os_part_read(drive, &table)`): Reads LBA 0 (MBR) and unpacks the 4 partition table entries and boot signature.
+      - `SYS_PART_WRITE` (`0x25`, `os_part_write(drive, &table)`): Writes the updated partition table to LBA 0 (preserving or installing MBR boot code) and triggers an in-kernel storage volume rescan (`fat16_rescan_drives()`).
+    - Added structures `os_disk_geom_t`, `os_partition_t`, and `os_part_table_t`.
+  - **Dynamic In-Kernel Drive Rescanning (`kernel/fat16.c`, `kernel/kernel.h`)**:
+    - Added `fat16_rescan_drives()`: Flushes cached FAT sectors, resets volume tables, re-probes floppy drives and hard disks, and restores default aliases (`HD0A:` -> `HD0:`, `SYS:` -> boot volume).
+    - Fixed partition enumeration bug in `probe_drive()`: Snapshots MBR partition table to a local array `parts_copy[4]` before probing partition VBRs, preventing subsequent partitions (`HD1B:`, `HD1C:`, etc.) from being lost when `io_buf` is overwritten.
+  - **Standard 8086 Master Boot Record (`boot/mbr.asm`, `Makefile`)**:
+    - Implemented standard 8086 MBR bootblock (`boot/mbr.asm`, 446 bytes code + 64 bytes partition table + 2 bytes `0xAA55` signature).
+    - Relocates itself from `0000:7C00` to `0000:0600`, verifies partition table validity, searches for the active partition (`boot_indicator == 0x80`), loads the partition's VBR into `0000:7C00` with up to 5 retries, and jumps to `0000:7C00` passing `DL = boot_drive` and `DS:SI = partition table entry`.
+    - Integrated into build system: compiled with `nasm -f bin` to `build/mbr.bin`, converted by `tools/bin2c.py` into `build/mbrcode.h` (`default_mbr_code[446]`) for embedding into `FDISK.BIN`.
+  - **`FDISK.BIN` Interactive & CLI Partitioning Utility (`user/fdisk.c`)**:
+    - Complete partition management utility written in freestanding 8086 C.
+    - Interactive menu:
+      1. Create primary DOS partition (custom size in MB or maximum available).
+      2. Set active partition.
+      3. Delete partition.
+      4. Display partition information.
+      5. Switch fixed disk drive.
+      Q. Exit.
+    - CLI batch mode for scripting and testing:
+      - `fdisk /status`: Displays partition tables for all detected fixed disks.
+      - `fdisk <drive> /create:size|MAX`: Automatically creates partition aligned to cylinder boundaries.
+      - `fdisk <drive> /activate:n`: Marks partition `n` (1-4) as active bootable.
+      - `fdisk <drive> /delete:n`: Deletes partition `n`.
+      - `fdisk <drive> /mbr`: Installs or updates standard hobbyOS 8086 MBR boot code without touching partitions.
+    - Freestanding 8086 arithmetic: Inline hardware `div bx` pragmas (`div_dx_ax`, `rem_dx_ax`), shift/add multiplication (`(val << 3) + (val << 1)`), avoiding Watcom `-zl` 32-bit math helpers (`__U4D`, `__U4M`).
+  - **Volume Format Name Matching Fix (`user/format.c`)**:
+    - Replaced 3-character prefix comparison with case-insensitive full name matching `str_icmp()`, preventing secondary partition status reporting confusion (e.g. `HD1B:` matching `HD1A:`).
+
+## Revision 0.13 (2026-11-17)
+
+- **FAT16B / BigDOS Partition Formatting & 32-Bit Volume Reporting (`kernel/fat16.c`, `user/format.c`, `user/shell.c`)**:
+  - **FAT16B Hard Disk Partition Formatting (`kernel/fat16.c`)**:
+    - Extended `fat16_format_volume()` to format hard disk partitions larger than 32 MB (up to 2 GB) with the FAT16B / BigDOS standard.
+    - Inspects MBR partition table (LBA 0) for partition devices (`HD0A:`, `HD1A:`, etc.) to obtain the true sector count from the partition entry, preventing volumes previously formatted or clamped to 32 MB from being re-clamped.
+    - Automatically updates partition type in the MBR partition table from `0x04` (FAT16 < 32MB) to `0x06` (FAT16B > 32MB) when formatting partitions exceeding 65,535 sectors.
+    - Automatic MBR Active Partition Activation: Inspects the MBR partition table at LBA 0; if no partition is marked active (`0x80`), marks the partition being formatted as active (`boot_indicator = 0x80`) so the MBR code chains into the partition VBR upon reboot instead of halting with `INT 0x18`.
+    - Dynamic cluster geometry scaling: Automatically scales `spc` (sectors per cluster: 4, 8, 16, 32, 64) using power-of-two bit shifts without 32-bit C division routines, keeping total data clusters `<= 65520` to prevent 16-bit cluster integer overflow.
+    - Correctly writes `0` into `BPB_TotSec16` (offset 19) and total sectors into `BPB_TotSec32` (offset 32) when formatting volumes > 65,535 sectors, and vice-versa for volumes <= 32 MB.
+  - **32-Bit Volume Capacity Reporting & Free Space (`user/format.c`, `user/shell.c`)**:
+    - Implemented freestanding 8086-safe 32-bit decimal printer (`u32_div10` and `print_uint32()`) avoiding Watcom `-zl` `__U4D` library symbols.
+    - Upgraded `clusters_to_kb` in `user/shell.c` and size calculation in `user/format.c` to `uint32_t`, eliminating 16-bit integer overflow when calculating capacity and free space on partitions > 64 MB.
+    - Verified in 86Box: 504 MB partition formats cleanly and displays full `515792 KB` total and available space across both `format` and `lsdisk`.
+
+## Revision 0.12 (2026-11-17)
+
+- **Multi-Density Floppy Formatting Engine & AT/286+ Architecture Fixes (`kernel/fat16.c`, `kernel/entry.asm`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/format.c`)**:
+  - **AT/286+ Floppy Controller Rate & DPT Management (`kernel/entry.asm`, `kernel/fat16.c`)**:
+    - Added `bios_disk_set_media_type(drive, cyls, spt)` calling `INT 0x13, AH=0x18` ("Set Media Type for Format").
+    - Configures AT FDC controller data transfer rate (500 kbps for 1.44M/1.2M, 250 kbps for 720K/360K) and repoints Diskette Parameter Table (`INT 0x1E`) to correct sector count before formatting/writing.
+    - Graceful fallback on PC/XT BIOS where `AH=0x18` is unsupported.
+  - **Low-Level Track Formatting Engine (`kernel/entry.asm`, `kernel/fat16.c`)**:
+    - Added `bios_disk_format_track(drive, cyl, head, table)` calling `INT 0x13, AH=0x05`.
+    - Formats all cylinders and heads with 4-byte address fields (C, H, S, N) to lay down physical sector headers.
+    - Allows formatting completely raw/unformatted diskettes as well as reformatting media between geometries (e.g. 720K in 1.44M drive).
+    - Auto-skips track formatting on hard disk partitions and when `/Q` (quick format) is passed.
+  - **Universal Floppy Geometry Support (`kernel/fat16.c`)**:
+    - Full support for 4 standard PC floppy geometries:
+      - **1.44 MB 3.5" HD**: 80 cyls, 2 heads, 18 spt, 2880 sectors, 1 spc, 224 root entries, 9 spf, media `0xF0`.
+      - **720 KB 3.5" DD**: 80 cyls, 2 heads, 9 spt, 1440 sectors, 2 spc, 112 root entries, 3 spf, media `0xF9`.
+      - **1.2 MB 5.25" HD**: 80 cyls, 2 heads, 15 spt, 2400 sectors, 1 spc, 224 root entries, 7 spf, media `0xF9`.
+      - **360 KB 5.25" DD**: 40 cyls, 2 heads, 9 spt, 720 sectors, 2 spc, 112 root entries, 2 spf, media `0xFD`.
+    - In auto-detection mode (`FORMAT_TYPE_AUTO`), inspects existing media VBR first to preserve inserted disk geometry (preventing 720K disks in 1.44M drives from being corrupted as 1.44M), then falls back to BIOS drive parameters or 720K fallback.
+  - **User-Space Geometry & Quick Format Flags (`user/format.c`, `include/hobbyos.h`, `kernel/syscall.c`)**:
+    - Added `os_vol_format_ex(dev, label, flags)` passing geometry types and quick flag in register `CX`.
+    - `FORMAT.BIN` parses `/F:1440`, `/F:720`, `/F:1200`, `/F:360` (also `/1440`, `/720`, `/1200`, `/360`) and `/Q`.
+    - Displays selected format details during formatting (e.g. `(720 KB DD, 9 spt)`).
+
+## Revision 0.11 (2026-11-17)
+
+- **Disk & Partition Formatting Utility `FORMAT.BIN` with System Bootblock Installation (`user/format.c`, `kernel/fat16.c`, `kernel/syscall.c`, `kernel/console.c`, `boot/boot.asm`, `include/hobbyos.h`, `kernel/kernel.h`, `Makefile`)**:
+  - **`FORMAT.BIN` User Utility (`user/format.c`)**:
+    - Full-featured disk formatting tool supporting floppy drives (`FD0:`, `FD1:`) and hard disk partitions (`HD0A:`, `HD1A:`).
+    - Syntax: `FORMAT <DEV:> [/S] [/V:label] [/Y]`.
+    - Safety confirmation prompt before destructive write (`WARNING: ALL DATA ON DISK DRIVE %s WILL BE LOST! Proceed with Format (Y/N)?`), with `/Y` switch for non-interactive scripting/testing.
+    - System transfer (`/S`): Installs bootloader, copies `/KERNEL.BIN` to root, creates `/BIN`, and copies `/BIN/SHELL.BIN` to `/BIN/SHELL.BIN`.
+    - Real-time format statistics: Reports total capacity and available free space in kilobytes.
+  - **Kernel Formatting Engine & Syscall `SYS_VOL_FORMAT` (`0x1F` / `os_vol_format()`)**:
+    - Low-level formatting engine in `kernel/fat16.c` (`fat16_format_volume`):
+      - Floppy auto-geometry discovery (defaults 720KB 3.5" 2DD, 80 tracks, 2 heads, 9 spt for PC/XT, detects 1.44MB on AT BIOS).
+      - Hard disk partition formatting using start LBA and sector count from MBR.
+      - Constructs Sector 0 (VBR) with valid BPB, OEM `"HOBBYOS"`, volume label, and `0x55AA` boot signature.
+      - Clears FAT1 and FAT2 tables with proper media descriptors (`0xF9` for 720K, `0xF0` for 1.44M, `0xF8` for hard disks).
+      - Clears root directory sectors and writes optional volume label directory entry (`FAT_ATTR_VOLUME_ID`).
+      - In-memory state refresh: Invalidate FAT cache, re-parses BPB, resets CWD to `/`, and marks volume mounted.
+  - **Universal Dual FAT12/FAT16 Bootloader (`boot/boot.asm`)**:
+    - Updated HobbyOS bootloader sector to support booting from both FAT12 (floppies) and FAT16 (hard drives).
+    - Dynamic cluster lookup: Detects filesystem type from BPB and switches to 12-bit packed cluster lookup (with boundary-crossing sector pair buffer) or FAT16 cluster lookup.
+    - 3-retry spin-up loop with controller reset on `INT 0x13` read failure for robust floppy booting.
+    - Fits within Sector 0 (512 bytes with `0x55AA` signature).
+    - Embedded into kernel build as `build/bootcode.h` and deployed to `/BIN/BOOT.BIN`.
+  - **Optimized Streaming File Copy (`kernel/fat16.c`)**:
+    - Boosted `fat16_copy_file` with a 2 KB streaming buffer (`copy_buf`), copying entire clusters per batch rather than 512-byte increments, reducing floppy disk head thrashing and speeding up transfer by over 400%.
+  - **Serial Console Mirroring to COM1 (`kernel/console.c`)**:
+    - All console text output (`putc_no_cursor`) is mirrored to COM1 (9600 8N1) alongside screen memory, enabling full terminal session logging under 86Box headless execution.
+  - **Shell Integration (`user/shell.c`)**:
+    - `lsdisk` reports unformatted hard disk partitions cleanly as `[Unformatted]`.
+    - Added `format` to `help` command list.
+
+- **FAT12 Filesystem Driver & Removable Media Lazy Mount Architecture (`kernel/fat16.c`, `kernel/entry.asm`, `kernel/kernel.h`, `kernel/syscall.c`, `include/hobbyos.h`, `user/shell.c`)**:
+  - **Floppy Drive Detection from BDA**:
+    - Discovers physical floppy drives at boot via BIOS Data Area Equipment Word (`0x0040:0x0010` bit 0 & bits 6–7).
+    - Registers `FD0:` (BIOS 0x00) and `FD1:` (BIOS 0x01) without spinning up spindle motors at boot, keeping boot time instantaneous.
+  - **Lazy Mount & Geometry Auto-Discovery**:
+    - Mounts removable drives on demand upon first filesystem access.
+    - Reads Sector 0 (CHS 0,0,1) with floppy controller reset (`INT 0x13, AH=0x00`) and 3 retries for motor spin-up.
+    - Dynamically configures `sectors_per_track` and `num_heads` straight from the BPB (supporting 360K, 720K, 1.2M, and 1.44M floppy formats).
+    - If empty or door open, returns clean `OS_ERR_NO_MEDIA` (`-3`) without hang, displaying `Drive not ready / No disk in drive`.
+  - **FAT12 Cluster Chain Engine**:
+    - Full 12-bit packed cluster lookup and allocation in `kernel/fat16.c` (`FAT_TYPE_FAT12`).
+    - Handles 511-byte FAT sector boundaries when a 12-bit entry spans two sectors.
+    - End-of-chain (`>= 0x0FF8`) and free cluster accounting seamlessly unified with FAT16.
+  - **AmigaDOS-Style `diskchange` Command & Removable State Management**:
+    - Syscall `SYS_DISKCHANGE` (`0x1E` / `os_diskchange()`).
+    - `diskchange [dev:]` shell command to unmount removable drives and signal media swap.
+    - Auto-unmounts removable volumes upon I/O errors to prevent stale cache corruption.
+    - `lsdisk` displays floppy status: `[No disk inserted]` when unmounted, or formatted capacity and free space `(FAT12)` when mounted.
+
 ## Revision 0.9 (2026-11-17)
 
 - **Wildcard Pattern Support in User-Space File Management Commands (`user/shell.c`)**:

@@ -73,7 +73,7 @@ start:
     add ax, [root_lba]
     mov [data_lba], ax
 
-    ; Search FAT16 root directory for "KERNEL  BIN"
+    ; Search root directory for "KERNEL  BIN"
     mov ax, [root_lba]
 .search_root_sector:
     xor bx, bx
@@ -126,7 +126,11 @@ found_kernel:
 .no_seg_wrap:
     loop .read_cluster_sector
 
-    ; Look up next cluster in FAT16 table
+    ; Check if FAT12 or FAT16
+    cmp byte [bpb_fs_type + 4], '2'     ; '2' in "FAT12"
+    je  .fat12_lookup
+
+    ; --- FAT16 Lookup ---
     mov ax, bp
     mov al, ah
     xor ah, ah
@@ -142,8 +146,43 @@ found_kernel:
     mov bp, [bx + 0x0500]
     cmp bp, 0xFFF8
     jb  .load_cluster
+    jmp .done_kernel
 
-    mov ax, 0x0E4B                      ; Print 'K' (Kernel loaded from FAT16)
+    ; --- FAT12 Lookup ---
+.fat12_lookup:
+    mov ax, bp
+    mov bx, ax
+    shr bx, 1                           ; bx = cluster / 2
+    add ax, bx                          ; ax = cluster * 1.5 (byte offset in FAT)
+    push ax                             ; save byte offset
+    mov cl, 9
+    shr ax, cl                          ; ax = offset / 512
+    add ax, [fat_lba]                   ; ax = FAT sector LBA
+    xor bx, bx
+    mov es, bx
+    mov bx, 0x0500
+    call read_sector
+    inc ax
+    mov bx, 0x0700
+    call read_sector                    ; read consecutive sector for cross-boundary entries
+
+    pop bx                              ; bx = byte offset in FAT
+    and bx, 0x01FF                      ; bx = offset within sector (0..511)
+    mov ax, [bx + 0x0500]               ; 16-bit word
+    test bp, 1                          ; is cluster odd?
+    jz  .fat12_even
+    mov cl, 4
+    shr ax, cl                          ; odd cluster: high 12 bits
+    jmp .fat12_check
+.fat12_even:
+    and ax, 0x0FFF                      ; even cluster: low 12 bits
+.fat12_check:
+    mov bp, ax
+    cmp bp, 0x0FF8
+    jb  .load_cluster
+
+.done_kernel:
+    mov ax, 0x0E4B                      ; Print 'K' (Kernel loaded)
     int 0x10
 
     mov dl, [bpb_drive_num]
@@ -183,10 +222,21 @@ read_sector:
     or  cl, ah                          ; cl |= cylinder high 2 bits (bits 6..7)
 
     mov dl, [bpb_drive_num]
+    mov di, 3                           ; 3 retries for floppy spin-up
+.try_read:
+    push ax
     mov ax, 0x0201                      ; BIOS Read 1 sector
     int 0x13
-    jc  disk_err
+    jnc .read_ok
+    xor ax, ax                          ; Reset disk controller
+    int 0x13
+    pop ax
+    dec di
+    jnz .try_read
+    jmp disk_err
 
+.read_ok:
+    pop ax
     pop dx
     pop cx
     pop bx

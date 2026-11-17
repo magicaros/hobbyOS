@@ -206,6 +206,110 @@ _bios_disk_rw_lba:
     pop bp
     ret
 
+; int bios_disk_reset(uint8_t drive)
+global _bios_disk_reset
+_bios_disk_reset:
+    push bp
+    mov bp, sp
+    push dx
+    mov dl, [bp+4]          ; drive
+    xor ah, ah              ; reset disk subsystem
+    int 0x13
+    xor ax, ax
+    pop dx
+    pop bp
+    ret
+
+; int bios_disk_set_media_type(uint8_t drive, uint16_t num_cyls, uint8_t spt)
+; Sets floppy media transfer rate and parameter table on AT BIOS (INT 0x13, AH=0x18)
+global _bios_disk_set_media_type
+_bios_disk_set_media_type:
+    push bp
+    mov bp, sp
+    push bx
+    push cx
+    push dx
+    push di
+    push es
+
+    mov dl, [bp+4]          ; drive
+    mov ax, [bp+6]          ; num_cyls
+    dec ax                  ; max cylinder (num_cyls - 1)
+    mov ch, al              ; CH = low 8 bits
+    ror ah, 1
+    ror ah, 1
+    and ah, 0xC0
+    mov cl, [bp+8]          ; spt
+    and cl, 0x3F
+    or  cl, ah              ; CL = spt | cyl_hi
+
+    mov ah, 0x18            ; INT 0x13, AH=0x18: Set Media Type for Format
+    int 0x13
+    jnc .smt_ok
+
+    mov al, ah
+    xor ah, ah
+    test ax, ax
+    jnz .smt_done
+    mov ax, 1
+    jmp .smt_done
+
+.smt_ok:
+    xor ax, ax
+.smt_done:
+    pop es
+    pop di
+    pop dx
+    pop cx
+    pop bx
+    pop bp
+    ret
+
+; int bios_disk_format_track(uint8_t drive, uint16_t cyl, uint8_t head, void __far *table)
+; Formats 1 track (cylinder, head) using INT 0x13, AH=0x05
+global _bios_disk_format_track
+_bios_disk_format_track:
+    push bp
+    mov bp, sp
+    push bx
+    push cx
+    push dx
+    push es
+
+    mov dl, [bp+4]          ; drive
+    mov dh, [bp+8]          ; head
+    mov ax, [bp+6]          ; cyl
+    mov ch, al              ; low 8 bits of cylinder
+    ror ah, 1
+    ror ah, 1
+    and ah, 0xC0
+    mov cl, ah              ; high 2 bits of cylinder in CL (bits 7-6)
+
+    mov bx, [bp+10]         ; table offset
+    mov es, [bp+12]         ; table segment
+
+    mov ah, 0x05            ; BIOS format track
+    xor al, al              ; interleave
+    int 0x13
+    jnc .fmt_ok
+
+    mov al, ah
+    xor ah, ah
+    test ax, ax
+    jnz .fmt_done
+    mov ax, 1
+    jmp .fmt_done
+
+.fmt_ok:
+    xor ax, ax
+.fmt_done:
+    pop es
+    pop dx
+    pop cx
+    pop bx
+    pop bp
+    ret
+
 ; int bios_get_drive_params(uint8_t drive, uint16_t *cyls, uint8_t *heads, uint8_t *spt, uint8_t *drives)
 global _bios_get_drive_params
 _bios_get_drive_params:

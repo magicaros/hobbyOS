@@ -35,6 +35,9 @@ extern uint8_t  inb(uint16_t port);
 extern int      fpu_8087_init(void);
 extern int      bios_disk_rw(uint8_t drive, uint8_t is_write, uint16_t cyl, uint8_t head, uint8_t sec, void __far *buf);
 extern int      bios_disk_rw_lba(uint8_t drive, uint8_t is_write, uint32_t lba, uint16_t spt, uint16_t heads, void __far *buf);
+extern int      bios_disk_reset(uint8_t drive);
+extern int      bios_disk_set_media_type(uint8_t drive, uint16_t num_cyls, uint8_t spt);
+extern int      bios_disk_format_track(uint8_t drive, uint16_t cyl, uint8_t head, void __far *table);
 extern int      bios_get_drive_params(uint8_t drive, uint16_t *cyls, uint8_t *heads, uint8_t *spt, uint8_t *drives);
 extern uint8_t  bios_get_boot_drive(void);
 extern void     cpu_halt(void);
@@ -124,16 +127,22 @@ void     xms_free_by_owner(uint16_t owner_seg);
 int      xms_move(const os_xms_move_t __far *req);
 void     xms_dispatch(syscall_regs_t __far *regs);
 
-/* FAT16 filesystem driver & Volume Manager (kernel/fat16.c) */
-#define MAX_VOLUMES 8
+/* FAT12/FAT16 filesystem driver & Volume Manager (kernel/fat16.c) */
+#define MAX_VOLUMES 16
+
+#define FAT_TYPE_FAT12 1
+#define FAT_TYPE_FAT16 2
 
 typedef struct {
-    char     name[8];          /* "HD0A", "HD0", "SYS", etc. */
-    uint8_t  active;           /* 1 if mounted */
+    char     name[8];          /* "HD0A", "HD0", "SYS", "FD0", etc. */
+    uint8_t  active;           /* 1 if registered */
     uint8_t  is_alias;         /* 1 if alias to another volume */
     uint8_t  target_vol_idx;   /* Target volume index if alias */
     uint8_t  bios_drive;       /* 0x80, 0x81, 0x00, 0x01 */
     uint8_t  part_idx;         /* 0..3 for MBR partitions, 0xFF for raw/alias */
+    uint8_t  is_removable;     /* 1 for removable media (floppy) */
+    uint8_t  is_mounted;       /* 1 if media is mounted and BPB parsed */
+    uint8_t  fat_type;         /* FAT_TYPE_FAT12 or FAT_TYPE_FAT16 */
     uint16_t sectors_per_track;
     uint16_t num_heads;
     uint32_t start_lba;        /* Partition start LBA (0 for raw/VBR) */
@@ -158,6 +167,9 @@ int          vol_get_count(void);
 os_volume_t *vol_get(uint8_t idx);
 os_volume_t *vol_get_current(void);
 int          vol_set_current(uint8_t idx);
+int          vol_mount(os_volume_t *vol);
+int          vol_unmount(os_volume_t *vol);
+int          vol_diskchange(const char __far *dev_name);
 int          vol_resolve_path(const char __far *path, os_volume_t **out_vol, const char __far **out_subpath);
 int          vol_get_info(uint8_t idx, os_vol_info_t __far *out_info);
 uint16_t     vol_get_free_clusters(os_volume_t *vol);
@@ -174,6 +186,11 @@ int      fat16_chdir(const char __far *path);
 int      fat16_getcwd(char __far *buf, uint16_t max_len);
 int      fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint8_t append);
 int      fat16_rename_file(const char __far *src_path, const char __far *dst_path);
+int      fat16_format_volume(const char __far *dev_name, const char __far *label, uint16_t fmt_flags);
+int      fat16_rescan_drives(void);
+int      disk_get_geom(uint8_t drive, os_disk_geom_t __far *out_geom);
+int      disk_part_read(uint8_t drive, os_part_table_t __far *out_table);
+int      disk_part_write(uint8_t drive, const os_part_table_t __far *in_table, uint16_t write_mbr_code);
 
 /* CGA Graphics Subsystem (kernel/gfx.c) */
 int      gfx_set_mode(uint8_t mode);

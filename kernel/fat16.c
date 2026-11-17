@@ -14,6 +14,8 @@
  */
 
 #include "kernel.h"
+#include "bootcode.h"
+#include "mbrcode.h"
 
 #pragma pack(push, 1)
 typedef struct {
@@ -71,6 +73,22 @@ static int fat_load_sector(os_volume_t *vol, uint16_t fat_sec_idx);
 static uint16_t fat_get_cluster(os_volume_t *vol, uint16_t cluster);
 static int fat_set_cluster(os_volume_t *vol, uint16_t cluster, uint16_t val);
 static int dir_get_sector_lba(os_volume_t *vol, uint16_t dir_cluster, uint16_t sec_idx, uint32_t *out_lba);
+static int parse_bpb(os_volume_t *vol, const uint8_t *buf);
+static int vol_ensure_mounted(os_volume_t *vol);
+
+static int is_eof_cluster(os_volume_t *vol, uint16_t cluster) {
+    if (vol && vol->fat_type == FAT_TYPE_FAT12) {
+        return (cluster >= 0x0FF8);
+    }
+    return (cluster >= 0xFFF8);
+}
+
+static uint16_t eof_cluster_marker(os_volume_t *vol) {
+    if (vol && vol->fat_type == FAT_TYPE_FAT12) {
+        return 0x0FFF;
+    }
+    return 0xFFFF;
+}
 
 /* --- Low-Level Disk I/O Helpers --- */
 
@@ -85,13 +103,126 @@ static uint32_t rd_le32(const uint8_t *p) {
            ((uint32_t)p[3] << 24);
 }
 
-static int vol_rw_lba(os_volume_t *vol, uint8_t is_write, uint32_t rel_lba, void __far *buf) {
+static void wr_le16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+}
+
+static void wr_le32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFF);
+    p[1] = (uint8_t)((v >> 8) & 0xFF);
+    p[2] = (uint8_t)((v >> 16) & 0xFF);
+    p[3] = (uint8_t)((v >> 24) & 0xFF);
+}
+
+int vol_unmount(os_volume_t *vol) {
+    uint8_t v_idx;
+    vol = resolve_vol_alias(vol);
+    if (!vol) {
+        return -1;
+    }
+    v_idx = (uint8_t)(vol - volumes);
+    if (cached_fat_vol == v_idx) {
+        fat_flush();
+        cached_fat_sec = 0xFFFF;
+        cached_fat_vol = 0xFF;
+    }
+    if (vol->is_removable) {
+        vol->is_mounted = 0;
+        vol->cwd_cluster = 0;
+        vol->cwd_path[0] = '/';
+        vol->cwd_path[1] = '\0';
+    }
+    return 0;
+}
+
+int vol_mount(os_volume_t *vol) {
+    int retry;
+    int rc = -1;
     vol = resolve_vol_alias(vol);
     if (!vol || !vol->active) {
         return -1;
     }
-    return bios_disk_rw_lba(vol->bios_drive, is_write, vol->start_lba + rel_lba,
-                             vol->sectors_per_track, vol->num_heads, buf);
+    if (vol->is_mounted) {
+        return 0;
+    }
+    if (!vol->is_removable) {
+        vol->is_mounted = 1;
+        return 0;
+    }
+
+    /* Try reading Sector 0 (VBR) with up to 3 retries (motor spin-up) */
+    for (retry = 0; retry < 3; retry++) {
+        rc = bios_disk_rw_lba(vol->bios_drive, 0, 0, vol->sectors_per_track, vol->num_heads, MK_FP(KERNEL_SEG, io_buf));
+        if (rc == 0) {
+            break;
+        }
+        bios_disk_reset(vol->bios_drive);
+    }
+    if (retry == 3) {
+        return -2; /* Drive not ready / no media */
+    }
+
+    /* Check VBR signature */
+    if (io_buf[510] != 0x55 || io_buf[511] != 0xAA) {
+        return -1;
+    }
+
+    /* Parse BPB */
+    if (parse_bpb(vol, io_buf) != 0) {
+        return -1;
+    }
+
+    vol->is_mounted = 1;
+    return 0;
+}
+
+static int vol_ensure_mounted(os_volume_t *vol) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (vol->is_removable && !vol->is_mounted) {
+        int rc = vol_mount(vol);
+        if (rc != 0) {
+            return (rc == -2) ? -3 : -1;
+        }
+    }
+    return 0;
+}
+
+int vol_diskchange(const char __far *dev_name) {
+    if (dev_name && dev_name[0] != '\0') {
+        os_volume_t *vol = 0;
+        const char __far *sub = 0;
+        if (vol_resolve_path(dev_name, &vol, &sub) == 0 && vol) {
+            return vol_unmount(vol);
+        }
+        return -1;
+    } else {
+        uint8_t v;
+        for (v = 0; v < num_volumes; v++) {
+            if (volumes[v].active && volumes[v].is_removable) {
+                vol_unmount(&volumes[v]);
+            }
+        }
+        return 0;
+    }
+}
+
+static int vol_rw_lba(os_volume_t *vol, uint8_t is_write, uint32_t rel_lba, void __far *buf) {
+    int res;
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    res = bios_disk_rw_lba(vol->bios_drive, is_write, vol->start_lba + rel_lba,
+                            vol->sectors_per_track, vol->num_heads, buf);
+    if (res != 0 && vol->is_removable) {
+        /* I/O error on removable drive: unmount to prevent corrupt operations */
+        vol_unmount(vol);
+    }
+    return res;
 }
 
 /* --- Volume Management Functions --- */
@@ -117,6 +248,9 @@ os_volume_t *vol_get_current(void) {
 int vol_set_current(uint8_t idx) {
     if (idx >= MAX_VOLUMES || !volumes[idx].active) {
         return -1;
+    }
+    if (vol_ensure_mounted(&volumes[idx]) != 0) {
+        return -3;
     }
     current_vol_idx = idx;
     return 0;
@@ -221,8 +355,18 @@ uint16_t vol_get_free_clusters(os_volume_t *vol) {
     uint16_t free_count = 0;
 
     vol = resolve_vol_alias(vol);
-    if (!vol || !vol->active || vol->total_clusters == 0) {
+    if (!vol || !vol->active || !vol->is_mounted || vol->total_clusters == 0) {
         return 0;
+    }
+
+    if (vol->fat_type == FAT_TYPE_FAT12) {
+        uint16_t c;
+        for (c = 2; c < vol->total_clusters + 2; c++) {
+            if (fat_get_cluster(vol, c) == 0x0000) {
+                free_count++;
+            }
+        }
+        return free_count;
     }
 
     num_fat_secs = (vol->total_clusters + 2 + 255) >> 8;
@@ -289,7 +433,11 @@ int vol_get_info(uint8_t idx, os_vol_info_t __far *out_info) {
         out_info->target_name[0] = '\0';
     }
 
-    if (target) {
+    out_info->is_removable = target ? target->is_removable : vol->is_removable;
+    out_info->is_mounted   = target ? target->is_mounted   : vol->is_mounted;
+    out_info->fat_type     = target ? target->fat_type     : vol->fat_type;
+
+    if (target && target->is_mounted) {
         out_info->total_clusters      = target->total_clusters;
         out_info->free_clusters       = vol_get_free_clusters(target);
         out_info->sectors_per_cluster = target->sectors_per_cluster;
@@ -297,8 +445,8 @@ int vol_get_info(uint8_t idx, os_vol_info_t __far *out_info) {
     } else {
         out_info->total_clusters      = 0;
         out_info->free_clusters       = 0;
-        out_info->sectors_per_cluster = 0;
-        out_info->bytes_per_sector    = 512;
+        out_info->sectors_per_cluster = target ? target->sectors_per_cluster : 0;
+        out_info->bytes_per_sector    = target ? target->bytes_per_sector : 512;
     }
 
     return 0;
@@ -350,24 +498,113 @@ static int fat_load_sector(os_volume_t *vol, uint16_t fat_sec_idx) {
 }
 
 static uint16_t fat_get_cluster(os_volume_t *vol, uint16_t cluster) {
-    uint16_t sec_idx = cluster >> 8;
-    uint16_t off     = (cluster & 0xFF) << 1;
-    if (fat_load_sector(vol, sec_idx) != 0) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
         return 0xFFFF;
     }
-    return (uint16_t)fat_buf[off] | ((uint16_t)fat_buf[off + 1] << 8);
+    if (vol->fat_type == FAT_TYPE_FAT12) {
+        uint16_t byte_off = cluster + (cluster >> 1);
+        uint16_t sec_idx  = byte_off >> 9;
+        uint16_t off      = byte_off & 511;
+        uint8_t  b0, b1;
+        uint16_t val;
+
+        if (fat_load_sector(vol, sec_idx) != 0) {
+            return 0xFFFF;
+        }
+        b0 = fat_buf[off];
+        if (off == 511) {
+            if (fat_load_sector(vol, sec_idx + 1) != 0) {
+                return 0xFFFF;
+            }
+            b1 = fat_buf[0];
+        } else {
+            b1 = fat_buf[off + 1];
+        }
+        val = (uint16_t)b0 | ((uint16_t)b1 << 8);
+        if (cluster & 1) {
+            val >>= 4;
+        } else {
+            val &= 0x0FFF;
+        }
+        return val;
+    } else {
+        uint16_t sec_idx = cluster >> 8;
+        uint16_t off     = (cluster & 0xFF) << 1;
+        if (fat_load_sector(vol, sec_idx) != 0) {
+            return 0xFFFF;
+        }
+        return (uint16_t)fat_buf[off] | ((uint16_t)fat_buf[off + 1] << 8);
+    }
 }
 
 static int fat_set_cluster(os_volume_t *vol, uint16_t cluster, uint16_t val) {
-    uint16_t sec_idx = cluster >> 8;
-    uint16_t off     = (cluster & 0xFF) << 1;
-    if (fat_load_sector(vol, sec_idx) != 0) {
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
         return -1;
     }
-    fat_buf[off]     = (uint8_t)(val & 0xFF);
-    fat_buf[off + 1] = (uint8_t)(val >> 8);
-    fat_dirty = 1;
-    return 0;
+    if (vol->fat_type == FAT_TYPE_FAT12) {
+        uint16_t byte_off = cluster + (cluster >> 1);
+        uint16_t sec_idx  = byte_off >> 9;
+        uint16_t off      = byte_off & 511;
+        uint8_t  b0, b1;
+
+        if (off == 511) {
+            if (fat_load_sector(vol, sec_idx) != 0) {
+                return -1;
+            }
+            b0 = fat_buf[511];
+            if (fat_load_sector(vol, sec_idx + 1) != 0) {
+                return -1;
+            }
+            b1 = fat_buf[0];
+
+            if (cluster & 1) {
+                b0 = (b0 & 0x0F) | (uint8_t)((val & 0x0F) << 4);
+                b1 = (uint8_t)((val >> 4) & 0xFF);
+            } else {
+                b0 = (uint8_t)(val & 0xFF);
+                b1 = (b1 & 0xF0) | (uint8_t)((val >> 8) & 0x0F);
+            }
+
+            fat_buf[0] = b1;
+            fat_dirty  = 1;
+            if (fat_load_sector(vol, sec_idx) != 0) {
+                return -1;
+            }
+            fat_buf[511] = b0;
+            fat_dirty    = 1;
+        } else {
+            if (fat_load_sector(vol, sec_idx) != 0) {
+                return -1;
+            }
+            b0 = fat_buf[off];
+            b1 = fat_buf[off + 1];
+
+            if (cluster & 1) {
+                b0 = (b0 & 0x0F) | (uint8_t)((val & 0x0F) << 4);
+                b1 = (uint8_t)((val >> 4) & 0xFF);
+            } else {
+                b0 = (uint8_t)(val & 0xFF);
+                b1 = (b1 & 0xF0) | (uint8_t)((val >> 8) & 0x0F);
+            }
+
+            fat_buf[off]     = b0;
+            fat_buf[off + 1] = b1;
+            fat_dirty        = 1;
+        }
+        return 0;
+    } else {
+        uint16_t sec_idx = cluster >> 8;
+        uint16_t off     = (cluster & 0xFF) << 1;
+        if (fat_load_sector(vol, sec_idx) != 0) {
+            return -1;
+        }
+        fat_buf[off]     = (uint8_t)(val & 0xFF);
+        fat_buf[off + 1] = (uint8_t)(val >> 8);
+        fat_dirty = 1;
+        return 0;
+    }
 }
 
 /* --- Directory & Path Resolution Helpers --- */
@@ -495,13 +732,13 @@ static int dir_get_sector_lba(os_volume_t *vol, uint16_t dir_cluster, uint16_t s
         uint16_t sec_offset = sec_idx % vol->sectors_per_cluster;
         uint16_t cur        = dir_cluster;
         while (clus_steps > 0) {
-            if (cur < 2 || cur >= 0xFFF8) {
+            if (cur < 2 || is_eof_cluster(vol, cur)) {
                 return -1;
             }
             cur = fat_get_cluster(vol, cur);
             clus_steps--;
         }
-        if (cur < 2 || cur >= 0xFFF8) {
+        if (cur < 2 || is_eof_cluster(vol, cur)) {
             return -1;
         }
         *out_lba = cluster_to_lba(vol, cur) + sec_offset;
@@ -580,7 +817,7 @@ static uint16_t alloc_free_cluster(os_volume_t *vol, uint16_t start_hint) {
     }
     for (c = start_hint; c < vol->total_clusters + 2; c++) {
         if (fat_get_cluster(vol, c) == 0x0000) {
-            if (fat_set_cluster(vol, c, 0xFFFF) != 0) {
+            if (fat_set_cluster(vol, c, eof_cluster_marker(vol)) != 0) {
                 return 0;
             }
             return c;
@@ -588,7 +825,7 @@ static uint16_t alloc_free_cluster(os_volume_t *vol, uint16_t start_hint) {
     }
     for (c = 2; c < start_hint; c++) {
         if (fat_get_cluster(vol, c) == 0x0000) {
-            if (fat_set_cluster(vol, c, 0xFFFF) != 0) {
+            if (fat_set_cluster(vol, c, eof_cluster_marker(vol)) != 0) {
                 return 0;
             }
             return c;
@@ -623,7 +860,7 @@ static int free_cluster_chain(os_volume_t *vol, uint16_t start_cluster) {
     if (!vol || !vol->active) {
         return -1;
     }
-    while (cur >= 2 && cur < 0xFFF8) {
+    while (cur >= 2 && !is_eof_cluster(vol, cur)) {
         uint16_t next = fat_get_cluster(vol, cur);
         if (fat_set_cluster(vol, cur, 0x0000) != 0) {
             return -1;
@@ -772,7 +1009,11 @@ static uint16_t calc_clusters(uint32_t total_sec, uint16_t data_lba, uint8_t spc
     while ((1 << shift) < spc && shift < 8) {
         shift++;
     }
-    return (uint16_t)(rem >> shift);
+    rem = rem >> shift;
+    if (rem > 65520UL) {
+        rem = 65520UL;
+    }
+    return (uint16_t)rem;
 }
 
 static int parse_bpb(os_volume_t *vol, const uint8_t *buf) {
@@ -787,11 +1028,13 @@ static int parse_bpb(os_volume_t *vol, const uint8_t *buf) {
     }
     vol->sectors_per_fat     = rd_le16(&buf[22]);
 
-    if (vol->sectors_per_track == 0) {
-        vol->sectors_per_track = rd_le16(&buf[24]);
-    }
-    if (vol->num_heads == 0) {
-        vol->num_heads = rd_le16(&buf[26]);
+    if (vol->is_removable || vol->sectors_per_track == 0) {
+        if (rd_le16(&buf[24]) != 0) {
+            vol->sectors_per_track = rd_le16(&buf[24]);
+        }
+        if (rd_le16(&buf[26]) != 0) {
+            vol->num_heads = rd_le16(&buf[26]);
+        }
     }
 
     if (vol->bytes_per_sector != 512 || vol->sectors_per_cluster == 0) {
@@ -804,11 +1047,58 @@ static int parse_bpb(os_volume_t *vol, const uint8_t *buf) {
     vol->data_lba       = vol->root_lba + vol->root_sectors;
     vol->total_clusters = calc_clusters(vol->total_sectors, vol->data_lba, vol->sectors_per_cluster);
 
+    if (vol->total_clusters < 4085) {
+        vol->fat_type = FAT_TYPE_FAT12;
+    } else {
+        vol->fat_type = FAT_TYPE_FAT16;
+    }
+
     vol->cwd_cluster    = 0;
     vol->cwd_path[0]    = '/';
     vol->cwd_path[1]    = '\0';
     vol->active         = 1;
+    vol->is_mounted     = 1;
     return 0;
+}
+
+static void register_floppy_drive(uint8_t drive_num, const char *name) {
+    os_volume_t *vol;
+    int i;
+    if (num_volumes >= MAX_VOLUMES) {
+        return;
+    }
+    vol = &volumes[num_volumes++];
+    for (i = 0; i < 7 && name[i] != '\0'; i++) {
+        vol->name[i] = name[i];
+    }
+    vol->name[i] = '\0';
+
+    vol->active              = 1;
+    vol->is_alias            = 0;
+    vol->target_vol_idx      = 0;
+    vol->bios_drive          = drive_num;
+    vol->part_idx            = 0xFF;
+    vol->is_removable        = 1;
+    vol->is_mounted          = 0;
+    vol->fat_type            = FAT_TYPE_FAT12;
+    vol->start_lba           = 0;
+    vol->sectors_per_track   = 9;  /* default 720KB PC/XT fallback */
+    vol->num_heads           = 2;
+    vol->total_sectors       = 1440;
+    vol->bytes_per_sector    = 512;
+    vol->sectors_per_cluster = 2;
+    vol->reserved_sectors    = 1;
+    vol->num_fats            = 2;
+    vol->root_entries        = 112;
+    vol->sectors_per_fat     = 3;
+    vol->fat_lba             = 1;
+    vol->root_lba            = 7;
+    vol->root_sectors        = 7;
+    vol->data_lba            = 14;
+    vol->total_clusters      = 713;
+    vol->cwd_cluster         = 0;
+    vol->cwd_path[0]         = '/';
+    vol->cwd_path[1]         = '\0';
 }
 
 static void probe_drive(uint8_t drive_num, const char *base_name) {
@@ -817,6 +1107,7 @@ static void probe_drive(uint8_t drive_num, const char *base_name) {
     uint8_t  spt = 0;
     uint8_t  drives = 0;
     mbr_partition_t *parts;
+    mbr_partition_t parts_copy[4];
     int is_mbr = 0;
     int p;
     int valid_parts = 0;
@@ -840,53 +1131,62 @@ static void probe_drive(uint8_t drive_num, const char *base_name) {
     /* Check if MBR: inspect partition table at 0x01BE */
     parts = (mbr_partition_t *)&io_buf[0x01BE];
     for (p = 0; p < 4; p++) {
-        uint8_t pt = parts[p].part_type;
-        if ((pt == 0x04 || pt == 0x06 || pt == 0x0E || pt == 0x01) &&
-            parts[p].start_lba > 0 && parts[p].total_sectors > 0) {
-            valid_parts++;
-        }
-    }
-    /* If offset 0x36 contains "FAT", this is a raw superfloppy VBR, not an MBR */
-    if (io_buf[0x36] == 'F' && io_buf[0x37] == 'A' && io_buf[0x38] == 'T') {
-        is_mbr = 0;
-    } else if (valid_parts > 0) {
-        is_mbr = 1;
-    }
-
-    if (is_mbr) {
-        for (p = 0; p < 4 && num_volumes < MAX_VOLUMES; p++) {
-            uint8_t pt = parts[p].part_type;
-            if (pt == 0x04 || pt == 0x06 || pt == 0x0E || pt == 0x01) {
-                uint8_t v_idx = num_volumes;
-                os_volume_t *vol = &volumes[v_idx];
-                int i;
-
-                vol->name[0] = base_name[0];
-                vol->name[1] = base_name[1];
-                vol->name[2] = base_name[2];
-                vol->name[3] = (char)('A' + p);
-                vol->name[4] = '\0';
-
-                vol->bios_drive        = drive_num;
-                vol->part_idx          = (uint8_t)p;
-                vol->start_lba         = parts[p].start_lba;
-                vol->sectors_per_track = spt;
-                vol->num_heads         = heads;
-                vol->is_alias          = 0;
-                vol->target_vol_idx    = 0;
-
-                /* Read VBR of partition */
-                if (bios_disk_rw_lba(drive_num, 0, vol->start_lba, spt, heads, MK_FP(KERNEL_SEG, io_buf)) == 0 &&
-                    io_buf[510] == 0x55 && io_buf[511] == 0xAA) {
-                    if (parse_bpb(vol, io_buf) == 0) {
-                        if (first_part_idx == 0xFF) {
-                            first_part_idx = v_idx;
-                        }
-                        num_volumes++;
-                    }
-                }
+        parts_copy[p] = parts[p];
+            if ((parts[p].part_type == 0x04 || parts[p].part_type == 0x06 ||
+                 parts[p].part_type == 0x0E || parts[p].part_type == 0x01) &&
+                parts[p].start_lba > 0 && parts[p].total_sectors > 0) {
+                valid_parts++;
             }
         }
+        /* If offset 0x36 contains "FAT", this is a raw superfloppy VBR, not an MBR */
+        if (io_buf[0x36] == 'F' && io_buf[0x37] == 'A' && io_buf[0x38] == 'T') {
+            is_mbr = 0;
+        } else if (valid_parts > 0) {
+            is_mbr = 1;
+        }
+
+        if (is_mbr) {
+            for (p = 0; p < 4 && num_volumes < MAX_VOLUMES; p++) {
+                uint8_t pt = parts_copy[p].part_type;
+                if (pt == 0x04 || pt == 0x06 || pt == 0x0E || pt == 0x01) {
+                    uint8_t v_idx = num_volumes;
+                    os_volume_t *vol = &volumes[v_idx];
+                    int i;
+
+                    vol->name[0] = base_name[0];
+                    vol->name[1] = base_name[1];
+                    vol->name[2] = base_name[2];
+                    vol->name[3] = (char)('A' + p);
+                    vol->name[4] = '\0';
+
+                    vol->bios_drive        = drive_num;
+                    vol->part_idx          = (uint8_t)p;
+                    vol->start_lba         = parts_copy[p].start_lba;
+                    vol->total_sectors     = parts_copy[p].total_sectors;
+                    vol->sectors_per_track = spt;
+                    vol->num_heads         = heads;
+                    vol->is_alias          = 0;
+                    vol->target_vol_idx    = 0;
+                    vol->is_removable      = 0;
+                    vol->is_mounted        = 0;
+                    vol->active            = 1;
+                    vol->cwd_cluster       = 0;
+                    vol->cwd_path[0]       = '/';
+                    vol->cwd_path[1]       = '\0';
+
+                    /* Read VBR of partition */
+                    if (bios_disk_rw_lba(drive_num, 0, vol->start_lba, spt, heads, MK_FP(KERNEL_SEG, io_buf)) == 0 &&
+                        io_buf[510] == 0x55 && io_buf[511] == 0xAA) {
+                        if (parse_bpb(vol, io_buf) == 0) {
+                            vol->is_mounted = 1;
+                        }
+                    }
+                    if (first_part_idx == 0xFF && vol->is_mounted) {
+                        first_part_idx = v_idx;
+                    }
+                    num_volumes++;
+                }
+            }
         /* Add whole-drive alias e.g. "HD0" -> "HD0A" */
         if (first_part_idx != 0xFF && num_volumes < MAX_VOLUMES) {
             os_volume_t *alias = &volumes[num_volumes];
@@ -899,6 +1199,9 @@ static void probe_drive(uint8_t drive_num, const char *base_name) {
             alias->is_alias       = 1;
             alias->target_vol_idx = first_part_idx;
             alias->active         = 1;
+            alias->is_removable   = volumes[first_part_idx].is_removable;
+            alias->is_mounted     = volumes[first_part_idx].is_mounted;
+            alias->fat_type       = volumes[first_part_idx].fat_type;
             alias->cwd_cluster    = 0;
             alias->cwd_path[0]    = '/';
             alias->cwd_path[1]    = '\0';
@@ -920,6 +1223,8 @@ static void probe_drive(uint8_t drive_num, const char *base_name) {
             vol->sectors_per_track = spt;
             vol->num_heads         = heads;
             vol->is_alias          = 0;
+            vol->is_removable      = 0;
+            vol->is_mounted        = 1;
 
             if (parse_bpb(vol, io_buf) == 0) {
                 num_volumes++;
@@ -937,6 +1242,9 @@ static void probe_drive(uint8_t drive_num, const char *base_name) {
                     alias->is_alias       = 1;
                     alias->target_vol_idx = raw_idx;
                     alias->active         = 1;
+                    alias->is_removable   = volumes[raw_idx].is_removable;
+                    alias->is_mounted     = volumes[raw_idx].is_mounted;
+                    alias->fat_type       = volumes[raw_idx].fat_type;
                     alias->cwd_cluster    = 0;
                     alias->cwd_path[0]    = '/';
                     alias->cwd_path[1]    = '\0';
@@ -947,23 +1255,43 @@ static void probe_drive(uint8_t drive_num, const char *base_name) {
     }
 }
 
-int fat16_init(void) {
+int fat16_rescan_drives(void) {
     uint8_t boot_drive;
     uint8_t v;
     uint8_t boot_vol_idx = 0xFF;
+    uint16_t bda_equip;
+    uint8_t num_floppies = 0;
 
-    num_volumes     = 0;
-    current_vol_idx = 0;
+    /* Flush cached FAT */
+    fat_flush();
     cached_fat_vol  = 0xFF;
     cached_fat_sec  = 0xFFFF;
     fat_dirty       = 0;
 
+    num_volumes     = 0;
+    current_vol_idx = 0;
+
     boot_drive = bios_get_boot_drive();
 
-    /* Probe Hard Disk 0 (0x80) */
+    /* 1. Register Floppy Drives from BDA Equipment Word */
+    bda_equip = *((uint16_t __far *)MK_FP(0x0040, 0x0010));
+    if (bda_equip & 1) {
+        num_floppies = (uint8_t)(((bda_equip >> 6) & 3) + 1);
+        if (num_floppies > 2) {
+            num_floppies = 2;
+        }
+    }
+    if (num_floppies >= 1 && num_volumes < MAX_VOLUMES) {
+        register_floppy_drive(0x00, "FD0");
+    }
+    if (num_floppies >= 2 && num_volumes < MAX_VOLUMES) {
+        register_floppy_drive(0x01, "FD1");
+    }
+
+    /* 2. Probe Hard Disk 0 (0x80) */
     probe_drive(0x80, "HD0");
 
-    /* Probe Hard Disk 1 (0x81) */
+    /* 3. Probe Hard Disk 1 (0x81) */
     probe_drive(0x81, "HD1");
 
     if (num_volumes == 0) {
@@ -993,6 +1321,9 @@ int fat16_init(void) {
         sys->is_alias       = 1;
         sys->target_vol_idx = boot_vol_idx;
         sys->active         = 1;
+        sys->is_removable   = volumes[boot_vol_idx].is_removable;
+        sys->is_mounted     = volumes[boot_vol_idx].is_mounted;
+        sys->fat_type       = volumes[boot_vol_idx].fat_type;
         sys->cwd_cluster    = 0;
         sys->cwd_path[0]    = '/';
         sys->cwd_path[1]    = '\0';
@@ -1004,6 +1335,10 @@ int fat16_init(void) {
 
     fs_mounted = 1;
     return 0;
+}
+
+int fat16_init(void) {
+    return fat16_rescan_drives();
 }
 
 /* --- Public Syscall Implementations --- */
@@ -1035,7 +1370,10 @@ int fat16_chdir(const char __far *path) {
     /* Also switch active volume to the specified volume */
     {
         uint8_t v_idx = (uint8_t)(vol - volumes);
-        vol_set_current(v_idx);
+        int rc = vol_set_current(v_idx);
+        if (rc != 0) {
+            return rc;
+        }
     }
 
     is_vol_root = (uint8_t)(path != subpath);
@@ -1148,6 +1486,9 @@ int fat16_mkdir(const char __far *path) {
     if (!vol || !vol->active) {
         return -1;
     }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
     if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(path != subpath)) != 0) {
         return -1;
     }
@@ -1233,6 +1574,9 @@ int fat16_rmdir(const char __far *path) {
     if (!vol || !vol->active) {
         return -1;
     }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
     if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(path != subpath)) != 0) {
         return -1;
     }
@@ -1278,6 +1622,9 @@ int32_t fat16_file_size(const char __far *filename) {
     if (!vol || !vol->active) {
         return -1;
     }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
     if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
         return -1;
     }
@@ -1308,6 +1655,9 @@ int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_b
     if (!vol || !vol->active) {
         return -1;
     }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
     if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
         return -1;
     }
@@ -1323,7 +1673,7 @@ int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_b
                        : max_bytes;
     cluster = entry.fst_clus_lo;
 
-    while (cluster >= 2 && cluster < 0xFFF8 && bytes_read < target_bytes) {
+    while (cluster >= 2 && !is_eof_cluster(vol, cluster) && bytes_read < target_bytes) {
         uint32_t first_lba = cluster_to_lba(vol, cluster);
         uint8_t s;
         for (s = 0; s < vol->sectors_per_cluster && bytes_read < target_bytes; s++) {
@@ -1364,6 +1714,9 @@ int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_
     if (!vol || !vol->active) {
         return -1;
     }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
     if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
         return -1;
     }
@@ -1377,7 +1730,7 @@ int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_
     remaining = entry.file_size;
     cluster   = entry.fst_clus_lo;
 
-    while (cluster >= 2 && cluster < 0xFFF8 && remaining > 0) {
+    while (cluster >= 2 && !is_eof_cluster(vol, cluster) && remaining > 0) {
         uint32_t first_lba = cluster_to_lba(vol, cluster);
         uint8_t s;
         for (s = 0; s < vol->sectors_per_cluster && remaining > 0; s++) {
@@ -1424,6 +1777,9 @@ int fat16_write_file(const char __far *filename, const void __far *src, uint16_t
     vol = resolve_vol_alias(vol);
     if (!vol || !vol->active) {
         return -1;
+    }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
     }
     if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
         return -1;
@@ -1520,6 +1876,9 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
     if (!vol || !vol->active) {
         return -1;
     }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
     if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
         return -1;
     }
@@ -1540,9 +1899,9 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
     }
 
     last_clus = entry.fst_clus_lo;
-    while (last_clus >= 2 && last_clus < 0xFFF8) {
+    while (last_clus >= 2 && !is_eof_cluster(vol, last_clus)) {
         uint16_t next = fat_get_cluster(vol, last_clus);
-        if (next >= 0xFFF8 || next < 2) {
+        if (is_eof_cluster(vol, next) || next < 2) {
             break;
         }
         last_clus = next;
@@ -1652,6 +2011,9 @@ int fat16_delete_file(const char __far *filename) {
     if (!vol || !vol->active) {
         return -1;
     }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
     if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
         return -1;
     }
@@ -1677,7 +2039,7 @@ int fat16_delete_file(const char __far *filename) {
 }
 
 int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint8_t append) {
-    static uint8_t copy_buf[512];
+    static uint8_t copy_buf[2048];
     os_volume_t *src_vol, *dst_vol;
     const char __far *src_sub;
     const char __far *dst_sub;
@@ -1691,6 +2053,9 @@ int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint
     if (vol_resolve_path(src_path, &src_vol, &src_sub) != 0) {
         return -1;
     }
+    if (vol_ensure_mounted(src_vol) != 0) {
+        return -3;
+    }
     if (resolve_parent_and_leaf(src_vol, src_sub, &src_parent, src_name83, (uint8_t)(src_path != src_sub)) != 0) {
         return -1;
     }
@@ -1703,6 +2068,9 @@ int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint
 
     if (vol_resolve_path(dst_path, &dst_vol, &dst_sub) != 0) {
         return -1;
+    }
+    if (vol_ensure_mounted(dst_vol) != 0) {
+        return -3;
     }
     if (resolve_parent_and_leaf(dst_vol, dst_sub, &dst_parent, dst_name83, (uint8_t)(dst_path != dst_sub)) != 0) {
         return -1;
@@ -1725,28 +2093,30 @@ int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint
         return 0;
     }
 
-    while (cur_clus >= 2 && cur_clus < 0xFFF8 && remaining > 0) {
+    while (cur_clus >= 2 && !is_eof_cluster(src_vol, cur_clus) && remaining > 0) {
         uint32_t first_lba = cluster_to_lba(src_vol, cur_clus);
         uint16_t next_clus = fat_get_cluster(src_vol, cur_clus);
         uint8_t  s;
+        uint16_t clus_bytes = 0;
+        int rc;
 
         for (s = 0; s < src_vol->sectors_per_cluster && remaining > 0; s++) {
             uint16_t chunk = (remaining > 512) ? 512 : (uint16_t)remaining;
-            int rc;
 
-            if (vol_rw_lba(src_vol, 0, first_lba + s, MK_FP(KERNEL_SEG, copy_buf)) != 0) {
+            if (vol_rw_lba(src_vol, 0, first_lba + s, MK_FP(KERNEL_SEG, copy_buf + clus_bytes)) != 0) {
                 return -1;
             }
-            if (first_chunk) {
-                rc = fat16_write_file(dst_path, MK_FP(KERNEL_SEG, copy_buf), chunk);
-                first_chunk = 0;
-            } else {
-                rc = fat16_append_file(dst_path, MK_FP(KERNEL_SEG, copy_buf), chunk);
-            }
-            if (rc < 0) {
-                return -1;
-            }
-            remaining -= chunk;
+            clus_bytes += chunk;
+            remaining  -= chunk;
+        }
+        if (first_chunk) {
+            rc = fat16_write_file(dst_path, MK_FP(KERNEL_SEG, copy_buf), clus_bytes);
+            first_chunk = 0;
+        } else {
+            rc = fat16_append_file(dst_path, MK_FP(KERNEL_SEG, copy_buf), clus_bytes);
+        }
+        if (rc < 0) {
+            return -1;
         }
         cur_clus = next_clus;
     }
@@ -1783,6 +2153,9 @@ int fat16_rename_file(const char __far *src_path, const char __far *dst_path) {
 
     if (vol_resolve_path(dst_path, &dst_vol, &dst_sub) != 0) {
         return -1;
+    }
+    if (vol_ensure_mounted(src_vol) != 0 || vol_ensure_mounted(dst_vol) != 0) {
+        return -3;
     }
     if (resolve_vol_alias(src_vol) != resolve_vol_alias(dst_vol)) {
         /* Cannot rename across physical volumes */
@@ -1913,6 +2286,9 @@ int fat16_dir_entry(const char __far *path, uint16_t index, os_dir_entry_t __far
     if (!vol || !vol->active) {
         return -2;
     }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
     if (resolve_dir_cluster(vol, subpath, &target_clus, (uint8_t)(path != subpath)) != 0) {
         return -2;
     }
@@ -1944,4 +2320,535 @@ int fat16_dir_entry(const char __far *path, uint16_t index, os_dir_entry_t __far
         }
     }
     return -1;
+}
+
+int fat16_format_volume(const char __far *dev_name, const char __far *label, uint16_t fmt_flags) {
+    os_volume_t *vol = 0;
+    const char __far *subpath = 0;
+    uint16_t cyls = 0, spt = 0;
+    uint8_t heads = 0;
+    uint8_t p_heads = 0, p_spt = 0, p_drives = 0;
+    uint32_t start_lba = 0;
+    uint32_t total_sec = 0;
+    uint16_t tot_sec_16 = 0;
+    uint32_t tot_sec_32 = 0;
+    uint16_t tot_sec = 0;
+    uint8_t spc = 2;
+    uint16_t root_entries = 112;
+    uint16_t sec_per_fat = 3;
+    uint8_t media = 0xF9;
+    uint8_t fat_type = FAT_TYPE_FAT12;
+    uint8_t req_type = (uint8_t)(fmt_flags & 0x7FFF);
+    uint8_t quick = (fmt_flags & FORMAT_FLAG_QUICK) ? 1 : 0;
+    uint32_t fat1_lba, fat2_lba, root_lba;
+    uint16_t root_sec, s;
+    int i;
+    char vol_label[11];
+
+    if (!dev_name) {
+        return -1;
+    }
+    if (vol_resolve_path(dev_name, &vol, &subpath) != 0) {
+        return -1;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+
+    /* Format volume label: 11 bytes space-padded */
+    for (i = 0; i < 11; i++) {
+        vol_label[i] = ' ';
+    }
+    if (label) {
+        for (i = 0; i < 11 && label[i] != '\0'; i++) {
+            char c = label[i];
+            if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+            vol_label[i] = c;
+        }
+    } else {
+        const char *def_lbl = "HOBBYOS    ";
+        for (i = 0; i < 11; i++) {
+            vol_label[i] = def_lbl[i];
+        }
+    }
+
+    if (vol->is_removable) {
+        /* Determine Floppy Geometry */
+        if (req_type == FORMAT_TYPE_AUTO) {
+            int det = 0;
+            bios_disk_reset(vol->bios_drive);
+            /* Try reading existing sector 0 to detect inserted media type */
+            if (bios_disk_rw_lba(vol->bios_drive, 0, 0, vol->sectors_per_track, vol->num_heads, MK_FP(KERNEL_SEG, io_buf)) == 0) {
+                if (io_buf[510] == 0x55 && io_buf[511] == 0xAA) {
+                    uint16_t b_tot = rd_le16(&io_buf[19]);
+                    uint16_t b_spt = rd_le16(&io_buf[24]);
+                    if (b_tot == 2880 || b_spt == 18) {
+                        req_type = FORMAT_TYPE_1440;
+                        det = 1;
+                    } else if (b_tot == 2400 || b_spt == 15) {
+                        req_type = FORMAT_TYPE_1200;
+                        det = 1;
+                    } else if (b_tot == 720 || (b_spt == 9 && io_buf[21] == 0xFD)) {
+                        req_type = FORMAT_TYPE_360;
+                        det = 1;
+                    } else if (b_tot == 1440 || b_spt == 9) {
+                        req_type = FORMAT_TYPE_720;
+                        det = 1;
+                    }
+                }
+            }
+            if (!det) {
+                /* Query BIOS drive parameters */
+                if (bios_get_drive_params(vol->bios_drive, &cyls, &p_heads, &p_spt, &p_drives) == 0 && p_spt > 0 && p_heads > 0) {
+                    if (p_spt == 18) {
+                        req_type = FORMAT_TYPE_1440;
+                    } else if (p_spt == 15) {
+                        req_type = FORMAT_TYPE_1200;
+                    } else if (p_spt == 9 && cyls <= 40 && cyls > 0) {
+                        req_type = FORMAT_TYPE_360;
+                    } else {
+                        req_type = FORMAT_TYPE_720;
+                    }
+                } else if (vol->sectors_per_track == 18) {
+                    req_type = FORMAT_TYPE_1440;
+                } else {
+                    req_type = FORMAT_TYPE_720;
+                }
+            }
+        }
+
+        /* Configure target geometry parameters */
+        if (req_type == FORMAT_TYPE_1440) {
+            /* 1.44 MB 3.5" Floppy */
+            tot_sec = 2880;
+            cyls = 80;
+            heads = 2;
+            spt = 18;
+            spc = 1;
+            root_entries = 224;
+            sec_per_fat = 9;
+            media = 0xF0;
+            fat_type = FAT_TYPE_FAT12;
+        } else if (req_type == FORMAT_TYPE_1200) {
+            /* 1.2 MB 5.25" Floppy */
+            tot_sec = 2400;
+            cyls = 80;
+            heads = 2;
+            spt = 15;
+            spc = 1;
+            root_entries = 224;
+            sec_per_fat = 7;
+            media = 0xF9;
+            fat_type = FAT_TYPE_FAT12;
+        } else if (req_type == FORMAT_TYPE_360) {
+            /* 360 KB 5.25" Floppy */
+            tot_sec = 720;
+            cyls = 40;
+            heads = 2;
+            spt = 9;
+            spc = 2;
+            root_entries = 112;
+            sec_per_fat = 2;
+            media = 0xFD;
+            fat_type = FAT_TYPE_FAT12;
+        } else {
+            /* 720 KB 3.5" Floppy (Default) */
+            tot_sec = 1440;
+            cyls = 80;
+            heads = 2;
+            spt = 9;
+            spc = 2;
+            root_entries = 112;
+            sec_per_fat = 3;
+            media = 0xF9;
+            fat_type = FAT_TYPE_FAT12;
+        }
+
+        start_lba = 0;
+        vol->sectors_per_track = spt;
+        vol->num_heads = heads;
+        vol->total_sectors = tot_sec;
+        tot_sec_16 = tot_sec;
+        tot_sec_32 = 0;
+
+        /* Program data transfer rate and parameter table on AT BIOS */
+        bios_disk_reset(vol->bios_drive);
+        bios_disk_set_media_type(vol->bios_drive, cyls, spt);
+
+        /* Low-Level Format Tracks if requested */
+        if (!quick) {
+            uint16_t c;
+            uint8_t h;
+            for (c = 0; c < cyls; c++) {
+                for (h = 0; h < heads; h++) {
+                    int retry;
+                    /* Build 4-byte address fields for sectors 1..spt */
+                    for (s = 1; s <= spt; s++) {
+                        uint16_t off = (uint16_t)((s - 1) * 4);
+                        io_buf[off + 0] = (uint8_t)c;
+                        io_buf[off + 1] = h;
+                        io_buf[off + 2] = (uint8_t)s;
+                        io_buf[off + 3] = 2; /* 512 bytes */
+                    }
+                    for (retry = 0; retry < 3; retry++) {
+                        if (bios_disk_format_track(vol->bios_drive, c, h, MK_FP(KERNEL_SEG, io_buf)) == 0) {
+                            break;
+                        }
+                        bios_disk_reset(vol->bios_drive);
+                        bios_disk_set_media_type(vol->bios_drive, cyls, spt);
+                    }
+                    if (retry == 3) {
+                        if (c == 0 && h == 0) {
+                            /* Fall back gracefully if controller doesn't support track format */
+                            c = cyls;
+                            break;
+                        }
+                        return -1;
+                    }
+                }
+            }
+        }
+    } else {
+        /* Hard Disk Partition */
+        start_lba = vol->start_lba;
+        spt = vol->sectors_per_track;
+        heads = (uint8_t)vol->num_heads;
+        total_sec = vol->total_sectors;
+
+        /* If volume is an MBR partition, check MBR partition table (LBA 0)
+         * to obtain the true partition size in case it was previously clamped
+         * or formatted to a smaller size, and ensure bootability.
+         */
+        if (vol->part_idx < 4) {
+            if (bios_disk_rw_lba(vol->bios_drive, 0, 0, spt, heads, MK_FP(KERNEL_SEG, io_buf)) == 0) {
+                mbr_partition_t *parts = (mbr_partition_t *)&io_buf[0x01BE];
+                int mbr_dirty = 0;
+                int p, has_active = 0;
+
+                if (parts[vol->part_idx].total_sectors > 0) {
+                    total_sec = parts[vol->part_idx].total_sectors;
+                    /* If FAT16B (> 65535 sectors) and MBR type was 0x04, update to 0x06 (BigDOS) */
+                    if (total_sec > 65535UL && parts[vol->part_idx].part_type == 0x04) {
+                        parts[vol->part_idx].part_type = 0x06;
+                        mbr_dirty = 1;
+                    }
+                }
+
+                /* Ensure partition is marked active (0x80) in MBR if no partition is active */
+                for (p = 0; p < 4; p++) {
+                    if (parts[p].boot_indicator == 0x80) {
+                        has_active = 1;
+                        break;
+                    }
+                }
+                if (!has_active) {
+                    parts[vol->part_idx].boot_indicator = 0x80;
+                    mbr_dirty = 1;
+                }
+
+                if (mbr_dirty) {
+                    bios_disk_rw_lba(vol->bios_drive, 1, 0, spt, heads, MK_FP(KERNEL_SEG, io_buf));
+                }
+            }
+        }
+
+        if (total_sec == 0) {
+            return -1;
+        }
+        media = 0xF8;
+
+        if (total_sec < 8192UL) {
+            /* Small partition: FAT12 */
+            fat_type = FAT_TYPE_FAT12;
+            spc = 2;
+            root_entries = 224;
+            sec_per_fat = 6;
+            tot_sec_16 = (uint16_t)total_sec;
+            tot_sec_32 = 0;
+        } else {
+            /* Standard partition: FAT16 / FAT16B */
+            uint16_t shift = 2;
+            uint32_t max_clusters;
+            uint32_t fat_bytes;
+
+            fat_type = FAT_TYPE_FAT16;
+            root_entries = 512;
+            spc = 4; /* 2 KB clusters */
+
+            /* Scale SPC so total clusters <= 65520 to fit within 16-bit FAT limit */
+            while (spc < 64 && (uint32_t)(total_sec >> shift) > 65520UL) {
+                spc = (uint8_t)(spc * 2);
+                shift++;
+            }
+
+            max_clusters = total_sec >> shift;
+            if (max_clusters > 65520UL) {
+                max_clusters = 65520UL;
+            }
+            fat_bytes = ((uint32_t)(max_clusters + 2)) << 1;
+            sec_per_fat = (uint16_t)((fat_bytes + 511) >> 9);
+            if (sec_per_fat == 0) sec_per_fat = 1;
+
+            if (total_sec <= 65535UL) {
+                tot_sec_16 = (uint16_t)total_sec;
+                tot_sec_32 = 0;
+            } else {
+                tot_sec_16 = 0;
+                tot_sec_32 = total_sec;
+            }
+        }
+        vol->total_sectors = total_sec;
+    }
+
+    /* Invalidate cached FAT */
+    cached_fat_vol = 0xFF;
+    cached_fat_sec = 0xFFFF;
+    fat_dirty = 0;
+
+    /* 1. Build & Write Sector 0 (VBR with HobbyOS bootblock) */
+    for (i = 0; i < 512; i++) {
+        io_buf[i] = default_boot_sector[i];
+    }
+    io_buf[0] = 0xEB;
+    io_buf[1] = 0x3C;
+    io_buf[2] = 0x90;
+    io_buf[3] = 'H'; io_buf[4] = 'O'; io_buf[5] = 'B'; io_buf[6] = 'B';
+    io_buf[7] = 'Y'; io_buf[8] = 'O'; io_buf[9] = 'S'; io_buf[10] = ' ';
+
+    wr_le16(&io_buf[11], 512);
+    io_buf[13] = spc;
+    wr_le16(&io_buf[14], 1);          /* Reserved sectors = 1 */
+    io_buf[16] = 2;                  /* Num FATs = 2 */
+    wr_le16(&io_buf[17], root_entries);
+    wr_le16(&io_buf[19], tot_sec_16);
+    io_buf[21] = media;
+    wr_le16(&io_buf[22], sec_per_fat);
+    wr_le16(&io_buf[24], spt);
+    wr_le16(&io_buf[26], heads);
+    wr_le32(&io_buf[28], start_lba);  /* Hidden sectors */
+    wr_le32(&io_buf[32], tot_sec_32); /* Total sectors 32 (FAT16B) */
+
+    io_buf[36] = vol->bios_drive;
+    io_buf[37] = 0;
+    io_buf[38] = 0x29;                /* Extended boot signature */
+    wr_le32(&io_buf[39], 0x19800101); /* Volume ID */
+
+    for (i = 0; i < 11; i++) {
+        io_buf[43 + i] = vol_label[i];
+    }
+    if (fat_type == FAT_TYPE_FAT12) {
+        io_buf[54] = 'F'; io_buf[55] = 'A'; io_buf[56] = 'T';
+        io_buf[57] = '1'; io_buf[58] = '2'; io_buf[59] = ' ';
+        io_buf[60] = ' '; io_buf[61] = ' ';
+    } else {
+        io_buf[54] = 'F'; io_buf[55] = 'A'; io_buf[56] = 'T';
+        io_buf[57] = '1'; io_buf[58] = '6'; io_buf[59] = ' ';
+        io_buf[60] = ' '; io_buf[61] = ' ';
+    }
+    io_buf[510] = 0x55;
+    io_buf[511] = 0xAA;
+
+    if (bios_disk_rw_lba(vol->bios_drive, 1, start_lba, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        return -1;
+    }
+
+    /* 2. Write FAT1 & FAT2 */
+    fat1_lba = start_lba + 1;
+    fat2_lba = fat1_lba + sec_per_fat;
+
+    /* First sector of FAT: media byte + 0xFF markers */
+    for (i = 0; i < 512; i++) {
+        io_buf[i] = 0;
+    }
+    io_buf[0] = media;
+    io_buf[1] = 0xFF;
+    io_buf[2] = 0xFF;
+    if (fat_type == FAT_TYPE_FAT16) {
+        io_buf[3] = 0xFF;
+    }
+    if (bios_disk_rw_lba(vol->bios_drive, 1, fat1_lba, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) return -1;
+    if (bios_disk_rw_lba(vol->bios_drive, 1, fat2_lba, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) return -1;
+
+    /* Subsequent FAT sectors (if any): all zeros */
+    for (i = 0; i < 512; i++) {
+        io_buf[i] = 0;
+    }
+    for (s = 1; s < sec_per_fat; s++) {
+        if (bios_disk_rw_lba(vol->bios_drive, 1, fat1_lba + s, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) return -1;
+        if (bios_disk_rw_lba(vol->bios_drive, 1, fat2_lba + s, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) return -1;
+    }
+
+    /* 3. Write Root Directory */
+    root_lba = fat2_lba + sec_per_fat;
+    root_sec = (root_entries * 32) >> 9;
+
+    /* Sector 0 of Root Directory: optional Volume Label entry */
+    for (i = 0; i < 512; i++) {
+        io_buf[i] = 0;
+    }
+    if (label) {
+        for (i = 0; i < 11; i++) {
+            io_buf[i] = vol_label[i];
+        }
+        io_buf[11] = FAT_ATTR_VOLUME_ID;
+    }
+    if (bios_disk_rw_lba(vol->bios_drive, 1, root_lba, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) return -1;
+
+    /* Remaining root sectors: all zeros */
+    for (i = 0; i < 512; i++) {
+        io_buf[i] = 0;
+    }
+    for (s = 1; s < root_sec; s++) {
+        if (bios_disk_rw_lba(vol->bios_drive, 1, root_lba + s, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) return -1;
+    }
+
+    /* 4. Reload VBR into vol and update in-memory state */
+    if (bios_disk_rw_lba(vol->bios_drive, 0, start_lba, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        return -1;
+    }
+    if (parse_bpb(vol, io_buf) != 0) {
+        return -1;
+    }
+    vol->is_mounted  = 1;
+    vol->cwd_cluster = 0;
+    vol->cwd_path[0] = '/';
+    vol->cwd_path[1] = '\0';
+
+    return 0;
+}
+
+/* --- Fixed Disk Partition & Geometry Management --- */
+
+int disk_get_geom(uint8_t drive, os_disk_geom_t __far *out_geom) {
+    uint16_t cyls = 0;
+    uint8_t heads = 0;
+    uint8_t spt = 0;
+    uint8_t drives = 0;
+    uint16_t track_sec;
+    uint32_t acc = 0;
+    uint16_t c;
+
+    if (!out_geom) return -1;
+    if (bios_get_drive_params(drive, &cyls, &heads, &spt, &drives) != 0) {
+        return -1;
+    }
+    if (spt == 0 || heads == 0 || cyls == 0) {
+        return -1;
+    }
+
+    track_sec = (uint16_t)heads * spt;
+    for (c = 0; c < cyls; c++) {
+        acc += track_sec;
+    }
+
+    out_geom->bios_drive    = drive;
+    out_geom->num_drives    = drives;
+    out_geom->cyls          = cyls;
+    out_geom->heads         = heads;
+    out_geom->spt           = spt;
+    out_geom->total_sectors = acc;
+    return 0;
+}
+
+int disk_part_read(uint8_t drive, os_part_table_t __far *out_table) {
+    uint16_t cyls = 0;
+    uint8_t heads = 0, spt = 0, drives = 0;
+    mbr_partition_t *parts;
+    int i, p;
+
+    if (!out_table) return -1;
+    if (bios_get_drive_params(drive, &cyls, &heads, &spt, &drives) != 0) {
+        return -1;
+    }
+    if (bios_disk_rw_lba(drive, 0, 0, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        return -1;
+    }
+
+    out_table->is_valid_mbr = (io_buf[510] == 0x55 && io_buf[511] == 0xAA) ? 1 : 0;
+    out_table->has_boot_code = 0;
+    for (i = 0; i < 446; i++) {
+        if (io_buf[i] != 0x00) {
+            out_table->has_boot_code = 1;
+            break;
+        }
+    }
+
+    parts = (mbr_partition_t *)&io_buf[0x01BE];
+    for (p = 0; p < 4; p++) {
+        out_table->parts[p].boot_indicator = parts[p].boot_indicator;
+        out_table->parts[p].start_head     = parts[p].start_head;
+        out_table->parts[p].start_sector   = parts[p].start_sector;
+        out_table->parts[p].start_cylinder = parts[p].start_cylinder;
+        out_table->parts[p].part_type      = parts[p].part_type;
+        out_table->parts[p].end_head       = parts[p].end_head;
+        out_table->parts[p].end_sector     = parts[p].end_sector;
+        out_table->parts[p].end_cylinder   = parts[p].end_cylinder;
+        out_table->parts[p].start_lba      = parts[p].start_lba;
+        out_table->parts[p].total_sectors  = parts[p].total_sectors;
+    }
+    return 0;
+}
+
+int disk_part_write(uint8_t drive, const os_part_table_t __far *in_table, uint16_t write_mbr_code) {
+    uint16_t cyls = 0;
+    uint8_t heads = 0, spt = 0, drives = 0;
+    mbr_partition_t *parts;
+    int i, p;
+
+    if (!in_table) return -1;
+    if (bios_get_drive_params(drive, &cyls, &heads, &spt, &drives) != 0) {
+        return -1;
+    }
+
+    /* Read existing Sector 0 to preserve existing boot code if write_mbr_code is 0 */
+    if (bios_disk_rw_lba(drive, 0, 0, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        for (i = 0; i < 512; i++) {
+            io_buf[i] = 0;
+        }
+        write_mbr_code = 1;
+    }
+
+    if (write_mbr_code) {
+        for (i = 0; i < 446; i++) {
+            io_buf[i] = default_mbr_code[i];
+        }
+    } else {
+        int has_code = 0;
+        for (i = 0; i < 446; i++) {
+            if (io_buf[i] != 0) {
+                has_code = 1;
+                break;
+            }
+        }
+        if (!has_code) {
+            for (i = 0; i < 446; i++) {
+                io_buf[i] = default_mbr_code[i];
+            }
+        }
+    }
+
+    parts = (mbr_partition_t *)&io_buf[0x01BE];
+    for (p = 0; p < 4; p++) {
+        parts[p].boot_indicator = in_table->parts[p].boot_indicator;
+        parts[p].start_head     = in_table->parts[p].start_head;
+        parts[p].start_sector   = in_table->parts[p].start_sector;
+        parts[p].start_cylinder = in_table->parts[p].start_cylinder;
+        parts[p].part_type      = in_table->parts[p].part_type;
+        parts[p].end_head       = in_table->parts[p].end_head;
+        parts[p].end_sector     = in_table->parts[p].end_sector;
+        parts[p].end_cylinder   = in_table->parts[p].end_cylinder;
+        parts[p].start_lba      = in_table->parts[p].start_lba;
+        parts[p].total_sectors  = in_table->parts[p].total_sectors;
+    }
+
+    io_buf[510] = 0x55;
+    io_buf[511] = 0xAA;
+
+    if (bios_disk_rw_lba(drive, 1, 0, spt, heads, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        return -1;
+    }
+
+    fat16_rescan_drives();
+    return 0;
 }
