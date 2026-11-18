@@ -57,8 +57,10 @@ extern void     kbd_install_vector(void);
 extern void     cga_write_cell(uint16_t cell_idx, uint16_t cell_val);
 extern void     cga_sync_copy(const uint16_t *src, uint16_t word_count);
 extern void     bios_set_video_mode(uint8_t mode);
+extern void     bios_set_palette_reg(uint8_t reg, uint8_t val);
 extern void     cga_wait_vsync(void);
 extern void     cga_blit_linear(const void __far *src);
+extern void     vga_blit_linear(const void __far *src);
 extern void     syscall_install_vector(void);
 extern uint16_t bios_get_ext_mem_kb(void);
 extern int      bios_move_ext_mem(void __far *gdt_table, uint16_t word_count);
@@ -205,6 +207,7 @@ void     gfx_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t color)
 void     gfx_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t color, uint8_t filled);
 void     gfx_draw_text(uint16_t x, uint16_t y, const char __far *str, uint8_t color);
 void     gfx_blit(const void __far *linear_buf);
+void     gfx_set_dac(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
 
 /* Syscall & Executable loader (kernel/syscall.c) */
 void     syscall_init(void);

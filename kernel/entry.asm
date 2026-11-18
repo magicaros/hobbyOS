@@ -784,20 +784,57 @@ _bios_set_video_mode:
     pop bp
     ret
 
+; void bios_set_palette_reg(uint8_t reg, uint8_t val) -> calls INT 0x10 AX=0x1000
+global _bios_set_palette_reg
+_bios_set_palette_reg:
+    push bp
+    mov bp, sp
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+
+    mov ah, 0x10
+    mov al, 0x00
+    mov bl, [bp+4]
+    mov bh, [bp+6]
+    int 0x10
+
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop bp
+    ret
+
 ; void cga_wait_vsync(void) -> waits for rising edge of CGA vertical retrace (0x3DA bit 3)
 global _cga_wait_vsync
 _cga_wait_vsync:
+    push cx
     push dx
     mov dx, 0x03DA
+    mov cx, 1000
 .wait_end:
     in  al, dx
     test al, 0x08
-    jnz .wait_end
+    jz  .wait_start
+    loop .wait_end
 .wait_start:
+    mov cx, 1000
+.wait_start_loop:
     in  al, dx
     test al, 0x08
-    jz  .wait_start
+    jnz .done
+    loop .wait_start_loop
+.done:
     pop dx
+    pop cx
     ret
 
 ; void cga_blit_linear(const void __far *src)
@@ -845,6 +882,34 @@ _cga_blit_linear:
     pop di
     pop si
     pop dx
+    pop cx
+    pop bp
+    ret
+
+; void vga_blit_linear(const void __far *src)
+; Copies a 64,000-byte (320x200) linear buffer into VGA VRAM at 0xA000:0000
+global _vga_blit_linear
+_vga_blit_linear:
+    push bp
+    mov bp, sp
+    push cx
+    push si
+    push di
+    push ds
+    push es
+
+    cld
+    mov ax, 0xA000
+    mov es, ax
+    xor di, di
+    lds si, [bp+4]
+    mov cx, 32000
+    rep movsw
+
+    pop es
+    pop ds
+    pop di
+    pop si
     pop cx
     pop bp
     ret

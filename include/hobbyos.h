@@ -113,14 +113,19 @@ typedef signed long    int32_t;
 #define SYS_GFX_RECT     0x67
 #define SYS_GFX_TEXT     0x68
 #define SYS_GFX_BLIT     0x69
+#define SYS_GFX_SET_DAC  0x6A
 
-/* CGA Video Modes */
+/* Video Modes */
 #define OS_MODE_TEXT_80x25      0x03  /* 80x25 16-color text (default) */
 #define OS_MODE_CGA_320x200     0x04  /* 320x200 4-color graphics (Palettes 0 & 1) */
 #define OS_MODE_CGA_320x200_ALT 0x05  /* 320x200 4-color graphics (Palette 2 Cyan/Red/White) */
 #define OS_MODE_CGA_640x200     0x06  /* 640x200 2-color high-res graphics */
+#define OS_MODE_VGA_640x480     0x12  /* 640x480 16-color planar graphics (VGA only) */
+#define OS_MODE_VGA_320x200_256 0x13  /* 320x200 256-color linear graphics (VGA only) */
 #define OS_CGA_LINEAR_BUF_BYTES 16000 /* 200 rows * 80 bytes/row linear backbuffer */
 #define OS_CGA_LINEAR_BUF_PARAS 1000  /* 16,000 bytes = 1,000 paragraphs */
+#define OS_VGA_LINEAR_BUF_BYTES 64000 /* 320x200 256-color linear backbuffer */
+#define OS_VGA_LINEAR_BUF_PARAS 4000  /* 64,000 bytes = 4,000 paragraphs */
 
 /* Standard CGA Text Attributes */
 #define ATTR_DEFAULT     0x07  /* Light grey on black */
@@ -669,6 +674,21 @@ void os_gfx_rect_raw(const os_gfx_rect_t __far *rect);
     "int 0x21" \
     parm [es di] modify [ax];
 
+uint16_t get_ds(void);
+#pragma aux get_ds = "mov ax, ds" value [ax];
+
+static __inline void os_gfx_line(int16_t x0, int16_t y0, int16_t x1, int16_t y1, uint8_t color) {
+    os_gfx_line_t ln;
+    ln.x0 = x0; ln.y0 = y0; ln.x1 = x1; ln.y1 = y1; ln.color = color;
+    os_gfx_line_raw((const os_gfx_line_t __far *)(((unsigned long)get_ds() << 16) | (uint16_t)&ln));
+}
+
+static __inline void os_gfx_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t color, uint8_t filled) {
+    os_gfx_rect_t rc;
+    rc.x = x; rc.y = y; rc.w = w; rc.h = h; rc.color = color; rc.filled = filled;
+    os_gfx_rect_raw((const os_gfx_rect_t __far *)(((unsigned long)get_ds() << 16) | (uint16_t)&rc));
+}
+
 void os_gfx_text(uint16_t x, uint16_t y, const char __far *str, uint8_t color);
 #pragma aux os_gfx_text = \
     "mov ah, 0x68" \
@@ -681,12 +701,24 @@ void os_gfx_blit(const void __far *linear_buf);
     "int 0x21" \
     parm [es di] modify [ax];
 
+void os_gfx_set_dac(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
+#pragma aux os_gfx_set_dac = \
+    "mov ah, 0x6A" \
+    "int 0x21" \
+    parm [bl] [cl] [ch] [dl] modify [ax];
+
 /* Fast inline pixel plotting into a 16,000-byte linear backbuffer (80 bytes/row) */
 static __inline void os_buf_putpixel_320(uint8_t __far *buf, uint16_t x, uint16_t y, uint8_t color) {
     if (x < 320 && y < 200) {
         uint16_t off   = (y << 6) + (y << 4) + (x >> 2); /* y * 80 + (x / 4) */
         uint8_t  shift = (uint8_t)((3 - (x & 3)) << 1);
         buf[off] = (uint8_t)((buf[off] & ~(0x03 << shift)) | ((color & 0x03) << shift));
+    }
+}
+
+static __inline void os_buf_putpixel_13h(uint8_t __far *buf, uint16_t x, uint16_t y, uint8_t color) {
+    if (x < 320 && y < 200) {
+        buf[(y << 8) + (y << 6) + x] = color;
     }
 }
 

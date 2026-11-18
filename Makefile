@@ -9,7 +9,7 @@ IMG    := book8088/disk.img
 CFLAGS := -0 -fpi87 -ms -s -zl -ecc -zq -Iinclude -Ibuild
 
 KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
-USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin
+USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin
 KEYMAPS     := build/us.map build/fr.map build/be.map
 
 all: $(IMG)
@@ -75,6 +75,7 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) boot.sh tools/fa
 		build/format.bin:/BIN/FORMAT.BIN \
 		build/fdisk.bin:/BIN/FDISK.BIN \
 		build/chkdsk.bin:/BIN/CHKDSK.BIN \
+		build/gfxdemo.bin:/BIN/GFXDEMO.BIN \
 		build/boot.bin:/BIN/BOOT.BIN \
 		boot.sh:/BOOT.SH \
 		build/us.map:/KEYMAPS/US.MAP \

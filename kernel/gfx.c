@@ -17,6 +17,11 @@
 #define CGA_MODE_CTRL_PORT  0x03D8
 #define CGA_COLOR_SEL_PORT  0x03D9
 #define CGA_VRAM_SEG        0xB800
+#define VGA_VRAM_SEG        0xA000
+#define VGA_GFX_INDEX_PORT  0x03CE
+#define VGA_GFX_DATA_PORT   0x03CF
+#define VGA_DAC_WRITE_INDEX 0x03C8
+#define VGA_DAC_DATA_PORT   0x03C9
 #define BIOS_FONT_SEG       0xF000
 #define BIOS_FONT_OFF       0xFA6E
 
@@ -31,6 +36,16 @@ int gfx_set_mode(uint8_t mode) {
             return 0;
         }
         return -1; /* MDA does not support CGA color graphics modes */
+    }
+
+    if (mode == OS_MODE_VGA_640x480 || mode == OS_MODE_VGA_320x200_256) {
+        if (video_get_type() < VIDEO_TYPE_VGA) {
+            return -1; /* Requires VGA */
+        }
+        bios_set_video_mode(mode);
+        cur_video_mode = mode;
+        gfx_clear(0);
+        return 0;
     }
 
     if (mode != OS_MODE_TEXT_80x25 &&
@@ -85,6 +100,45 @@ void gfx_set_palette(uint8_t palette, uint8_t intensity, uint8_t color) {
     }
 
     outb(CGA_COLOR_SEL_PORT, color_sel);
+
+    /* On EGA and VGA, emulate CGA palette swaps via Attribute Controller */
+    if (video_get_type() >= VIDEO_TYPE_EGA) {
+        uint8_t c0 = (uint8_t)(color & 0x0F);
+        uint8_t c1, c2, c3;
+
+        if (cur_video_mode == OS_MODE_CGA_640x200) {
+            bios_set_palette_reg(0, 0);
+            bios_set_palette_reg(1, c0 ? c0 : 15);
+        } else if (cur_video_mode == OS_MODE_CGA_320x200 ||
+                   cur_video_mode == OS_MODE_CGA_320x200_ALT) {
+            if (palette == 0) {
+                /* Green, Red, Brown (or bright equivalents) */
+                c1 = intensity ? 10 : 2;  /* Light Green / Green */
+                c2 = intensity ? 12 : 4;  /* Light Red / Red */
+                c3 = intensity ? 14 : 6;  /* Yellow / Brown */
+            } else if (palette == 1) {
+                /* Cyan, Magenta, White */
+                c1 = intensity ? 11 : 3;  /* Light Cyan / Cyan */
+                c2 = intensity ? 13 : 5;  /* Light Magenta / Magenta */
+                c3 = intensity ? 15 : 7;  /* High White / Light Gray */
+            } else {
+                /* Palette 2 (Mode 5): Cyan, Red, White */
+                c1 = intensity ? 11 : 3;  /* Light Cyan / Cyan */
+                c2 = intensity ? 12 : 4;  /* Light Red / Red */
+                c3 = intensity ? 15 : 7;  /* High White / Light Gray */
+            }
+
+            bios_set_palette_reg(0, c0);
+            bios_set_palette_reg(1, c1);
+            bios_set_palette_reg(2, c2);
+            bios_set_palette_reg(3, c3);
+            bios_set_palette_reg(0x11, c0); /* Overscan / border */
+        }
+
+        /* Reset flip-flop and ensure PAS bit 5 is 1 (display unblanked) */
+        inb(0x3DA);
+        outb(0x3C0, 0x20);
+    }
 }
 
 void gfx_vsync(void) {
@@ -99,6 +153,28 @@ void gfx_clear(uint8_t color) {
 
     if (cur_video_mode == OS_MODE_TEXT_80x25) {
         con_clear(color ? color : ATTR_DEFAULT);
+        return;
+    }
+
+    if (cur_video_mode == OS_MODE_VGA_320x200_256) {
+        volatile uint16_t __far *vga_vram = (volatile uint16_t __far *)MK_FP(VGA_VRAM_SEG, 0x0000);
+        fill_word = ((uint16_t)color << 8) | color;
+        for (i = 0; i < 32000U; i++) {
+            vga_vram[i] = fill_word;
+        }
+        return;
+    }
+
+    if (cur_video_mode == OS_MODE_VGA_640x480) {
+        volatile uint16_t __far *vga_vram = (volatile uint16_t __far *)MK_FP(VGA_VRAM_SEG, 0x0000);
+        outb(VGA_GFX_INDEX_PORT, 0x00); outb(VGA_GFX_DATA_PORT, (uint8_t)(color & 0x0F)); /* Set/Reset */
+        outb(VGA_GFX_INDEX_PORT, 0x01); outb(VGA_GFX_DATA_PORT, 0x0F);                    /* Enable Set/Reset */
+        outb(VGA_GFX_INDEX_PORT, 0x08); outb(VGA_GFX_DATA_PORT, 0xFF);                    /* Bit Mask */
+        for (i = 0; i < 19200U; i++) {
+            vga_vram[i] = 0xFFFF;
+        }
+        outb(VGA_GFX_INDEX_PORT, 0x01); outb(VGA_GFX_DATA_PORT, 0x00);                    /* Restore defaults */
+        outb(VGA_GFX_INDEX_PORT, 0x00); outb(VGA_GFX_DATA_PORT, 0x00);
         return;
     }
 
@@ -121,6 +197,34 @@ void gfx_putpixel(uint16_t x, uint16_t y, uint8_t color) {
     volatile uint8_t __far *vram = (volatile uint8_t __far *)MK_FP(CGA_VRAM_SEG, 0x0000);
     uint16_t bank_off;
     uint16_t row_off;
+
+    if (cur_video_mode == OS_MODE_VGA_320x200_256) {
+        if (x >= 320 || y >= 200) {
+            return;
+        }
+        *(volatile uint8_t __far *)MK_FP(VGA_VRAM_SEG, (y << 8) + (y << 6) + x) = color;
+        return;
+    }
+
+    if (cur_video_mode == OS_MODE_VGA_640x480) {
+        uint16_t off;
+        uint8_t mask;
+        uint8_t dummy;
+        if (x >= 640 || y >= 480) {
+            return;
+        }
+        off = (y << 6) + (y << 4) + (x >> 3); /* y * 80 + x / 8 */
+        mask = (uint8_t)(0x80 >> (x & 7));
+        outb(VGA_GFX_INDEX_PORT, 0x00); outb(VGA_GFX_DATA_PORT, (uint8_t)(color & 0x0F));
+        outb(VGA_GFX_INDEX_PORT, 0x01); outb(VGA_GFX_DATA_PORT, 0x0F);
+        outb(VGA_GFX_INDEX_PORT, 0x08); outb(VGA_GFX_DATA_PORT, mask);
+        dummy = *(volatile uint8_t __far *)MK_FP(VGA_VRAM_SEG, off);
+        *(volatile uint8_t __far *)MK_FP(VGA_VRAM_SEG, off) = 0xFF;
+        outb(VGA_GFX_INDEX_PORT, 0x08); outb(VGA_GFX_DATA_PORT, 0xFF);
+        outb(VGA_GFX_INDEX_PORT, 0x01); outb(VGA_GFX_DATA_PORT, 0x00);
+        outb(VGA_GFX_INDEX_PORT, 0x00); outb(VGA_GFX_DATA_PORT, 0x00);
+        return;
+    }
 
     if (y >= 200) {
         return;
@@ -250,5 +354,18 @@ void gfx_blit(const void __far *linear_buf) {
     if (!linear_buf || cur_video_mode == OS_MODE_TEXT_80x25) {
         return;
     }
-    cga_blit_linear(linear_buf);
+    if (cur_video_mode == OS_MODE_VGA_320x200_256) {
+        vga_blit_linear(linear_buf);
+    } else {
+        cga_blit_linear(linear_buf);
+    }
+}
+
+void gfx_set_dac(uint8_t index, uint8_t r, uint8_t g, uint8_t b) {
+    if (video_get_type() >= VIDEO_TYPE_VGA) {
+        outb(VGA_DAC_WRITE_INDEX, index);
+        outb(VGA_DAC_DATA_PORT, (uint8_t)(r & 0x3F));
+        outb(VGA_DAC_DATA_PORT, (uint8_t)(g & 0x3F));
+        outb(VGA_DAC_DATA_PORT, (uint8_t)(b & 0x3F));
+    }
 }

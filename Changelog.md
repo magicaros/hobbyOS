@@ -17,6 +17,25 @@
     - Full MS-DOS Compatible Summary: Reports volume label, serial number, bytes in user files, hidden files, directories, bad sectors, available disk space, allocation unit metrics, and conventional 640 KB memory status (`SYS_MEM_AVAIL`).
   - **Shell Integration (`user/shell.c`)**:
     - Added `chkdsk` to shell `help` command list.
+- **VGA Graphics API Expansion & `GFXDEMO.BIN` Showcase (`kernel/gfx.c`, `kernel/entry.asm`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/gfxdemo.c`, `user/shell.c`, `Makefile`)**:
+  - **VGA Mode Support & Hardware DAC Control (`include/hobbyos.h`, `kernel/gfx.c`, `kernel/syscall.c`, `kernel/kernel.h`)**:
+    - Defined `OS_MODE_VGA_640x480` (`0x12`, 640x480 16-color planar graphics) and `OS_MODE_VGA_320x200_256` (`0x13`, 320x200 256-color packed-pixel linear graphics).
+    - Added `SYS_GFX_SET_DAC` (`0x6A`, `os_gfx_set_dac(index, r, g, b)`): Sets hardware VGA DAC color registers via I/O ports `0x3C8` (PEL address write) and `0x3C9` (PEL data RGB).
+    - Added VGA adapter verification in `gfx_set_mode()`: Validates `video_get_type() >= VIDEO_TYPE_VGA` before setting Modes `0x12` or `0x13`, falling back gracefully to text mode if unsupported.
+    - Planar Graphics Controller engine for Mode `0x12`: Implemented `gfx_clear()` using Set/Reset registers (`0x3CE` index 0/1) filling all 4 bitplanes simultaneously, and `gfx_putpixel()` using latch read/write cycles and bitmask selection.
+    - Linear frame buffer engine for Mode `0x13`: Direct linear access `0xA000:y*320+x` for `gfx_putpixel()`, word-aligned `gfx_clear()`, and fast assembly `vga_blit_linear` (`kernel/entry.asm`) copying 32,000 words directly into `0xA000:0000`.
+    - Headless VSync timeout safeguard: Added bounded loop counter in `_cga_wait_vsync` to eliminate stalls in headless emulators without CRT beam sync.
+    - High-level C helpers in `include/hobbyos.h`: Added `os_gfx_line()`, `os_gfx_rect()`, and `os_buf_putpixel_13h()`.
+    - EGA/VGA Emulated CGA Palette Swapping (`kernel/gfx.c`, `kernel/entry.asm`, `kernel/kernel.h`): Implemented Attribute Controller palette reprogramming via `bios_set_palette_reg()` (`INT 0x10, AX=0x1000`) when CGA modes run on EGA/VGA adapters (`video_get_type() >= VIDEO_TYPE_EGA`). Emulates CGA Palette 0 (Green/Red/Brown), Palette 1 (Cyan/Magenta/White), and Palette 2 / Mode 5 (Cyan/Red/White) seamlessly on analog VGA hardware where Port `0x3D8`/`0x3D9` writes are ignored by display DACs.
+  - **`GFXDEMO.BIN` User Graphics Showcase (`user/gfxdemo.c`, `Makefile`, `user/shell.c`)**:
+    - Interactive 5-screen graphics showcase demonstrating CGA and VGA graphics features:
+      1. CGA 320x200 4-color palettes (Palettes 0, 1, 2) and geometric primitives.
+      2. CGA 640x200 2-color high-res mathematical curves, moiré lines, and borders.
+      3. Double-buffered 3D rotating wireframe cube with perspective projection, fixed-point integer sine/cosine table (`sin_table`), and hardware `imul` via `fx_mul()`.
+      4. VGA Mode `0x12` (640x480 16-color) planar grid, diamond patterns, and 16 color test bars.
+      5. VGA Mode `0x13` (320x200 256-color) custom DAC gradient palette and concentric color rings.
+    - Supports automated test mode (`gfxdemo /t` or non-interactive key check) with brief delays.
+    - Added `gfxdemo` to shell `help` command list.
 
 ## Revision 0.14 (2026-11-17)
 

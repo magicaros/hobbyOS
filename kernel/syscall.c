@@ -151,7 +151,7 @@ static int resolve_exec_target(const char __far *input, char out_buf[48], const 
 }
 
 int exec_program(const char __far *filename, const char __far *args) {
-    char resolved_buf[32];
+    char resolved_buf[48];
     const char __far *target_name = 0;
     uint32_t bin_size = 0;
     uint16_t user_seg;
@@ -567,6 +567,13 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         gfx_blit(buf);
         break;
     }
+
+    case SYS_GFX_SET_DAC:
+        gfx_set_dac((uint8_t)(regs->bx & 0xFF),
+                    (uint8_t)(regs->cx & 0xFF),
+                    (uint8_t)(regs->cx >> 8),
+                    (uint8_t)(regs->dx & 0xFF));
+        break;
 
     default:
         regs->ax = 0xFFFF;
