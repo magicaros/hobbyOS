@@ -428,6 +428,24 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         break;
     }
 
+    case SYS_VOL_READ_SECTOR: {
+        const char __far *vol = regs->bx ? (const char __far *)MK_FP(regs->ds, regs->bx) : 0;
+        uint32_t lba = ((uint32_t)regs->cx << 16) | regs->dx;
+        void __far *buf = MK_FP(regs->es, regs->di);
+        int res = vol_read_sector(vol, lba, buf);
+        regs->ax = (res == 0) ? 0 : 0xFFFF;
+        break;
+    }
+
+    case SYS_VOL_WRITE_SECTOR: {
+        const char __far *vol = regs->bx ? (const char __far *)MK_FP(regs->ds, regs->bx) : 0;
+        uint32_t lba = ((uint32_t)regs->cx << 16) | regs->dx;
+        const void __far *buf = MK_FP(regs->es, regs->di);
+        int res = vol_write_sector(vol, lba, buf);
+        regs->ax = (res == 0) ? 0 : 0xFFFF;
+        break;
+    }
+
     case SYS_MEM_ALLOC:
         regs->ax = mem_alloc(regs->bx, regs->cs);
         break;

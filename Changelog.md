@@ -1,5 +1,23 @@
 # Changelog
 
+## Revision 0.15 (2026-11-18)
+
+- **Raw Volume Sector Syscalls & `CHKDSK.BIN` Integrity Utility (`user/chkdsk.c`, `kernel/fat16.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/shell.c`, `Makefile`)**:
+  - **Raw Logical Volume Sector Syscalls (`include/hobbyos.h`, `kernel/syscall.c`, `kernel/fat16.c`, `kernel/kernel.h`)**:
+    - Added `SYS_VOL_READ_SECTOR` (`0x26`, `os_vol_read_sector(vol, lba, buf)`): Reads raw 512-byte sectors relative to a logical volume (`HD0A:`, `SYS:`, `FD0:`, etc.), translating volume partition start LBA, drive geometry, and removable media auto-mounting.
+    - Added `SYS_VOL_WRITE_SECTOR` (`0x27`, `os_vol_write_sector(vol, lba, buf)`): Writes raw 512-byte sectors to a logical volume and invalidates kernel FAT cache to ensure consistency.
+  - **`CHKDSK.BIN` Filesystem Integrity & Repair Utility (`user/chkdsk.c`, `Makefile`)**:
+    - Standalone user-space utility written in freestanding 8086 C (`-0 -fpi87 -zl`).
+    - BPB & Boot Sector Validation: Checks `0x55AA` signature, bytes per sector (512), power-of-2 sectors per cluster, reserved sectors, and partition geometry.
+    - FAT Table Consistency: Compares primary and secondary FAT copies sector-by-sector, reporting or synchronizing differences with `/F`.
+    - Directory Tree Traversal: Iterative queue-based traversal of Root Directory and subdirectories, eliminating C stack recursion limits on 8086.
+    - Cluster Chain Validation: Traces FAT12 and FAT16 chains, detecting cross-linked clusters, out-of-range cluster numbers, and infinite circular chain loops.
+    - Lost Cluster Detection & Repair: Dynamically allocates an 8,192-byte bitmap via `os_mem_alloc()` to track referenced clusters across all directories, identifies unreferenced orphan clusters in the FAT, and optionally frees them with `/F`.
+    - Verbose Mode (`/V`): Lists each file, directory, and byte size as it is inspected.
+    - Full MS-DOS Compatible Summary: Reports volume label, serial number, bytes in user files, hidden files, directories, bad sectors, available disk space, allocation unit metrics, and conventional 640 KB memory status (`SYS_MEM_AVAIL`).
+  - **Shell Integration (`user/shell.c`)**:
+    - Added `chkdsk` to shell `help` command list.
+
 ## Revision 0.14 (2026-11-17)
 
 - **Hard Disk Partitioning Subsystem, Syscall API & `FDISK.BIN` (`boot/mbr.asm`, `user/fdisk.c`, `kernel/fat16.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `Makefile`, `user/format.c`)**:

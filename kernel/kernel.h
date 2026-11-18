@@ -186,6 +186,8 @@ int      fat16_chdir(const char __far *path);
 int      fat16_getcwd(char __far *buf, uint16_t max_len);
 int      fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint8_t append);
 int      fat16_rename_file(const char __far *src_path, const char __far *dst_path);
+int      vol_read_sector(const char __far *vol_name, uint32_t lba, void __far *buf);
+int      vol_write_sector(const char __far *vol_name, uint32_t lba, const void __far *buf);
 int      fat16_format_volume(const char __far *dev_name, const char __far *label, uint16_t fmt_flags);
 int      fat16_rescan_drives(void);
 int      disk_get_geom(uint8_t drive, os_disk_geom_t __far *out_geom);

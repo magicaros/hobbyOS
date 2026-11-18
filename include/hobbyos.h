@@ -82,6 +82,8 @@ typedef signed long    int32_t;
 #define SYS_DISK_GET_GEOM 0x23
 #define SYS_PART_READ     0x24
 #define SYS_PART_WRITE    0x25
+#define SYS_VOL_READ_SECTOR  0x26
+#define SYS_VOL_WRITE_SECTOR 0x27
 
 #define SYS_MEM_ALLOC    0x30
 #define SYS_MEM_FREE     0x31
@@ -500,6 +502,18 @@ int os_part_write(uint8_t drive, const os_part_table_t __far *table, uint16_t wr
     "mov ah, 0x25" \
     "int 0x21" \
     parm [bl] [es di] [cx] value [ax];
+
+int os_vol_read_sector(const char *vol, uint32_t lba, void __far *buf);
+#pragma aux os_vol_read_sector = \
+    "mov ah, 0x26" \
+    "int 0x21" \
+    parm [bx] [cx dx] [es di] value [ax];
+
+int os_vol_write_sector(const char *vol, uint32_t lba, const void __far *buf);
+#pragma aux os_vol_write_sector = \
+    "mov ah, 0x27" \
+    "int 0x21" \
+    parm [bx] [cx dx] [es di] value [ax];
 
 uint16_t os_mem_alloc(uint16_t paragraphs);
 #pragma aux os_mem_alloc = \

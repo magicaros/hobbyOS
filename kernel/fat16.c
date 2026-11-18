@@ -349,6 +349,38 @@ int vol_resolve_path(const char __far *path, os_volume_t **out_vol, const char _
     return (*out_vol != 0) ? 0 : -1;
 }
 
+int vol_read_sector(const char __far *vol_name, uint32_t lba, void __far *buf) {
+    os_volume_t *vol = 0;
+    const char __far *subpath = 0;
+    if (!buf) return -1;
+    if (vol_resolve_path(vol_name, &vol, &subpath) != 0 || !vol) {
+        return -1;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) return -1;
+    if (vol->is_removable && !vol->is_mounted) {
+        vol_ensure_mounted(vol);
+    }
+    return vol_rw_lba(vol, 0, lba, buf);
+}
+
+int vol_write_sector(const char __far *vol_name, uint32_t lba, const void __far *buf) {
+    os_volume_t *vol = 0;
+    const char __far *subpath = 0;
+    if (!buf) return -1;
+    if (vol_resolve_path(vol_name, &vol, &subpath) != 0 || !vol) {
+        return -1;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) return -1;
+    if (vol->is_removable && !vol->is_mounted) {
+        vol_ensure_mounted(vol);
+    }
+    fat_flush();
+    cached_fat_vol = 0xFF;
+    return vol_rw_lba(vol, 1, lba, (void __far *)buf);
+}
+
 uint16_t vol_get_free_clusters(os_volume_t *vol) {
     uint16_t num_fat_secs;
     uint16_t sec;
