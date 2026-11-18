@@ -9,7 +9,7 @@ IMG    := book8088/disk.img
 CFLAGS := -0 -fpi87 -ms -s -zl -ecc -zq -Iinclude -Ibuild
 
 KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
-USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin
+USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin
 KEYMAPS     := build/us.map build/fr.map build/be.map
 
 all: $(IMG)
@@ -77,6 +77,7 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) boot.sh tools/fa
 		build/chkdsk.bin:/BIN/CHKDSK.BIN \
 		build/gfxdemo.bin:/BIN/GFXDEMO.BIN \
 		build/ramdisk.bin:/BIN/RAMDISK.BIN \
+		build/har.bin:/BIN/HAR.BIN \
 		build/boot.bin:/BIN/BOOT.BIN \
 		boot.sh:/BOOT.SH \
 		build/us.map:/KEYMAPS/US.MAP \
@@ -92,11 +93,11 @@ run: $(IMG)
 	gdb -batch -ex "target remote :12345" -ex "c"
 
 agent-test: $(IMG)
-	timeout 20s env QT_QPA_PLATFORM=offscreen $(86BOX) -P book8088 > build/run.log 2>&1 & \
+	timeout 60s env QT_QPA_PLATFORM=offscreen $(86BOX) -P book8088 > build/run.log 2>&1 & \
 	PID=$$!; \
 	trap "kill $$PID 2>/dev/null || true" EXIT; \
 	while ! nc -z 127.0.0.1 12345; do sleep 0.1; done; \
 	gdb -batch -ex "set architecture i8086" -ex "target remote :12345" -ex "c"; \
-	sleep 6; \
+	sleep 20; \
 	kill $$PID 2>/dev/null || true; \
 	cat build/run.log

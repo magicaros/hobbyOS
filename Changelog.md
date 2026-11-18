@@ -2,6 +2,36 @@
 
 ## Revision 0.15 (2026-11-18)
 
+- **HobbyOS Archiver (`HAR.BIN`), Stream Offset Syscall & LZ4 Compression (`user/har.c`, `kernel/fat16.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/shell.c`, `Makefile`)**:
+  - **Large File (> 32 KB) I/O Support & Signed Integer Fix (`kernel/fat16.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/har.c`, `user/shell.c`, `user/chkdsk.c`)**:
+    - Fixed 16-bit signed integer overflow where files $\ge 32,768$ bytes (such as `KERNEL.BIN` at 35,653 bytes) produced negative return values when cast to signed `int` (`-29975 < 0`).
+    - Changed `fat16_read_file`, `fat16_read_file_offset`, `fat16_write_file`, and `fat16_append_file` to return `int32_t`, cleanly separating 0..65534 byte counts from negative error codes (`-1`, `-3`).
+    - Updated `os_file_read`, `os_file_read_offset`, `os_file_write`, and `os_file_append` prototypes in `include/hobbyos.h` to `uint16_t` (returning `0xFFFF` on failure).
+    - Updated `user/har.c` to use unsigned return comparisons (`r == 0xFFFF || r != sz`), allowing archiving, appending, testing, and extraction of files up to the 48 KB buffer ceiling without false read/write errors.
+    - Fixed `ls` (`cmd_ls` in `user/shell.c`) truncating file sizes $\ge 64$ KB by printing full 32-bit `dent.size` (`print_uint32`) instead of casting to `uint16_t` (which displayed 71,067 B as 5,531 B).
+    - Implemented safe kernel bounce buffering in `vol_read_sector()` and `vol_write_sector()` via `KERNEL_SEG io_buf` (`kernel/fat16.c`), eliminating BIOS `INT 0x13` DMA 64K boundary crossing errors (`AH=0x09`) on floppy drives.
+    - Updated `user/chkdsk.c` FAT12 cross-sector cluster lookup (clusters 341 and 682) to use static sector buffer `next_fat_buf` instead of allocating 512 bytes on the user stack.
+  - **Recursive Directory Archiving & Append Switch `-a` (`user/har.c`, `user/shell.c`)**:
+    - Implemented recursive directory traversal for both `har -c` and `har -a`: directories specified on the command line are recursively scanned, preserving relative subdirectory paths within the archive.
+    - Implemented `-a` append switch: appends files and subdirectories directly to existing `.HAR` archives using streamable chunked headers.
+    - Added directory tree recreation on extraction (`har -x`): automatically invokes `os_mkdir` via `ensure_parent_dirs()` to rebuild parent directories before writing files.
+  - **Random Access File Stream Syscall (`include/hobbyos.h`, `kernel/syscall.c`, `kernel/fat16.c`, `kernel/kernel.h`)**:
+    - Added `SYS_FILE_READ_OFFSET` (`0x2B`, `os_file_read_offset(filename, buf, max_len, offset_32)`): Enables reading files from arbitrary 32-bit byte offsets across cluster chains without library dependencies or memory allocation. Fast-forwards cluster lookups via bit shifts, supporting arbitrary-sized file streaming on real-mode 8086 systems.
+  - **Pure 8086 Freestanding LZ4 Compression Engine (`user/har.c`)**:
+    - Ported Yann Collet's LZ4 block compression and decompression algorithm to freestanding real-mode 8086 C (`-0 -fpi87 -zl`).
+    - Decompressor: Ultra-compact, high-speed 16-bit block decompressor supporting overlapping token matches and RLE runs.
+    - Compressor: 4096-entry (8 KB) hash table with pure 16-bit hash arithmetic (`(w0 * 40503U) ^ w1`) compiling to single 8086 `mul` instructions without 32-bit math helpers. Automatically falls back to uncompressed storage if compression expands data.
+    - Checksum: Integrated CRC-16 computation (`har_crc16`) for end-to-end data integrity verification.
+  - **Custom Streamable Archive Format (`.HAR`)**:
+    - Compact container: 8-byte archive header (`"HAR1"`), 16-byte packed file entry headers (`"HF"`), relative filenames, CRC16, and end-of-archive marker (`"HE"`).
+    - Chunked file appending: Uses `os_file_append()` to stream files directly into the archive without requiring multi-megabyte staging buffers.
+  - **User-Space Archiver Utility `/BIN/HAR.BIN` (`user/har.c`, `Makefile`, `user/shell.c`)**:
+    - `har -c <archive.har> <files...>`: Compresses and creates archives (supports wildcards `*` and `?`).
+    - `har -x <archive.har> [dest_dir]`: Extracts files from archive to current or target volume/directory (e.g. `RAM:`).
+    - `har -t <archive.har>`: Tests archive integrity, validating payload decompression and CRC16 checksums.
+    - `har -l <archive.har>`: Lists archive contents, uncompressed/compressed sizes, compression ratios, and CRC16.
+    - Memory reporting: Displays available conventional memory, EMS, and XMS capacity.
+    - Added `har` to shell `help` command.
 - **RAM Disk Architecture, Syscall API & `RAMDISK.BIN` Utility (`user/ramdisk.c`, `kernel/fat16.c`, `kernel/ems.c`, `kernel/xms.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/shell.c`, `Makefile`)**:
   - **RAM Disk Syscalls (`include/hobbyos.h`, `kernel/syscall.c`, `kernel/fat16.c`, `kernel/kernel.h`)**:
     - Added `SYS_RAMDISK_MOUNT` (`0x28`, `os_ramdisk_mount(type, size_kb, &mounted_kb)`): Allocates EMS or XMS memory belonging to `KERNEL_SEG` (`0x9000`) so the disk survives user process termination, generates an in-memory FAT12 VBR (Sector 0) and initial FAT tables (Sector 1 with media descriptor `0xF8`), registers volume `RAM:`, and mounts it dynamically.

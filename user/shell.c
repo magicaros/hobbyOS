@@ -521,7 +521,7 @@ static void cmd_ls(const char *path) {
             os_puts("\t<DIR>\n");
         } else {
             os_puts("\t");
-            print_uint16((uint16_t)dent.size);
+            print_uint32(dent.size);
             os_puts(" B\n");
         }
     }
@@ -1346,7 +1346,7 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
         os_puts("Commands: help, ls [dir|pat], lsdisk, cd <dir>, pwd, mkdir <dir>, rmdir <dir>,\n");
         os_puts("          cat <file>, write [-a] [file] \"<text>\", cp <src> <dst>, mv <s> <d>,\n");
         os_puts("          rm <path>, edit <file>, forth, set [VAR=VAL], echo [text|on|off],\n");
-        os_puts("          keyb [us|fr|be], mem, cls, format [dev:] [/s], fdisk, chkdsk, ramdisk, gfxdemo, diskchange, <DEV:>\n");
+        os_puts("          keyb [us|fr|be], mem, cls, format [dev:] [/s], fdisk, chkdsk, ramdisk, har, gfxdemo, diskchange, <DEV:>\n");
     } else if (str_eq(cmd, "set")) {
         cmd_set(rest);
     } else if (str_eq(cmd, "ls") || str_eq(cmd, "dir")) {

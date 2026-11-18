@@ -276,24 +276,24 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
     case SYS_FILE_READ: {
         const char __far *fname = (const char __far *)MK_FP(regs->ds, regs->bx);
         void __far *dest        = MK_FP(regs->es, regs->di);
-        int res = fat16_read_file(fname, dest, regs->cx);
-        regs->ax = (res == -1) ? 0xFFFF : (uint16_t)res;
+        int32_t res = fat16_read_file(fname, dest, regs->cx);
+        regs->ax = (uint16_t)res;
         break;
     }
 
     case SYS_FILE_WRITE: {
         const char __far *fname = (const char __far *)MK_FP(regs->ds, regs->bx);
         const void __far *src   = MK_FP(regs->es, regs->di);
-        int res = fat16_write_file(fname, src, regs->cx);
-        regs->ax = (res == -1) ? 0xFFFF : (uint16_t)res;
+        int32_t res = fat16_write_file(fname, src, regs->cx);
+        regs->ax = (uint16_t)res;
         break;
     }
 
     case SYS_FILE_APPEND: {
         const char __far *fname = (const char __far *)MK_FP(regs->ds, regs->bx);
         const void __far *src   = MK_FP(regs->es, regs->di);
-        int res = fat16_append_file(fname, src, regs->cx);
-        regs->ax = (res == -1) ? 0xFFFF : (uint16_t)res;
+        int32_t res = fat16_append_file(fname, src, regs->cx);
+        regs->ax = (uint16_t)res;
         break;
     }
 
@@ -466,6 +466,15 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         os_ramdisk_status_t __far *st = (regs->es || regs->di) ?
             (os_ramdisk_status_t __far *)MK_FP(regs->es, regs->di) : 0;
         regs->ax = (uint16_t)ramdisk_status(st);
+        break;
+    }
+
+    case SYS_FILE_READ_OFFSET: {
+        const char __far *fname = (const char __far *)MK_FP(regs->ds, regs->bx);
+        void __far *dest        = MK_FP(regs->es, regs->di);
+        uint32_t offset         = ((uint32_t)regs->dx << 16) | regs->si;
+        int32_t res = fat16_read_file_offset(fname, dest, regs->cx, offset);
+        regs->ax = (uint16_t)res;
         break;
     }
 

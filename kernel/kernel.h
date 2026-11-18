@@ -180,10 +180,11 @@ int          vol_resolve_path(const char __far *path, os_volume_t **out_vol, con
 int          vol_get_info(uint8_t idx, os_vol_info_t __far *out_info);
 uint16_t     vol_get_free_clusters(os_volume_t *vol);
 int32_t      fat16_file_size(const char __far *filename);
-int      fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_bytes);
-int      fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_t *out_size);
-int      fat16_write_file(const char __far *filename, const void __far *src, uint16_t size);
-int      fat16_append_file(const char __far *filename, const void __far *src, uint16_t size);
+int32_t      fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_bytes);
+int32_t      fat16_read_file_offset(const char __far *filename, void __far *dest, uint16_t max_bytes, uint32_t offset);
+int          fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_t *out_size);
+int32_t      fat16_write_file(const char __far *filename, const void __far *src, uint16_t size);
+int32_t      fat16_append_file(const char __far *filename, const void __far *src, uint16_t size);
 int      fat16_delete_file(const char __far *filename);
 int      fat16_dir_entry(const char __far *path, uint16_t index, os_dir_entry_t __far *out_info);
 int      fat16_mkdir(const char __far *path);

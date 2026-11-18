@@ -389,6 +389,7 @@ int vol_resolve_path(const char __far *path, os_volume_t **out_vol, const char _
 int vol_read_sector(const char __far *vol_name, uint32_t lba, void __far *buf) {
     os_volume_t *vol = 0;
     const char __far *subpath = 0;
+    int rc;
     if (!buf) return -1;
     if (vol_resolve_path(vol_name, &vol, &subpath) != 0 || !vol) {
         return -1;
@@ -398,12 +399,23 @@ int vol_read_sector(const char __far *vol_name, uint32_t lba, void __far *buf) {
     if (vol->is_removable && !vol->is_mounted) {
         vol_ensure_mounted(vol);
     }
-    return vol_rw_lba(vol, 0, lba, buf);
+    /* Bounce through KERNEL_SEG io_buf to guarantee no 64K DMA boundary violations */
+    rc = vol_rw_lba(vol, 0, lba, MK_FP(KERNEL_SEG, io_buf));
+    if (rc == 0) {
+        uint8_t __far *dst = (uint8_t __far *)buf;
+        uint16_t i;
+        for (i = 0; i < 512; i++) {
+            dst[i] = io_buf[i];
+        }
+    }
+    return rc;
 }
 
 int vol_write_sector(const char __far *vol_name, uint32_t lba, const void __far *buf) {
     os_volume_t *vol = 0;
     const char __far *subpath = 0;
+    const uint8_t __far *src = (const uint8_t __far *)buf;
+    uint16_t i;
     if (!buf) return -1;
     if (vol_resolve_path(vol_name, &vol, &subpath) != 0 || !vol) {
         return -1;
@@ -415,7 +427,11 @@ int vol_write_sector(const char __far *vol_name, uint32_t lba, const void __far 
     }
     fat_flush();
     cached_fat_vol = 0xFF;
-    return vol_rw_lba(vol, 1, lba, (void __far *)buf);
+    /* Bounce through KERNEL_SEG io_buf to guarantee no 64K DMA boundary violations */
+    for (i = 0; i < 512; i++) {
+        io_buf[i] = src[i];
+    }
+    return vol_rw_lba(vol, 1, lba, MK_FP(KERNEL_SEG, io_buf));
 }
 
 uint16_t vol_get_free_clusters(os_volume_t *vol) {
@@ -1744,7 +1760,7 @@ int32_t fat16_file_size(const char __far *filename) {
     return (int32_t)entry.file_size;
 }
 
-int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_bytes) {
+int32_t fat16_read_file_offset(const char __far *filename, void __far *dest, uint16_t max_bytes, uint32_t offset) {
     os_volume_t *vol;
     const char __far *subpath;
     uint16_t parent_clus;
@@ -1754,6 +1770,12 @@ int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_b
     uint16_t target_bytes;
     uint16_t bytes_read = 0;
     uint8_t __far *out_ptr = (uint8_t __far *)dest;
+    uint8_t clus_shift;
+    uint8_t spc;
+    uint16_t clus_to_skip;
+    uint16_t off_in_clus;
+    uint16_t cluster_mask;
+    uint16_t i;
 
     if (vol_resolve_path(filename, &vol, &subpath) != 0) {
         return -1;
@@ -1774,33 +1796,64 @@ int fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_b
     if (entry.attr & FAT_ATTR_DIRECTORY) {
         return -1;
     }
+    if (offset >= entry.file_size) {
+        return 0; /* EOF */
+    }
 
-    target_bytes = (entry.file_size < (uint32_t)max_bytes)
-                       ? (uint16_t)entry.file_size
+    target_bytes = (entry.file_size - offset < (uint32_t)max_bytes)
+                       ? (uint16_t)(entry.file_size - offset)
                        : max_bytes;
     cluster = entry.fst_clus_lo;
 
+    /* Calculate cluster shift: sectors_per_cluster * 512 */
+    clus_shift = 9;
+    spc = vol->sectors_per_cluster;
+    while (spc > 1) {
+        clus_shift++;
+        spc >>= 1;
+    }
+
+    clus_to_skip = (uint16_t)(offset >> clus_shift);
+    cluster_mask = ((uint16_t)vol->sectors_per_cluster << 9) - 1;
+    off_in_clus  = (uint16_t)(offset & cluster_mask);
+
+    for (i = 0; i < clus_to_skip; i++) {
+        if (cluster < 2 || is_eof_cluster(vol, cluster)) {
+            return 0;
+        }
+        cluster = fat_get_cluster(vol, cluster);
+    }
+
     while (cluster >= 2 && !is_eof_cluster(vol, cluster) && bytes_read < target_bytes) {
         uint32_t first_lba = cluster_to_lba(vol, cluster);
-        uint8_t s;
-        for (s = 0; s < vol->sectors_per_cluster && bytes_read < target_bytes; s++) {
+        uint8_t s = (uint8_t)(off_in_clus >> 9);
+        uint16_t sec_off = off_in_clus & 511;
+
+        for (; s < vol->sectors_per_cluster && bytes_read < target_bytes; s++) {
+            uint16_t avail_in_sec = 512 - sec_off;
             uint16_t chunk = target_bytes - bytes_read;
             uint16_t j;
-            if (chunk > 512) {
-                chunk = 512;
+            if (chunk > avail_in_sec) {
+                chunk = avail_in_sec;
             }
             if (vol_rw_lba(vol, 0, first_lba + s, MK_FP(KERNEL_SEG, io_buf)) != 0) {
                 return -1;
             }
             for (j = 0; j < chunk; j++) {
-                out_ptr[bytes_read + j] = io_buf[j];
+                out_ptr[bytes_read + j] = io_buf[sec_off + j];
             }
             bytes_read += chunk;
+            sec_off = 0;
         }
+        off_in_clus = 0;
         cluster = fat_get_cluster(vol, cluster);
     }
 
-    return (int)bytes_read;
+    return (int32_t)bytes_read;
+}
+
+int32_t fat16_read_file(const char __far *filename, void __far *dest, uint16_t max_bytes) {
+    return fat16_read_file_offset(filename, dest, max_bytes, 0);
 }
 
 int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_t *out_size) {
@@ -1863,7 +1916,7 @@ int fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_
     return 0;
 }
 
-int fat16_write_file(const char __far *filename, const void __far *src, uint16_t size) {
+int32_t fat16_write_file(const char __far *filename, const void __far *src, uint16_t size) {
     os_volume_t *vol;
     const char __far *subpath;
     uint16_t parent_clus;
@@ -1957,10 +2010,10 @@ int fat16_write_file(const char __far *filename, const void __far *src, uint16_t
         return -1;
     }
 
-    return (int)size;
+    return (int32_t)size;
 }
 
-int fat16_append_file(const char __far *filename, const void __far *src, uint16_t size) {
+int32_t fat16_append_file(const char __far *filename, const void __far *src, uint16_t size) {
     os_volume_t *vol;
     const char __far *subpath;
     uint16_t parent_clus;
@@ -2098,7 +2151,7 @@ int fat16_append_file(const char __far *filename, const void __far *src, uint16_
         return -1;
     }
 
-    return (int)size;
+    return (int32_t)size;
 }
 
 int fat16_delete_file(const char __far *filename) {
@@ -2205,7 +2258,7 @@ int fat16_copy_file(const char __far *src_path, const char __far *dst_path, uint
         uint16_t next_clus = fat_get_cluster(src_vol, cur_clus);
         uint8_t  s;
         uint16_t clus_bytes = 0;
-        int rc;
+        int32_t rc;
 
         for (s = 0; s < src_vol->sectors_per_cluster && remaining > 0; s++) {
             uint16_t chunk = (remaining > 512) ? 512 : (uint16_t)remaining;

@@ -157,6 +157,7 @@ static uint16_t cluster_bytes;
 static uint32_t cur_fat_sec = 0xFFFFFFFFUL;
 static int      cur_fat_dirty = 0;
 static uint8_t  fat_sec_buf[512];
+static uint8_t  next_fat_buf[512];
 
 static void fat_flush_cache(const char *vol) {
     if (cur_fat_dirty && cur_fat_sec != 0xFFFFFFFFUL) {
@@ -195,11 +196,10 @@ static uint16_t get_fat_entry(const char *vol, uint16_t cluster) {
         }
         if (off == 511) {
             uint8_t low_b = fat_sec_buf[511];
-            uint8_t next_buf[512];
-            if (os_vol_read_sector(vol, sec + 1, (void __far *)FP_HERE(next_buf)) != 0) {
+            if (os_vol_read_sector(vol, sec + 1, (void __far *)FP_HERE(next_fat_buf)) != 0) {
                 return 0x0FFF;
             }
-            val = (uint16_t)low_b | ((uint16_t)next_buf[0] << 8);
+            val = (uint16_t)low_b | ((uint16_t)next_fat_buf[0] << 8);
         } else {
             val = *(uint16_t *)&fat_sec_buf[off];
         }
@@ -233,20 +233,19 @@ static void set_fat_entry(const char *vol, uint16_t cluster, uint16_t val) {
             cur_fat_sec = sec;
         }
         if (off == 511) {
-            uint8_t next_buf[512];
-            os_vol_read_sector(vol, sec + 1, (void __far *)FP_HERE(next_buf));
+            os_vol_read_sector(vol, sec + 1, (void __far *)FP_HERE(next_fat_buf));
             if (cluster & 1) {
                 fat_sec_buf[511] = (uint8_t)((fat_sec_buf[511] & 0x0F) | ((val & 0x0F) << 4));
-                next_buf[0]      = (uint8_t)(val >> 4);
+                next_fat_buf[0]  = (uint8_t)(val >> 4);
             } else {
                 fat_sec_buf[511] = (uint8_t)(val & 0xFF);
-                next_buf[0]      = (uint8_t)((next_buf[0] & 0xF0) | ((val >> 8) & 0x0F));
+                next_fat_buf[0]  = (uint8_t)((next_fat_buf[0] & 0xF0) | ((val >> 8) & 0x0F));
             }
             cur_fat_dirty = 1;
             fat_flush_cache(vol);
-            os_vol_write_sector(vol, sec + 1, (const void __far *)FP_HERE(next_buf));
+            os_vol_write_sector(vol, sec + 1, (const void __far *)FP_HERE(next_fat_buf));
             if (num_fats >= 2) {
-                os_vol_write_sector(vol, sec + 1 + fat_sz16, (const void __far *)FP_HERE(next_buf));
+                os_vol_write_sector(vol, sec + 1 + fat_sz16, (const void __far *)FP_HERE(next_fat_buf));
             }
         } else {
             uint16_t old = *(uint16_t *)&fat_sec_buf[off];
