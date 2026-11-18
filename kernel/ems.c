@@ -144,3 +144,31 @@ void ems_restore_slots(const uint8_t in_slots[EMS_NUM_SLOTS]) {
         ems_hw_map(i, in_slots[i]);
     }
 }
+
+int ems_rw_sector(uint8_t phys_page, uint16_t sec_offset, uint8_t is_write, void __far *buf) {
+    uint8_t old_page;
+    volatile uint16_t __far *dst;
+    volatile uint16_t __far *src;
+    uint16_t i;
+
+    if (!ems_present || phys_page >= EMS_TOTAL_PAGES || sec_offset > 15872) {
+        return -1;
+    }
+
+    old_page = ems_slot_page[0];
+    ems_hw_map(0, phys_page);
+
+    if (is_write) {
+        dst = (volatile uint16_t __far *)MK_FP(EMS_FRAME_SEG, sec_offset);
+        src = (volatile uint16_t __far *)buf;
+    } else {
+        dst = (volatile uint16_t __far *)buf;
+        src = (volatile uint16_t __far *)MK_FP(EMS_FRAME_SEG, sec_offset);
+    }
+    for (i = 0; i < 256; i++) {
+        dst[i] = src[i];
+    }
+
+    ems_hw_map(0, old_page);
+    return 0;
+}

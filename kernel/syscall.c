@@ -446,6 +446,29 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         break;
     }
 
+    case SYS_RAMDISK_MOUNT: {
+        uint16_t out_size = 0;
+        int res = ramdisk_mount((uint8_t)(regs->bx & 0xFF), regs->dx, (uint16_t __far *)&out_size);
+        regs->ax = (uint16_t)res;
+        regs->dx = out_size;
+        if (regs->es || regs->di) {
+            uint16_t __far *out_ptr = (uint16_t __far *)MK_FP(regs->es, regs->di);
+            *out_ptr = out_size;
+        }
+        break;
+    }
+
+    case SYS_RAMDISK_UNMOUNT:
+        regs->ax = (ramdisk_unmount() == 0) ? 0 : 0xFFFF;
+        break;
+
+    case SYS_RAMDISK_STATUS: {
+        os_ramdisk_status_t __far *st = (regs->es || regs->di) ?
+            (os_ramdisk_status_t __far *)MK_FP(regs->es, regs->di) : 0;
+        regs->ax = (uint16_t)ramdisk_status(st);
+        break;
+    }
+
     case SYS_MEM_ALLOC:
         regs->ax = mem_alloc(regs->bx, regs->cs);
         break;

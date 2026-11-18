@@ -2,6 +2,25 @@
 
 ## Revision 0.15 (2026-11-18)
 
+- **RAM Disk Architecture, Syscall API & `RAMDISK.BIN` Utility (`user/ramdisk.c`, `kernel/fat16.c`, `kernel/ems.c`, `kernel/xms.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/shell.c`, `Makefile`)**:
+  - **RAM Disk Syscalls (`include/hobbyos.h`, `kernel/syscall.c`, `kernel/fat16.c`, `kernel/kernel.h`)**:
+    - Added `SYS_RAMDISK_MOUNT` (`0x28`, `os_ramdisk_mount(type, size_kb, &mounted_kb)`): Allocates EMS or XMS memory belonging to `KERNEL_SEG` (`0x9000`) so the disk survives user process termination, generates an in-memory FAT12 VBR (Sector 0) and initial FAT tables (Sector 1 with media descriptor `0xF8`), registers volume `RAM:`, and mounts it dynamically.
+    - Added `SYS_RAMDISK_UNMOUNT` (`0x29`, `os_ramdisk_unmount()`): Flushes FAT cache, frees allocated EMS pages / XMS handle, unregisters volume `RAM:`, and resets shell current volume to `SYS:` if needed.
+    - Added `SYS_RAMDISK_STATUS` (`0x2A`, `os_ramdisk_status(&status)`): Reports active status, memory backing type (`RAMDISK_TYPE_EMS` vs `RAMDISK_TYPE_XMS`), allocated capacity in KB, cluster size, and cluster metrics.
+  - **EMS & XMS Sector I/O Engines (`kernel/ems.c`, `kernel/xms.c`, `kernel/fat16.c`)**:
+    - Implemented `ems_rw_sector(phys_page, sec_offset, is_write, buf)`: Transparently maps physical 16 KB pages into EMS Slot 0 (`0xE000:0000`), copies 512 bytes (256 words), and restores previous page mappings.
+    - Implemented `xms_rw_sector(handle, byte_offset, is_write, buf)`: Sets up `os_xms_move_t` and performs extended memory sector transfers via `xms_move()`.
+    - Integrated with volume manager `vol_rw_lba()` using dummy BIOS drive `0xFF`.
+    - Preserved `RAM:` volume across `fat16_rescan_drives()`, preventing partition rescans from destroying active RAM disks.
+  - **`RAMDISK.BIN` User Utility (`user/ramdisk.c`, `Makefile`, `user/shell.c`)**:
+    - Freestanding 8086 C utility supporting:
+      - `/e [size|MAX]`: Mounts RAM disk in Lo-tech EMS memory (e.g., `ramdisk /e 512` or `ramdisk /e MAX`).
+      - `/x [size|MAX]`: Mounts RAM disk in XMS extended memory on 286+ systems.
+      - `/u`: Unmounts active RAM disk and releases memory back to system pools.
+      - `/s` or no arguments: Displays active status, memory type, capacity, free disk space, and total available EMS/XMS memory.
+  - **Shell Integration (`user/shell.c`)**:
+    - Updated `lsdisk` to detect and format `RAM:` as `RAM Disk (FAT12) | ... KB total (... KB free)`.
+    - Added `ramdisk` to shell `help` command list.
 - **Raw Volume Sector Syscalls & `CHKDSK.BIN` Integrity Utility (`user/chkdsk.c`, `kernel/fat16.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/shell.c`, `Makefile`)**:
   - **Raw Logical Volume Sector Syscalls (`include/hobbyos.h`, `kernel/syscall.c`, `kernel/fat16.c`, `kernel/kernel.h`)**:
     - Added `SYS_VOL_READ_SECTOR` (`0x26`, `os_vol_read_sector(vol, lba, buf)`): Reads raw 512-byte sectors relative to a logical volume (`HD0A:`, `SYS:`, `FD0:`, etc.), translating volume partition start LBA, drive geometry, and removable media auto-mounting.

@@ -84,6 +84,12 @@ typedef signed long    int32_t;
 #define SYS_PART_WRITE    0x25
 #define SYS_VOL_READ_SECTOR  0x26
 #define SYS_VOL_WRITE_SECTOR 0x27
+#define SYS_RAMDISK_MOUNT    0x28
+#define SYS_RAMDISK_UNMOUNT  0x29
+#define SYS_RAMDISK_STATUS   0x2A
+
+#define RAMDISK_TYPE_EMS     1
+#define RAMDISK_TYPE_XMS     2
 
 #define SYS_MEM_ALLOC    0x30
 #define SYS_MEM_FREE     0x31
@@ -233,6 +239,16 @@ typedef struct {
     uint8_t  color;
     uint8_t  filled;
 } os_gfx_rect_t;
+
+/* RAM Disk status descriptor for SYS_RAMDISK_STATUS */
+typedef struct {
+    uint8_t  active;            /* 1 if mounted, 0 if not */
+    uint8_t  type;              /* RAMDISK_TYPE_EMS (1) or RAMDISK_TYPE_XMS (2) */
+    uint16_t size_kb;           /* Total size in KB */
+    uint16_t total_clusters;    /* Total clusters */
+    uint16_t free_clusters;     /* Free clusters */
+    uint16_t bytes_per_cluster; /* Bytes per cluster */
+} os_ramdisk_status_t;
 
 /* Saved register frame during INT 0x21 dispatch */
 typedef struct {
@@ -519,6 +535,24 @@ int os_vol_write_sector(const char *vol, uint32_t lba, const void __far *buf);
     "mov ah, 0x27" \
     "int 0x21" \
     parm [bx] [cx dx] [es di] value [ax];
+
+int os_ramdisk_mount(uint8_t type, uint16_t size_kb, uint16_t __far *out_size_kb);
+#pragma aux os_ramdisk_mount = \
+    "mov ah, 0x28" \
+    "int 0x21" \
+    parm [bl] [dx] [es di] value [ax] modify [ax dx];
+
+int os_ramdisk_unmount(void);
+#pragma aux os_ramdisk_unmount = \
+    "mov ah, 0x29" \
+    "int 0x21" \
+    value [ax];
+
+int os_ramdisk_status(os_ramdisk_status_t __far *status);
+#pragma aux os_ramdisk_status = \
+    "mov ah, 0x2A" \
+    "int 0x21" \
+    parm [es di] value [ax];
 
 uint16_t os_mem_alloc(uint16_t paragraphs);
 #pragma aux os_mem_alloc = \

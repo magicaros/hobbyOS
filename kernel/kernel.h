@@ -28,6 +28,8 @@
 #define EMS_NUM_SLOTS    4
 
 #define MK_FP(seg, off)  ((void __far *)(((unsigned long)(seg) << 16) | (uint16_t)(off)))
+#define FP_SEG(fp)       ((uint16_t)(((uint32_t)(fp)) >> 16))
+#define FP_OFF(fp)       ((uint16_t)(((uint32_t)(fp)) & 0xFFFF))
 
 /* Low-level assembly helpers (kernel/entry.asm) */
 extern void     outb(uint16_t port, uint8_t val);
@@ -116,6 +118,7 @@ uint16_t ems_avail_pages(void);
 uint16_t ems_total_pages(void);
 void     ems_save_slots(uint8_t out_slots[EMS_NUM_SLOTS]);
 void     ems_restore_slots(const uint8_t in_slots[EMS_NUM_SLOTS]);
+int      ems_rw_sector(uint8_t phys_page, uint16_t sec_offset, uint8_t is_write, void __far *buf);
 
 /* XMS 2.0 Manager (kernel/xms.c) */
 int      xms_init(void);
@@ -127,6 +130,7 @@ uint16_t xms_alloc(uint16_t size_kb, uint16_t owner_seg);
 int      xms_free(uint16_t handle);
 void     xms_free_by_owner(uint16_t owner_seg);
 int      xms_move(const os_xms_move_t __far *req);
+int      xms_rw_sector(uint16_t handle, uint32_t byte_offset, uint8_t is_write, void __far *buf);
 void     xms_dispatch(syscall_regs_t __far *regs);
 
 /* FAT12/FAT16 filesystem driver & Volume Manager (kernel/fat16.c) */
@@ -190,6 +194,9 @@ int      fat16_copy_file(const char __far *src_path, const char __far *dst_path,
 int      fat16_rename_file(const char __far *src_path, const char __far *dst_path);
 int      vol_read_sector(const char __far *vol_name, uint32_t lba, void __far *buf);
 int      vol_write_sector(const char __far *vol_name, uint32_t lba, const void __far *buf);
+int      ramdisk_mount(uint8_t type, uint16_t size_kb, uint16_t __far *out_size_kb);
+int      ramdisk_unmount(void);
+int      ramdisk_status(os_ramdisk_status_t __far *status);
 int      fat16_format_volume(const char __far *dev_name, const char __far *label, uint16_t fmt_flags);
 int      fat16_rescan_drives(void);
 int      disk_get_geom(uint8_t drive, os_disk_geom_t __far *out_geom);

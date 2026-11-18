@@ -210,11 +210,48 @@ int vol_diskchange(const char __far *dev_name) {
     }
 }
 
+typedef struct {
+    uint8_t  active;
+    uint8_t  type;
+    uint16_t size_kb;
+    uint16_t total_sectors;
+    uint8_t  ems_pages[128];
+    uint16_t ems_num_pages;
+    uint16_t xms_handle;
+} ramdisk_info_t;
+
+static ramdisk_info_t ramdisk_info = {0};
+
+static int ramdisk_rw(uint8_t is_write, uint32_t rel_lba, void __far *buf) {
+    if (!ramdisk_info.active || rel_lba >= (uint32_t)ramdisk_info.total_sectors) {
+        return -1;
+    }
+    if (ramdisk_info.type == RAMDISK_TYPE_EMS) {
+        uint16_t lba16 = (uint16_t)rel_lba;
+        uint16_t page_idx = lba16 >> 5;          /* 32 sectors per 16KB page */
+        uint16_t sec_in_page = lba16 & 31;
+        uint16_t sec_offset = sec_in_page << 9;  /* 512 bytes per sector */
+
+        if (page_idx >= ramdisk_info.ems_num_pages) {
+            return -1;
+        }
+        return ems_rw_sector(ramdisk_info.ems_pages[page_idx], sec_offset, is_write, buf);
+    } else if (ramdisk_info.type == RAMDISK_TYPE_XMS) {
+        uint16_t lba16 = (uint16_t)rel_lba;
+        uint32_t byte_offset = ((uint32_t)(lba16 >> 7) << 16) | (uint16_t)(lba16 << 9);
+        return xms_rw_sector(ramdisk_info.xms_handle, byte_offset, is_write, buf);
+    }
+    return -1;
+}
+
 static int vol_rw_lba(os_volume_t *vol, uint8_t is_write, uint32_t rel_lba, void __far *buf) {
     int res;
     vol = resolve_vol_alias(vol);
     if (!vol || !vol->active) {
         return -1;
+    }
+    if (vol->bios_drive == 0xFF) {
+        return ramdisk_rw(is_write, rel_lba, buf);
     }
     res = bios_disk_rw_lba(vol->bios_drive, is_write, vol->start_lba + rel_lba,
                             vol->sectors_per_track, vol->num_heads, buf);
@@ -1363,6 +1400,44 @@ int fat16_rescan_drives(void) {
         num_volumes++;
     } else {
         current_vol_idx = boot_vol_idx;
+    }
+
+    /* Restore RAM disk volume if active */
+    if (ramdisk_info.active && num_volumes < MAX_VOLUMES) {
+        os_volume_t *vol = &volumes[num_volumes++];
+        uint16_t total_sectors = ramdisk_info.total_sectors;
+        uint8_t spc = (ramdisk_info.size_kb <= 2048) ? 1 : ((ramdisk_info.size_kb <= 4096) ? 2 : 4);
+        uint16_t root_entries = (ramdisk_info.size_kb <= 256) ? 64 : 128;
+        uint16_t root_sectors = (root_entries * 32) / 512;
+        uint16_t fat_bytes = (total_sectors + 2) + ((total_sectors + 2) >> 1);
+        uint16_t sectors_per_fat = (fat_bytes + 511) >> 9;
+
+        vol->name[0] = 'R'; vol->name[1] = 'A'; vol->name[2] = 'M'; vol->name[3] = '\0';
+        vol->active = 1;
+        vol->is_alias = 0;
+        vol->target_vol_idx = 0;
+        vol->bios_drive = 0xFF;
+        vol->part_idx = 0xFF;
+        vol->is_removable = 0;
+        vol->is_mounted = 1;
+        vol->fat_type = FAT_TYPE_FAT12;
+        vol->sectors_per_track = 32;
+        vol->num_heads = 1;
+        vol->start_lba = 0;
+        vol->total_sectors = total_sectors;
+        vol->bytes_per_sector = 512;
+        vol->sectors_per_cluster = spc;
+        vol->reserved_sectors = 1;
+        vol->num_fats = 1;
+        vol->root_entries = root_entries;
+        vol->sectors_per_fat = sectors_per_fat;
+        vol->fat_lba = 1;
+        vol->root_lba = 1 + sectors_per_fat;
+        vol->root_sectors = root_sectors;
+        vol->data_lba = 1 + sectors_per_fat + root_sectors;
+        vol->total_clusters = (total_sectors - vol->data_lba) / spc;
+        vol->cwd_cluster = 0;
+        vol->cwd_path[0] = '/'; vol->cwd_path[1] = '\0';
     }
 
     fs_mounted = 1;
@@ -2883,4 +2958,293 @@ int disk_part_write(uint8_t drive, const os_part_table_t __far *in_table, uint16
 
     fat16_rescan_drives();
     return 0;
+}
+
+int ramdisk_mount(uint8_t type, uint16_t size_kb, uint16_t __far *out_size_kb) {
+    uint16_t total_sectors;
+    uint8_t spc;
+    uint16_t root_entries;
+    uint16_t sectors_per_fat;
+    uint16_t fat_bytes;
+    uint16_t root_sectors;
+    uint16_t root_lba;
+    uint16_t data_lba;
+    uint16_t total_clusters;
+    os_volume_t *vol;
+    uint16_t s;
+    int i;
+    int vol_idx;
+
+    if (ramdisk_info.active) {
+        return -4; /* Already mounted */
+    }
+
+    if (type != RAMDISK_TYPE_EMS && type != RAMDISK_TYPE_XMS) {
+        return -1;
+    }
+
+    if (type == RAMDISK_TYPE_EMS) {
+        uint16_t avail_pages;
+        uint16_t needed_pages;
+
+        if (ems_total_pages() == 0) {
+            return -2; /* EMS not present */
+        }
+        avail_pages = ems_avail_pages();
+        if (size_kb == 0) {
+            needed_pages = avail_pages;
+            if (needed_pages == 0) {
+                return -3;
+            }
+            size_kb = needed_pages * 16;
+        } else {
+            needed_pages = (size_kb + 15) / 16;
+            if (needed_pages == 0 || needed_pages > avail_pages || needed_pages > 128) {
+                return -3;
+            }
+            size_kb = needed_pages * 16;
+        }
+
+        for (i = 0; i < (int)needed_pages; i++) {
+            int p = ems_alloc_page(KERNEL_SEG);
+            if (p < 0) {
+                int j;
+                for (j = 0; j < i; j++) {
+                    ems_free_page(ramdisk_info.ems_pages[j]);
+                }
+                return -3;
+            }
+            ramdisk_info.ems_pages[i] = (uint8_t)p;
+        }
+        ramdisk_info.ems_num_pages = needed_pages;
+        ramdisk_info.xms_handle = 0;
+    } else {
+        uint16_t max_free;
+        uint16_t h;
+
+        if (!xms_is_present()) {
+            return -2; /* XMS not present */
+        }
+        max_free = xms_largest_free_kb();
+        if (size_kb == 0) {
+            size_kb = max_free;
+            if (size_kb < 16) {
+                return -3;
+            }
+        } else {
+            if (size_kb < 16 || size_kb > max_free) {
+                return -3;
+            }
+        }
+        h = xms_alloc(size_kb, KERNEL_SEG);
+        if (h == 0) {
+            return -3;
+        }
+        ramdisk_info.xms_handle = h;
+        ramdisk_info.ems_num_pages = 0;
+    }
+
+    ramdisk_info.active = 1;
+    ramdisk_info.type = type;
+    ramdisk_info.size_kb = size_kb;
+    ramdisk_info.total_sectors = size_kb * 2;
+
+    fat_flush();
+    cached_fat_vol = 0xFF;
+    cached_fat_sec = 0xFFFF;
+    fat_dirty = 0;
+
+    total_sectors = ramdisk_info.total_sectors;
+    spc = (size_kb <= 2048) ? 1 : ((size_kb <= 4096) ? 2 : 4);
+    root_entries = (size_kb <= 256) ? 64 : 128;
+    root_sectors = (root_entries * 32) / 512;
+    fat_bytes = (total_sectors + 2) + ((total_sectors + 2) >> 1);
+    sectors_per_fat = (fat_bytes + 511) >> 9;
+    root_lba = 1 + sectors_per_fat;
+    data_lba = root_lba + root_sectors;
+    total_clusters = (total_sectors - data_lba) / spc;
+
+    /* Write VBR (Sector 0) */
+    for (i = 0; i < 512; i++) io_buf[i] = 0;
+    io_buf[0] = 0xEB; io_buf[1] = 0x3C; io_buf[2] = 0x90;
+    io_buf[3] = 'H'; io_buf[4] = 'O'; io_buf[5] = 'B'; io_buf[6] = 'B';
+    io_buf[7] = 'Y'; io_buf[8] = 'O'; io_buf[9] = 'S'; io_buf[10] = ' ';
+    wr_le16(&io_buf[11], 512);
+    io_buf[13] = spc;
+    wr_le16(&io_buf[14], 1);
+    io_buf[16] = 1;
+    wr_le16(&io_buf[17], root_entries);
+    wr_le16(&io_buf[19], total_sectors);
+    io_buf[21] = 0xF8;
+    wr_le16(&io_buf[22], sectors_per_fat);
+    wr_le16(&io_buf[24], 32);
+    wr_le16(&io_buf[26], 1);
+    wr_le32(&io_buf[28], 0);
+    wr_le32(&io_buf[32], 0);
+    io_buf[36] = 0x80;
+    io_buf[37] = 0;
+    io_buf[38] = 0x29;
+    wr_le32(&io_buf[39], 0x52414D44);
+    for (i = 0; i < 11; i++) io_buf[43 + i] = "RAM DISK   "[i];
+    for (i = 0; i < 8; i++)  io_buf[54 + i] = "FAT12   "[i];
+    io_buf[510] = 0x55;
+    io_buf[511] = 0xAA;
+    ramdisk_rw(1, 0, io_buf);
+
+    /* Write FAT Sector 0 (Sector 1) */
+    for (i = 0; i < 512; i++) io_buf[i] = 0;
+    io_buf[0] = 0xF8;
+    io_buf[1] = 0xFF;
+    io_buf[2] = 0xFF;
+    ramdisk_rw(1, 1, io_buf);
+
+    /* Clear remaining FAT sectors */
+    for (i = 0; i < 512; i++) io_buf[i] = 0;
+    for (s = 2; s <= sectors_per_fat; s++) {
+        ramdisk_rw(1, s, io_buf);
+    }
+
+    /* Write Root Directory Sector 0 with Volume Label */
+    for (i = 0; i < 11; i++) io_buf[i] = "RAM DISK   "[i];
+    io_buf[11] = 0x08; /* Volume Label */
+    ramdisk_rw(1, root_lba, io_buf);
+
+    /* Clear remaining Root Directory sectors */
+    for (i = 0; i < 512; i++) io_buf[i] = 0;
+    for (s = 1; s < root_sectors; s++) {
+        ramdisk_rw(1, root_lba + s, io_buf);
+    }
+
+    /* Find volume slot */
+    vol_idx = -1;
+    for (i = 0; i < MAX_VOLUMES; i++) {
+        if (!volumes[i].active) {
+            vol_idx = i;
+            break;
+        }
+    }
+    if (vol_idx < 0) {
+        ramdisk_unmount();
+        return -5;
+    }
+
+    vol = &volumes[vol_idx];
+    vol->name[0] = 'R'; vol->name[1] = 'A'; vol->name[2] = 'M'; vol->name[3] = '\0';
+    vol->active = 1;
+    vol->is_alias = 0;
+    vol->target_vol_idx = 0;
+    vol->bios_drive = 0xFF;
+    vol->part_idx = 0xFF;
+    vol->is_removable = 0;
+    vol->is_mounted = 1;
+    vol->fat_type = FAT_TYPE_FAT12;
+    vol->sectors_per_track = 32;
+    vol->num_heads = 1;
+    vol->start_lba = 0;
+    vol->total_sectors = total_sectors;
+    vol->bytes_per_sector = 512;
+    vol->sectors_per_cluster = spc;
+    vol->reserved_sectors = 1;
+    vol->num_fats = 1;
+    vol->root_entries = root_entries;
+    vol->sectors_per_fat = sectors_per_fat;
+    vol->fat_lba = 1;
+    vol->root_lba = root_lba;
+    vol->root_sectors = root_sectors;
+    vol->data_lba = data_lba;
+    vol->total_clusters = total_clusters;
+    vol->cwd_cluster = 0;
+    vol->cwd_path[0] = '/'; vol->cwd_path[1] = '\0';
+
+    if (vol_idx >= num_volumes) {
+        num_volumes = (uint8_t)(vol_idx + 1);
+    }
+
+    if (out_size_kb) {
+        *out_size_kb = size_kb;
+    }
+    return 0;
+}
+
+int ramdisk_unmount(void) {
+    int i;
+    if (!ramdisk_info.active) {
+        return -1;
+    }
+
+    fat_flush();
+    cached_fat_vol = 0xFF;
+    cached_fat_sec = 0xFFFF;
+    fat_dirty = 0;
+
+    if (ramdisk_info.type == RAMDISK_TYPE_EMS) {
+        for (i = 0; i < (int)ramdisk_info.ems_num_pages; i++) {
+            ems_free_page(ramdisk_info.ems_pages[i]);
+        }
+        ramdisk_info.ems_num_pages = 0;
+    } else if (ramdisk_info.type == RAMDISK_TYPE_XMS) {
+        if (ramdisk_info.xms_handle != 0) {
+            xms_free(ramdisk_info.xms_handle);
+            ramdisk_info.xms_handle = 0;
+        }
+    }
+    ramdisk_info.active = 0;
+
+    for (i = 0; i < MAX_VOLUMES; i++) {
+        if (volumes[i].active && volumes[i].bios_drive == 0xFF) {
+            volumes[i].active = 0;
+            volumes[i].is_mounted = 0;
+            volumes[i].name[0] = '\0';
+            if (current_vol_idx == (uint8_t)i) {
+                int s;
+                for (s = 0; s < MAX_VOLUMES; s++) {
+                    if (volumes[s].active && (vol_name_match(volumes[s].name, "SYS") ||
+                                              vol_name_match(volumes[s].name, "HD0"))) {
+                        current_vol_idx = (uint8_t)s;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    return 0;
+}
+
+int ramdisk_status(os_ramdisk_status_t __far *status) {
+    if (!ramdisk_info.active) {
+        if (status) {
+            status->active = 0;
+            status->type = 0;
+            status->size_kb = 0;
+            status->total_clusters = 0;
+            status->free_clusters = 0;
+            status->bytes_per_cluster = 0;
+        }
+        return 0;
+    }
+    if (status) {
+        int i;
+        os_volume_t *vol = 0;
+        status->active = 1;
+        status->type = ramdisk_info.type;
+        status->size_kb = ramdisk_info.size_kb;
+        for (i = 0; i < MAX_VOLUMES; i++) {
+            if (volumes[i].active && volumes[i].bios_drive == 0xFF) {
+                vol = &volumes[i];
+                break;
+            }
+        }
+        if (vol) {
+            status->total_clusters = vol->total_clusters;
+            status->free_clusters = vol_get_free_clusters(vol);
+            status->bytes_per_cluster = (uint16_t)vol->sectors_per_cluster * 512;
+        } else {
+            status->total_clusters = 0;
+            status->free_clusters = 0;
+            status->bytes_per_cluster = 512;
+        }
+    }
+    return 1;
 }

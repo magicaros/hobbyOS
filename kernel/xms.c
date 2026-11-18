@@ -288,6 +288,28 @@ int xms_move(const os_xms_move_t __far *req) {
     return 0;
 }
 
+int xms_rw_sector(uint16_t handle, uint32_t byte_offset, uint8_t is_write, void __far *buf) {
+    os_xms_move_t req;
+
+    if (!xms_present || handle == 0 || !buf) {
+        return -1;
+    }
+
+    req.length = 512;
+    if (is_write) {
+        req.src_handle = 0;
+        req.src_offset = ((uint32_t)FP_SEG(buf) << 16) | FP_OFF(buf);
+        req.dest_handle = handle;
+        req.dest_offset = byte_offset;
+    } else {
+        req.src_handle = handle;
+        req.src_offset = byte_offset;
+        req.dest_handle = 0;
+        req.dest_offset = ((uint32_t)FP_SEG(buf) << 16) | FP_OFF(buf);
+    }
+    return xms_move(&req);
+}
+
 void xms_dispatch(syscall_regs_t __far *regs) {
     uint8_t func = (uint8_t)(regs->ax >> 8);
 

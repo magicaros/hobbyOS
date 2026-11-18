@@ -556,6 +556,19 @@ static void cmd_lsdisk(void) {
             os_puts("-> ");
             os_puts(vinfo.target_name);
             os_puts(": (Alias)\n");
+        } else if (vinfo.bios_drive == 0xFF) {
+            os_puts("RAM Disk");
+            if (vinfo.is_mounted) {
+                uint32_t total_kb = clusters_to_kb(vinfo.total_clusters, (uint8_t)vinfo.sectors_per_cluster);
+                uint32_t free_kb  = clusters_to_kb(vinfo.free_clusters, (uint8_t)vinfo.sectors_per_cluster);
+                os_puts(vinfo.fat_type == 1 ? " (FAT12) | " : " (FAT16) | ");
+                print_uint32(total_kb);
+                os_puts(" KB total (");
+                print_uint32(free_kb);
+                os_puts(" KB free)\n");
+            } else {
+                os_puts(" | [Unmounted]\n");
+            }
         } else {
             os_puts("Drive 0x");
             print_hex_byte(vinfo.bios_drive);
@@ -1333,7 +1346,7 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
         os_puts("Commands: help, ls [dir|pat], lsdisk, cd <dir>, pwd, mkdir <dir>, rmdir <dir>,\n");
         os_puts("          cat <file>, write [-a] [file] \"<text>\", cp <src> <dst>, mv <s> <d>,\n");
         os_puts("          rm <path>, edit <file>, forth, set [VAR=VAL], echo [text|on|off],\n");
-        os_puts("          keyb [us|fr|be], mem, cls, format [dev:] [/s], fdisk, chkdsk, gfxdemo, diskchange, <DEV:>\n");
+        os_puts("          keyb [us|fr|be], mem, cls, format [dev:] [/s], fdisk, chkdsk, ramdisk, gfxdemo, diskchange, <DEV:>\n");
     } else if (str_eq(cmd, "set")) {
         cmd_set(rest);
     } else if (str_eq(cmd, "ls") || str_eq(cmd, "dir")) {
