@@ -9,7 +9,7 @@ IMG    := book8088/disk.img
 CFLAGS := -0 -fpi87 -ms -s -zl -ecc -zq -Iinclude -Ibuild
 
 KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
-USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin
+USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin
 KEYMAPS     := build/us.map build/fr.map build/be.map
 
 all: $(IMG)
@@ -61,7 +61,11 @@ build/forth.bin: user/forth.asm
 $(KEYMAPS): tools/mkkeymap.py
 	python3 tools/mkkeymap.py build
 
-$(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) boot.sh tools/fat16.py
+build/sam.mdl: tools/train_sam.py
+	mkdir -p build
+	python3 tools/train_sam.py $@
+
+$(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl boot.sh tools/fat16.py
 	dd if=/dev/zero of=$@ bs=512 count=20808 status=none
 	/usr/sbin/mkfs.fat -a -F 16 -s 4 -R 1 -f 2 -r 512 -g 4/17 -M 0xF8 -D 0x80 -n "HOBBYOS" $@ >/dev/null
 	python3 tools/fat16.py $@ build/boot.bin \
@@ -78,6 +82,8 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) boot.sh tools/fa
 		build/gfxdemo.bin:/BIN/GFXDEMO.BIN \
 		build/ramdisk.bin:/BIN/RAMDISK.BIN \
 		build/har.bin:/BIN/HAR.BIN \
+		build/sam.bin:/BIN/SAM.BIN \
+		build/sam.mdl:/MODELS/SAM.MDL \
 		build/boot.bin:/BIN/BOOT.BIN \
 		boot.sh:/BOOT.SH \
 		build/us.map:/KEYMAPS/US.MAP \

@@ -1,5 +1,28 @@
 # Changelog
 
+## Revision 0.16 (2026-11-18)
+
+- **8088 Micro Language Model (`SAM.BIN`), Quantization-Aware Trainer & Lo-tech EMS Neural Engine (`user/sam.c`, `tools/train_sam.py`, `Makefile`, `user/shell.c`)**:
+  - **Retro AI Micro Language Model (`/BIN/SAM.BIN`)**:
+    - Implemented a 4-bit quantized feed-forward character-level neural network inference engine running on the Intel 8088 CPU @ 8 MHz (Book8088).
+    - Architecture: 256-input vector (128-bucket polynomial rolling trigram hash + 128-bucket 8-char rolling context window) $\to$ Layer 1 (256 $\to$ 128, packed 4-bit weights + int16 bias, ReLU) $\to$ Layer 2 (128 $\to$ 96, packed 4-bit weights + int32 bias, ReLU) $\to$ Output Layer (96 $\to$ 96 logits, packed 4-bit weights + int32 bias, greedy argmax token prediction).
+    - Features humorous meta chatbot persona reassuring Sam Altman regarding 7-trillion-dollar investments and H100 clusters while putting pristine 1980s SRAM at `0xE000` to good use.
+    - Two operating modes: One-shot CLI evaluation (`sam <prompt>`) and interactive conversational REPL (`SAM> `).
+    - Added `sam` command to shell help list in `user/shell.c`.
+  - **Lo-tech EMS Memory Neural Staging & Conventional Fallback**:
+    - Automatically detects and stages model weights (`/MODELS/SAM.MDL`, 28,224 bytes $\approx 27.5$ KB) in 32 KB across 2 physical 16 KB pages mapped into Lo-tech EMS Slot 0 (`0xE000:0000`) and Slot 1 (`0xE400:0000`).
+    - Graceful fallback: If EMS memory is unavailable, automatically allocates conventional user memory via `os_mem_alloc()` without dropping functionality.
+    - Clean resource lifecycle: Automatically unmaps and frees allocated EMS pages and conventional memory on exit.
+  - **8088 Inference Optimizations & Multiplication Elimination**:
+    - Sparse input indexing: Scans input vector once to collect non-zero indices, reducing Layer 1 inner loops from 256 to ~15.
+    - Nibble multiplication precomputation: Precomputes a 16-entry table `x_times_nib[16]` for each active row before the inner loop, completely eliminating 130-cycle x86 `imul` instructions from the inner accumulation loops.
+    - Direct pointer traversal: Uses near pointer increments (`*acc++`) and far weight pointer traversal (`*row++`) instead of 2D array offset arithmetic, achieving 8-10 characters per second throughput on an 8 MHz 8088.
+    - Strict 8086 instructions and freestanding Open Watcom C (`-zl`), with zero 32-bit division or runtime library helper dependencies (`__I4M`/`__U4D`).
+  - **Quantization-Aware Training Pipeline (`tools/train_sam.py`)**:
+    - Standalone Python 3 / NumPy QAT trainer using Adam optimization, trigram dropout, and 4-bit Straight-Through Estimator (STE) fine-tuning to train the network to 100% training accuracy in ~20 seconds.
+    - Binary model exporter: Outputs packed binary format `build/sam.mdl` (magic `"SMLM"`, 64-byte header, packed 4-bit signed nibbles, 16-bit/32-bit biases).
+    - Integrated model compilation and disk packaging into `Makefile`.
+
 ## Revision 0.15 (2026-11-18)
 
 - **HobbyOS Archiver (`HAR.BIN`), Stream Offset Syscall & LZ4 Compression (`user/har.c`, `kernel/fat16.c`, `kernel/syscall.c`, `kernel/kernel.h`, `include/hobbyos.h`, `user/shell.c`, `Makefile`)**:
