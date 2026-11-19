@@ -22,8 +22,8 @@
 #define USER_INIT_SP     0xFEFE
 
 #define COM1_BASE        0x3F8
-#define EMS_IO_BASE      0x260
-#define EMS_FRAME_SEG    0xE000
+#define EMS_IO_BASE      0x268
+#define EMS_FRAME_SEG    0xC000
 #define EMS_TOTAL_PAGES  128
 #define EMS_NUM_SLOTS    4
 
@@ -43,6 +43,7 @@ extern int      bios_disk_format_track(uint8_t drive, uint16_t cyl, uint8_t head
 extern int      bios_get_drive_params(uint8_t drive, uint16_t *cyls, uint8_t *heads, uint8_t *spt, uint8_t *drives);
 extern uint8_t  bios_get_boot_drive(void);
 extern void     cpu_halt(void);
+extern void     cpu_reboot(void);
 extern uint16_t cpu_detect_type(void);
 uint16_t        cpu_get_type(void);
 const char     *cpu_get_name(void);
@@ -61,6 +62,7 @@ extern void     cga_sync_copy(const uint16_t *src, uint16_t word_count);
 extern void     bios_set_video_mode(uint8_t mode);
 extern void     bios_set_palette_reg(uint8_t reg, uint8_t val);
 extern void     cga_wait_vsync(void);
+extern void     cga_lcd_sync_delay(void);
 extern void     cga_blit_linear(const void __far *src);
 extern void     vga_blit_linear(const void __far *src);
 extern void     syscall_install_vector(void);
@@ -73,18 +75,23 @@ extern void     xms_install_vector(void);
 extern int      proc_exec_far(uint16_t user_seg, uint16_t user_sp);
 extern void     proc_exit_usermode(uint8_t code);
 extern uint16_t get_usermode_active(void);
+extern uint16_t ctrl_c_abort_pending;
 
 /* Custom IRQ 1 PC/XT Keyboard Driver & Layout Mapper (kernel/kbd.c) */
 void     kbd_init(void);
-void     kbd_irq_handler(uint8_t raw);
+uint8_t  kbd_irq_handler(uint8_t raw);
 int      kbd_kbhit(void);
 uint16_t kbd_getc(void);
+void     kbd_set_break_mode(uint8_t mode);
+uint8_t  kbd_get_break_mode(void);
 int      kbd_set_map(const os_keymap_t __far *map);
 int      kbd_get_name(char __far *out_name);
 int      kbd_get_state(uint8_t scancode);
 
 /* Console & Serial subsystem (kernel/console.c) */
 void     serial_init(void);
+void     serial_enable(void);
+void     serial_disable(void);
 
 void     con_init(void);
 void     con_clear(uint8_t attr);
@@ -100,6 +107,73 @@ void     con_put_hex16(uint16_t val);
 int      con_kbhit(void);
 uint16_t con_getc(void);
 uint16_t con_getline(char *buf, uint16_t max_len);
+void     con_set_cell(uint16_t idx, uint16_t val);
+uint16_t con_get_cell(uint16_t idx);
+
+/* Mouse & INT 0x33 subsystem (kernel/mouse.c) */
+#define MOUSE_TYPE_NONE             0
+#define MOUSE_TYPE_PS2              1
+#define MOUSE_TYPE_SERIAL_MS        2
+#define MOUSE_TYPE_SERIAL_MSSYSTEMS 3
+
+int         mouse_init(void);
+uint8_t     mouse_is_detected(void);
+uint8_t     mouse_get_type(void);
+uint8_t     mouse_get_buttons(void);
+uint16_t    mouse_get_port(void);
+uint8_t     mouse_get_irq(void);
+const char *mouse_get_type_name(void);
+void        mouse_dispatch(syscall_regs_t __far *regs);
+void        mouse_irq_handler(void);
+extern void mouse_install_vectors(uint8_t irq);
+void        mouse_handle_ps2_packet(uint16_t status, int16_t raw_x, int16_t raw_y);
+
+/* BIOS PS/2 pointing device services (kernel/entry.asm) */
+extern int  bios_ps2_enable(uint8_t enable);
+extern int  bios_ps2_init(uint8_t pkg_size);
+extern int  bios_ps2_set_handler(void);
+extern int  bios_ps2_reset_handler(void);
+extern int  bios_ps2_get_id(uint8_t *id);
+
+/* Sound & FM Synthesizer subsystem (kernel/sound.c) */
+#define SOUND_DEV_NONE     0
+#define SOUND_DEV_SPEAKER  1
+#define SOUND_DEV_OPL2     2
+#define SOUND_DEV_OPL3     3
+
+/* Sound Blaster Types & Mixer Channels */
+#define SOUND_VOL_MASTER   0
+#define SOUND_VOL_FM       1
+#define SOUND_VOL_PCM      2
+
+#define SB_TYPE_NONE       0
+#define SB_TYPE_SB10       1
+#define SB_TYPE_SB20       2
+#define SB_TYPE_PRO        3
+#define SB_TYPE_16         4
+
+int         sound_init(void);
+uint8_t     sound_get_device(void);
+const char *sound_get_device_name(void);
+uint16_t    sound_get_port(void);
+uint16_t    sound_get_channels(void);
+uint8_t     sound_get_sb_type(void);
+uint16_t    sound_get_sb_base(void);
+const char *sound_get_sb_name(void);
+int16_t     sound_get_volume(uint8_t channel);
+int16_t     sound_set_volume(uint8_t channel, uint8_t pct);
+int16_t     sound_pcm_play(uint16_t rate_hz, uint16_t len, const uint8_t __far *samples);
+int16_t     sound_pcm_status(void);
+void        sound_pcm_stop(void);
+void        sound_tone(uint16_t freq_hz, uint16_t duration_ms, uint8_t channel);
+void        sound_stop(void);
+void        sound_opl_write(uint16_t reg, uint8_t val);
+void        sound_timer_install(uint16_t divisor);
+void        sound_timer_restore(void);
+void        sound_bg_tick(void);
+int16_t     sound_bg_play(uint16_t rate_hz, uint8_t loop, uint16_t len, const uint8_t __far *data, const char __far *name);
+void        sound_bg_stop(void);
+int16_t     sound_bg_get_status(os_sound_bg_status_t __far *st);
 
 /* Conventional Memory MCB Allocator (kernel/mem.c) */
 void     mem_init(void);
@@ -216,6 +290,7 @@ void     gfx_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t color,
 void     gfx_draw_text(uint16_t x, uint16_t y, const char __far *str, uint8_t color);
 void     gfx_blit(const void __far *linear_buf);
 void     gfx_set_dac(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
+void     gfx_cga_lcd_sync(void);
 
 /* Syscall & Executable loader (kernel/syscall.c) */
 void     syscall_init(void);

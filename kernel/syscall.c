@@ -18,6 +18,7 @@ void syscall_init(void) {
 
 #define KERNEL_PATH_MAX 128
 static char kernel_path[KERNEL_PATH_MAX] = ".;/BIN";
+static void redir_stdout_flush(void);
 
 int path_get(char __far *buf, uint16_t max_len) {
     uint16_t i = 0;
@@ -184,13 +185,19 @@ int exec_program(const char __far *filename, const char __far *args) {
     }
     arg_dst[i] = '\0';
 
-    /* Save parent process EMS page frame slot mappings */
+    /* Save parent process EMS page frame slot mappings & break mode */
     {
         uint8_t saved_ems_slots[EMS_NUM_SLOTS];
+        uint8_t saved_break_mode = kbd_get_break_mode();
+        kbd_set_break_mode(BREAK_MODE_NORMAL);
+        ctrl_c_abort_pending = 0;
         ems_save_slots(saved_ems_slots);
 
         /* Transfer control to user executable at user_seg:0000 */
         rc = proc_exec_far(user_seg, USER_INIT_SP);
+
+        kbd_set_break_mode(saved_break_mode);
+        ctrl_c_abort_pending = 0;
 
         /* Restore 80x25 text console if the process exited while in CGA graphics mode */
         if (gfx_get_mode() != OS_MODE_TEXT_80x25 && gfx_get_mode() != 0x07) {
@@ -198,6 +205,12 @@ int exec_program(const char __far *filename, const char __far *args) {
         } else {
             con_set_cursor_visible(1);
         }
+
+        /* Flush any redirected stdout data written by child process */
+        redir_stdout_flush();
+
+        /* Mute any active sound output from child process */
+        sound_stop();
 
         /* Reclaim all conventional MCB blocks, EMS pages, and XMS blocks owned by the process */
         ems_free_by_owner(user_seg);
@@ -209,33 +222,162 @@ int exec_program(const char __far *filename, const char __far *args) {
     return rc;
 }
 
+/* Standard I/O Redirection Subsystem */
+#define REDIR_BUF_SIZE 512
+
+static uint8_t  s_stdout_redir_active = 0;
+static char     s_stdout_path[64];
+static uint8_t  s_stdout_append       = 0;
+static uint8_t  s_stdout_buf[REDIR_BUF_SIZE];
+static uint16_t s_stdout_buf_pos      = 0;
+
+static uint8_t  s_stdin_redir_active  = 0;
+static char     s_stdin_path[64];
+static uint32_t s_stdin_file_offset   = 0;
+static uint8_t  s_stdin_buf[REDIR_BUF_SIZE];
+static uint16_t s_stdin_buf_pos       = 0;
+static uint16_t s_stdin_buf_len       = 0;
+static uint8_t  s_stdin_eof           = 0;
+
+static void redir_stdout_flush(void) {
+    if (!s_stdout_redir_active) return;
+    if (s_stdout_buf_pos > 0) {
+        fat16_append_file(s_stdout_path, MK_FP(KERNEL_SEG, s_stdout_buf), s_stdout_buf_pos);
+        s_stdout_buf_pos = 0;
+    }
+}
+
+static void redir_stdout_putc(char c) {
+    s_stdout_buf[s_stdout_buf_pos++] = (uint8_t)c;
+    if (s_stdout_buf_pos >= REDIR_BUF_SIZE) {
+        redir_stdout_flush();
+    }
+}
+
+static int redir_set_stdout(const char __far *path, uint8_t append) {
+    uint16_t i = 0;
+    if (!path) return -1;
+    redir_stdout_flush();
+    while (path[i] != '\0' && i < sizeof(s_stdout_path) - 1) {
+        s_stdout_path[i] = path[i];
+        i++;
+    }
+    s_stdout_path[i] = '\0';
+    s_stdout_append = append;
+    s_stdout_buf_pos = 0;
+    s_stdout_redir_active = 1;
+
+    /* If truncate/overwrite mode (append == 0), clear file to 0 bytes */
+    if (!append) {
+        fat16_write_file(s_stdout_path, MK_FP(KERNEL_SEG, s_stdout_buf), 0);
+    }
+    return 0;
+}
+
+static int redir_set_stdin(const char __far *path) {
+    uint16_t i = 0;
+    if (!path) return -1;
+    while (path[i] != '\0' && i < sizeof(s_stdin_path) - 1) {
+        s_stdin_path[i] = path[i];
+        i++;
+    }
+    s_stdin_path[i] = '\0';
+    s_stdin_file_offset = 0;
+    s_stdin_buf_pos = 0;
+    s_stdin_buf_len = 0;
+    s_stdin_eof = 0;
+    s_stdin_redir_active = 1;
+    return 0;
+}
+
+static void redir_reset_all(void) {
+    if (s_stdout_redir_active) {
+        redir_stdout_flush();
+        s_stdout_redir_active = 0;
+    }
+    s_stdin_redir_active = 0;
+}
+
+static uint16_t redir_stdin_getc(void) {
+    if (!s_stdin_redir_active) return con_getc();
+    if (s_stdin_buf_pos >= s_stdin_buf_len) {
+        int32_t rd;
+        if (s_stdin_eof) return 0xFFFF;
+        rd = fat16_read_file_offset(s_stdin_path, MK_FP(KERNEL_SEG, s_stdin_buf), REDIR_BUF_SIZE, s_stdin_file_offset);
+        if (rd <= 0) {
+            s_stdin_eof = 1;
+            return 0xFFFF;
+        }
+        s_stdin_file_offset += (uint16_t)rd;
+        s_stdin_buf_len = (uint16_t)rd;
+        s_stdin_buf_pos = 0;
+    }
+    return (uint16_t)s_stdin_buf[s_stdin_buf_pos++];
+}
+
+static int redir_stdin_kbhit(void) {
+    if (!s_stdin_redir_active) return con_kbhit();
+    if (s_stdin_buf_pos < s_stdin_buf_len) return 1;
+    if (s_stdin_eof) return 0;
+    {
+        int32_t rd = fat16_read_file_offset(s_stdin_path, MK_FP(KERNEL_SEG, s_stdin_buf), REDIR_BUF_SIZE, s_stdin_file_offset);
+        if (rd <= 0) {
+            s_stdin_eof = 1;
+            return 0;
+        }
+        s_stdin_file_offset += (uint16_t)rd;
+        s_stdin_buf_len = (uint16_t)rd;
+        s_stdin_buf_pos = 0;
+        return 1;
+    }
+}
+
 void syscall_dispatch(syscall_regs_t __far *regs) {
     uint8_t func = (uint8_t)(regs->ax >> 8);
     uint8_t al   = (uint8_t)(regs->ax & 0xFF);
 
     switch (func) {
     case SYS_EXIT:
+        redir_stdout_flush();
         if (get_usermode_active()) {
             proc_exit_usermode(al);
         }
         break;
 
     case SYS_PUTC:
-        con_putc((char)al);
+        if (s_stdout_redir_active) {
+            redir_stdout_putc((char)al);
+        } else {
+            con_putc((char)al);
+        }
         break;
 
     case SYS_PUTS: {
         const char __far *str = (const char __far *)MK_FP(regs->ds, regs->bx);
-        con_puts_far(str);
+        if (s_stdout_redir_active) {
+            while (*str) {
+                redir_stdout_putc(*str++);
+            }
+        } else {
+            con_puts_far(str);
+        }
         break;
     }
 
     case SYS_GETC:
-        regs->ax = con_getc();
+        if (s_stdin_redir_active) {
+            regs->ax = redir_stdin_getc();
+        } else {
+            regs->ax = con_getc();
+        }
         break;
 
     case SYS_KBHIT:
-        regs->ax = (uint16_t)con_kbhit();
+        if (s_stdin_redir_active) {
+            regs->ax = (uint16_t)redir_stdin_kbhit();
+        } else {
+            regs->ax = (uint16_t)con_kbhit();
+        }
         break;
 
     case SYS_CLS:
@@ -271,6 +413,43 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
 
     case SYS_VIDEO_TYPE:
         regs->ax = video_get_type();
+        break;
+
+    case SYS_BREAK_MODE:
+        kbd_set_break_mode(al);
+        regs->ax = 0;
+        break;
+
+    case SYS_REDIR:
+        switch (al) {
+        case REDIR_STDOUT: {
+            const char __far *path = (const char __far *)MK_FP(regs->ds, regs->dx);
+            regs->ax = (redir_set_stdout(path, (uint8_t)(regs->cx & 0xFF)) == 0) ? 0 : 0xFFFF;
+            break;
+        }
+        case REDIR_STDIN: {
+            const char __far *path = (const char __far *)MK_FP(regs->ds, regs->dx);
+            regs->ax = (redir_set_stdin(path) == 0) ? 0 : 0xFFFF;
+            break;
+        }
+        case REDIR_RESET:
+            redir_reset_all();
+            regs->ax = 0;
+            break;
+        case REDIR_KEYB_GETC:
+            regs->ax = con_getc();
+            break;
+        case REDIR_KEYB_KBHIT:
+            regs->ax = (uint16_t)con_kbhit();
+            break;
+        case REDIR_FLUSH:
+            redir_stdout_flush();
+            regs->ax = 0;
+            break;
+        default:
+            regs->ax = 0xFFFF;
+            break;
+        }
         break;
 
     case SYS_FILE_READ: {
@@ -605,6 +784,67 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
                     (uint8_t)(regs->cx & 0xFF),
                     (uint8_t)(regs->cx >> 8),
                     (uint8_t)(regs->dx & 0xFF));
+        break;
+
+    case SYS_GFX_SYNC:
+        gfx_cga_lcd_sync();
+        regs->ax = 0;
+        break;
+
+    case SYS_SOUND_INFO:
+        regs->ax = (uint16_t)sound_get_device();
+        regs->bx = sound_get_port();
+        regs->cx = sound_get_channels();
+        regs->dx = ((uint16_t)sound_get_sb_type() << 8) | (sound_get_sb_base() & 0xFF);
+        break;
+
+    case SYS_SOUND_TONE:
+        sound_tone(regs->bx, regs->cx, (uint8_t)(regs->dx & 0xFF));
+        break;
+
+    case SYS_SOUND_STOP:
+        sound_stop();
+        break;
+
+    case SYS_SOUND_OPL_WRITE:
+        sound_opl_write(regs->bx, (uint8_t)(regs->cx & 0xFF));
+        break;
+
+    case SYS_SOUND_GET_VOL:
+        regs->ax = (uint16_t)sound_get_volume((uint8_t)(regs->bx & 0xFF));
+        break;
+
+    case SYS_SOUND_SET_VOL:
+        regs->ax = (uint16_t)sound_set_volume((uint8_t)(regs->bx & 0xFF), (uint8_t)(regs->cx & 0xFF));
+        break;
+
+    case SYS_SOUND_PCM_PLAY:
+        regs->ax = (uint16_t)sound_pcm_play(regs->bx, regs->cx,
+            (const uint8_t __far *)MK_FP(regs->es, regs->di));
+        break;
+
+    case SYS_SOUND_PCM_STATUS:
+        regs->ax = (uint16_t)sound_pcm_status();
+        break;
+
+    case SYS_SOUND_PCM_STOP:
+        sound_pcm_stop();
+        regs->ax = 0;
+        break;
+
+    case SYS_SOUND_BG_PLAY:
+        regs->ax = (uint16_t)sound_bg_play(regs->bx, (uint8_t)(regs->cx & 0xFF), regs->dx,
+            (const uint8_t __far *)MK_FP(regs->es, regs->di),
+            (const char __far *)MK_FP(regs->ds, regs->si));
+        break;
+
+    case SYS_SOUND_BG_STOP:
+        sound_bg_stop();
+        regs->ax = 0;
+        break;
+
+    case SYS_SOUND_BG_STATUS:
+        regs->ax = (uint16_t)sound_bg_get_status((os_sound_bg_status_t __far *)MK_FP(regs->es, regs->di));
         break;
 
     default:

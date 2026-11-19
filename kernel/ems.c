@@ -8,7 +8,7 @@
  * (at your option) any later version.
  *
  * Lo-tech 2MB EMS page allocator and bank-switching manager.
- * 128 physical 16 KB pages mapped into 4 slots at segment 0xE000 (I/O 0x260..0x263).
+ * 128 physical 16 KB pages mapped into 4 slots at segment 0xC000 (I/O 0x268..0x26B).
  */
 
 #include "kernel.h"

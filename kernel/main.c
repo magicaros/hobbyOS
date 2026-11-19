@@ -134,6 +134,28 @@ void kmain(void) {
     syscall_init();
     con_puts("[SYSCALL] INT 0x21 API installed OK\n");
 
+    if (mouse_init()) {
+        con_puts("[MOUSE] ");
+        con_puts(mouse_get_type_name());
+        con_puts(" ready (INT 0x33, ");
+        con_put_uint((uint32_t)mouse_get_buttons());
+        con_puts(" buttons)\n");
+    } else {
+        con_puts("[MOUSE] Not detected (INT 0x33 stub active)\n");
+    }
+
+    sound_init();
+    con_puts("[SOUND] ");
+    con_puts(sound_get_device_name());
+    con_puts(" ready\n");
+    if (sound_get_sb_type() != SB_TYPE_NONE) {
+        con_puts("[SOUND] ");
+        con_puts(sound_get_sb_name());
+        con_puts(" detected at port ");
+        con_put_hex16(sound_get_sb_base());
+        con_puts("\n");
+    }
+
     /* Run boot self-test (/BIN/HELLO.BIN) then launch user-space shell (/BIN/SHELL.BIN) */
     con_puts("[EXEC] Running /BIN/HELLO.BIN...\n");
     rc = exec_program((const char __far *)MK_FP(KERNEL_SEG, "/BIN/HELLO.BIN"),

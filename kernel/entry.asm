@@ -13,6 +13,8 @@ extern _kmain
 extern _syscall_dispatch
 extern _kbd_irq_handler
 extern _xms_dispatch
+extern _sound_bg_tick
+extern _gfx_cga_lcd_sync
 
 section _TEXT class=CODE
 
@@ -402,6 +404,17 @@ _cpu_halt:
     hlt
     ret
 
+; void cpu_reboot(void) -> IBM PC/XT BIOS warm boot (skip RAM test)
+global _cpu_reboot
+_cpu_reboot:
+    cli
+    mov al, 0x20
+    out 0x20, al            ; Send EOI to PIC
+    mov ax, 0x0040
+    mov ds, ax
+    mov word [0x0072], 0x1234 ; BDA warm boot flag
+    jmp 0xFFFF:0x0000       ; Jump to BIOS reset vector
+
 ; uint16_t cpu_detect_type(void) -> returns CPU_TYPE_* (0..7)
 global _cpu_detect_type
 _cpu_detect_type:
@@ -459,13 +472,14 @@ _cpu_detect_type:
     push cx
     popf
 
-    ; Step 3: Check for NEC V20/V30 using AAM with divisor 3.
-    ; Intel divides AL (5) by 3 -> AH=1, AL=2.
-    ; NEC V20/V30 ignores divisor and divides by 10 -> AH=0, AL=5.
-    mov ax, 0x0705
-    db 0xD4, 0x03       ; AAM 3
-    test ah, ah
-    jz .is_nec
+    ; Step 3: Check for NEC V20/V30 using AAD immediate operand behavior.
+    ; AAD (0xD5 imm8) calculates AL = (AH * imm8) + AL.
+    ; Intel 8086/8088/186: uses the immediate operand (0x01 * 0x10 + 0x01 = 0x11).
+    ; NEC V20/V30: ignores immediate operand and always multiplies by 10 (0x01 * 0x0A + 0x01 = 0x0B).
+    mov ax, 0x0101
+    db 0xD5, 0x10       ; AAD 0x10
+    cmp al, 0x0B
+    je .is_nec
 
     ; Step 4: Distinguish Intel 8086/8088 from Intel 80186/80188.
     ; Shift count masking test:
@@ -578,9 +592,30 @@ _isr_int09:
     call _kbd_irq_handler
     add sp, 2
 
+    mov bx, ax              ; Save action (1 = abort requested)
+
     mov al, 0x20            ; Send EOI to 8259 PIC
     out 0x20, al
 
+    cmp bx, 1               ; Abort requested?
+    jne .done_iret
+
+    ; Check if interrupted code was executing in user space (SS != CS)
+    mov ax, ss
+    mov cx, cs
+    cmp ax, cx
+    je .pending_abort
+
+    ; Interrupted in user space! Exit user mode immediately.
+    mov ax, 130
+    push ax
+    call _proc_exit_usermode
+    ; _proc_exit_usermode never returns here
+
+.pending_abort:
+    mov word [_ctrl_c_abort_pending], 1
+
+.done_iret:
     pop ax
     pop bx
     pop cx
@@ -837,6 +872,22 @@ _cga_wait_vsync:
     pop cx
     ret
 
+; void cga_lcd_sync_delay(void) -> exact busy-wait delay calibrated for Book 8088 LCD scaler
+global _cga_lcd_sync_delay
+_cga_lcd_sync_delay:
+    push cx
+    push dx
+    mov dx, 20
+.wait_outer:
+    mov cx, 0xFFFF
+.wait_inner:
+    loop .wait_inner
+    dec dx
+    jnz .wait_outer
+    pop dx
+    pop cx
+    ret
+
 ; void cga_blit_linear(const void __far *src)
 ; Copies a 16,000-byte (200x80) linear buffer into CGA interleaved banks at 0xB800:0000 and 0xB800:2000
 global _cga_blit_linear
@@ -914,7 +965,149 @@ _vga_blit_linear:
     pop bp
     ret
 
+; =============================================================================
+; INT 0x08 (IRQ 0) Hardware Timer Interrupt Handler for Background Music
+; =============================================================================
+global _sound_timer_install
+global _sound_timer_restore
+global _isr_int08
+
+_old_int08_off  dw 0
+_old_int08_seg  dw 0
+_timer_step     dw 0
+_timer_accum    dw 0
+_timer_hooked   db 0
+
+; void sound_timer_install(uint16_t divisor)
+_sound_timer_install:
+    push bp
+    mov bp, sp
+    push bx
+    push es
+
+    cmp byte [cs:_timer_hooked], 0
+    jne .already_hooked
+
+    ; Save old INT 0x08 vector at 0000:0020
+    xor ax, ax
+    mov es, ax
+    cli
+    mov ax, [es:0x0020]
+    mov [cs:_old_int08_off], ax
+    mov ax, [es:0x0022]
+    mov [cs:_old_int08_seg], ax
+
+    ; Install our ISR
+    mov word [es:0x0020], _isr_int08
+    mov word [es:0x0022], cs
+    mov byte [cs:_timer_hooked], 1
+    sti
+
+.already_hooked:
+    mov bx, [bp+4]          ; Divisor (e.g. 2131 for 560Hz, 1705 for 700Hz)
+    mov [cs:_timer_step], bx
+    mov word [cs:_timer_accum], 0
+
+    ; Reprogram Timer 0 Mode 2 (Rate Generator) with divisor
+    cli
+    mov al, 0x34
+    out 0x43, al
+    mov al, bl
+    out 0x40, al
+    mov al, bh
+    out 0x40, al
+    sti
+
+    pop es
+    pop bx
+    pop bp
+    ret
+
+; void sound_timer_restore(void)
+_sound_timer_restore:
+    push es
+    cmp byte [cs:_timer_hooked], 0
+    je .not_hooked
+
+    ; Restore Timer 0 Mode 3 (Square Wave), divisor 65536 (0)
+    cli
+    mov al, 0x36
+    out 0x43, al
+    xor al, al
+    out 0x40, al
+    out 0x40, al
+
+    ; Restore old INT 0x08 vector
+    xor ax, ax
+    mov es, ax
+    mov ax, [cs:_old_int08_off]
+    mov [es:0x0020], ax
+    mov ax, [cs:_old_int08_seg]
+    mov [es:0x0022], ax
+    mov byte [cs:_timer_hooked], 0
+    sti
+
+.not_hooked:
+    pop es
+    ret
+
+; INT 0x08 ISR for Background IMF Music
+_isr_int08:
+    push ds
+    push es
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+
+    mov ax, cs
+    mov ds, ax
+
+    ; Advance background music
+    call _sound_bg_tick
+
+    ; Accumulate timer step
+    mov ax, [cs:_timer_step]
+    add [cs:_timer_accum], ax
+    jc .chain_bios
+
+    ; Normal tick: acknowledge PIC (EOI) and return
+    mov al, 0x20
+    out 0x20, al
+
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    pop es
+    pop ds
+    iret
+
+.chain_bios:
+    ; 18.2 Hz BIOS mark reached: chain to original BIOS INT 0x08 handler
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    pop es
+    pop ds
+    jmp far [cs:_old_int08_off]
+
+_old_int10_off  dw 0
+_old_int10_seg  dw 0
+_in_int10_sync  db 0
+
 ; void syscall_install_vector(void) -> installs _isr_int21 at INT 0x21 (0000:0084)
+; and hooks BIOS INT 0x10 (0000:0040) for Book 8088 CGA LCD boundary sync
 global _syscall_install_vector
 _syscall_install_vector:
     push es
@@ -923,9 +1116,68 @@ _syscall_install_vector:
     cli
     mov word [es:0x0084], _isr_int21
     mov word [es:0x0086], cs
+
+    ; Hook INT 0x10 if not already hooked
+    cmp word [cs:_old_int10_seg], 0
+    jne .int10_done
+    mov ax, [es:0x0040]
+    mov [cs:_old_int10_off], ax
+    mov ax, [es:0x0042]
+    mov [cs:_old_int10_seg], ax
+    mov word [es:0x0040], _isr_int10
+    mov word [es:0x0042], cs
+.int10_done:
     sti
     pop es
     ret
+
+; INT 0x10 BIOS Video Service Hook
+; Intercepts AH=00h (Set Video Mode) and runs Book 8088 CGA LCD boundary sync
+global _isr_int10
+_isr_int10:
+    cmp ah, 0x00
+    jne .int10_passthru
+
+    cmp byte [cs:_in_int10_sync], 0
+    jne .int10_passthru
+
+    ; Call BIOS handler first to set mode
+    pushf
+    call far [cs:_old_int10_off]
+
+    ; Perform LCD boundary sync
+    mov byte [cs:_in_int10_sync], 1
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push bp
+    push ds
+    push es
+
+    mov ax, cs
+    mov ds, ax
+    mov es, ax
+
+    sti
+    call _gfx_cga_lcd_sync
+
+    pop es
+    pop ds
+    pop bp
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    mov byte [cs:_in_int10_sync], 0
+    iret
+
+.int10_passthru:
+    jmp far [cs:_old_int10_off]
 
 ; INT 0x21 System Call Handler
 global _isr_int21
@@ -960,6 +1212,18 @@ _isr_int21:
     pop ax                  ; offset of regs
     pop dx                  ; segment of regs
 
+    ; Check if Ctrl+C abort was flagged while in syscall
+    cmp word [_ctrl_c_abort_pending], 0
+    je .no_pending_abort
+    mov word [_ctrl_c_abort_pending], 0
+    cmp word [_usermode_active], 1
+    jbe .no_pending_abort
+
+    mov ax, 130
+    push ax
+    call _proc_exit_usermode
+
+.no_pending_abort:
     cli
     mov ss, dx
     mov sp, ax
@@ -992,7 +1256,7 @@ _proc_exec_far:
 
     cli
     mov [_kernel_saved_sp], sp
-    mov word [_usermode_active], 1
+    inc word [_usermode_active]
 
     mov ds, ax
     mov es, ax
@@ -1288,3 +1552,401 @@ _xms_driver_entry:
 
 _kernel_saved_sp: dw 0xFFFE
 _usermode_active: dw 0
+global _ctrl_c_abort_pending
+_ctrl_c_abort_pending: dw 0
+
+extern _mouse_dispatch
+extern _mouse_irq_handler
+
+; void mouse_install_vectors(uint8_t irq)
+global _mouse_install_vectors
+_mouse_install_vectors:
+    push bp
+    mov bp, sp
+    push es
+
+    xor ax, ax
+    mov es, ax
+
+    cli
+    ; Install INT 0x33 vector (0x33 * 4 = 0x00CC)
+    mov word [es:0x00CC], _isr_int33
+    mov word [es:0x00CE], cs
+
+    mov al, [bp+4]          ; IRQ number (3, 4, or 12)
+
+    cmp al, 3
+    je .install_irq3
+    cmp al, 4
+    je .install_irq4
+    cmp al, 12
+    je .install_irq12
+    jmp .done
+
+.install_irq3:
+    ; Install INT 0x0B vector (0x0B * 4 = 0x002C)
+    mov word [es:0x002C], _isr_mouse_irq3
+    mov word [es:0x002E], cs
+    in al, 0x21
+    and al, 0xF7            ; Unmask IRQ 3 (bit 3)
+    out 0x21, al
+    jmp .done
+
+.install_irq4:
+    ; Install INT 0x0C vector (0x0C * 4 = 0x0030)
+    mov word [es:0x0030], _isr_mouse_irq4
+    mov word [es:0x0032], cs
+    in al, 0x21
+    and al, 0xEF            ; Unmask IRQ 4 (bit 4)
+    out 0x21, al
+    jmp .done
+
+.install_irq12:
+    ; Install INT 0x74 vector (0x74 * 4 = 0x01D0)
+    mov word [es:0x01D0], _isr_mouse_irq12
+    mov word [es:0x01D2], cs
+    in al, 0x21
+    and al, 0xFB            ; Unmask IRQ 2 (cascade)
+    out 0x21, al
+    in al, 0xA1
+    and al, 0xEF            ; Unmask IRQ 12
+    out 0xA1, al
+
+.done:
+    sti
+    pop es
+    pop bp
+    ret
+
+global _isr_mouse_irq3
+_isr_mouse_irq3:
+    push es
+    push ds
+    push bp
+    push di
+    push si
+    push dx
+    push cx
+    push bx
+    push ax
+    mov ax, cs
+    mov ds, ax
+    mov es, ax
+    cld
+    call _mouse_irq_handler
+    mov al, 0x20
+    out 0x20, al            ; EOI to master PIC
+    pop ax
+    pop bx
+    pop cx
+    pop dx
+    pop si
+    pop di
+    pop bp
+    pop ds
+    pop es
+    iret
+
+global _isr_mouse_irq4
+_isr_mouse_irq4:
+    push es
+    push ds
+    push bp
+    push di
+    push si
+    push dx
+    push cx
+    push bx
+    push ax
+    mov ax, cs
+    mov ds, ax
+    mov es, ax
+    cld
+    call _mouse_irq_handler
+    mov al, 0x20
+    out 0x20, al            ; EOI to master PIC
+    pop ax
+    pop bx
+    pop cx
+    pop dx
+    pop si
+    pop di
+    pop bp
+    pop ds
+    pop es
+    iret
+
+global _isr_mouse_irq12
+_isr_mouse_irq12:
+    push es
+    push ds
+    push bp
+    push di
+    push si
+    push dx
+    push cx
+    push bx
+    push ax
+    mov ax, cs
+    mov ds, ax
+    mov es, ax
+    cld
+    call _mouse_irq_handler
+    mov al, 0x20
+    out 0xA0, al            ; EOI to slave PIC
+    out 0x20, al            ; EOI to master PIC
+    pop ax
+    pop bx
+    pop cx
+    pop dx
+    pop si
+    pop di
+    pop bp
+    pop ds
+    pop es
+    iret
+
+; int bios_ps2_enable(uint8_t enable)
+; BH = enable (1) or disable (0)
+global _bios_ps2_enable
+_bios_ps2_enable:
+    push bp
+    mov bp, sp
+    push bx
+    mov ah, 0xC2
+    mov al, 0x00
+    mov bh, [bp+4]          ; enable (0 or 1)
+    clc
+    int 0x15
+    jc .err
+    test ah, ah
+    jnz .err
+    xor ax, ax
+    jmp .done
+.err:
+    mov al, ah
+    xor ah, ah
+    test ax, ax
+    jnz .done
+    mov ax, 1
+.done:
+    pop bx
+    pop bp
+    ret
+
+; int bios_ps2_init(uint8_t pkg_size)
+; BH = package size (e.g. 3)
+global _bios_ps2_init
+_bios_ps2_init:
+    push bp
+    mov bp, sp
+    push bx
+    mov ah, 0xC2
+    mov al, 0x05
+    mov bh, [bp+4]          ; package size
+    clc
+    int 0x15
+    jc .err
+    test ah, ah
+    jnz .err
+    xor ax, ax
+    jmp .done
+.err:
+    mov al, ah
+    xor ah, ah
+    test ax, ax
+    jnz .done
+    mov ax, 1
+.done:
+    pop bx
+    pop bp
+    ret
+
+; int bios_ps2_set_handler(void)
+; ES:BX = cs:_ps2_bios_callback
+global _bios_ps2_set_handler
+_bios_ps2_set_handler:
+    push bp
+    mov bp, sp
+    push bx
+    push es
+    mov bx, _ps2_bios_callback
+    mov ax, cs
+    mov es, ax
+    mov ah, 0xC2
+    mov al, 0x07
+    clc
+    int 0x15
+    jc .err
+    test ah, ah
+    jnz .err
+    xor ax, ax
+    jmp .done
+.err:
+    mov al, ah
+    xor ah, ah
+    test ax, ax
+    jnz .done
+    mov ax, 1
+.done:
+    pop es
+    pop bx
+    pop bp
+    ret
+
+; int bios_ps2_reset_handler(void)
+; ES:BX = 0000:0000
+global _bios_ps2_reset_handler
+_bios_ps2_reset_handler:
+    push bp
+    mov bp, sp
+    push bx
+    push es
+    xor bx, bx
+    xor ax, ax
+    mov es, ax
+    mov ah, 0xC2
+    mov al, 0x07
+    clc
+    int 0x15
+    jc .err
+    test ah, ah
+    jnz .err
+    xor ax, ax
+    jmp .done
+.err:
+    mov al, ah
+    xor ah, ah
+    test ax, ax
+    jnz .done
+    mov ax, 1
+.done:
+    pop es
+    pop bx
+    pop bp
+    ret
+
+; int bios_ps2_get_id(uint8_t *id)
+; Returns device ID in *id
+global _bios_ps2_get_id
+_bios_ps2_get_id:
+    push bp
+    mov bp, sp
+    push bx
+    push si
+    mov ah, 0xC2
+    mov al, 0x04
+    clc
+    int 0x15
+    jc .err
+    test ah, ah
+    jnz .err
+    mov si, [bp+4]
+    test si, si
+    jz .ok
+    mov [si], bh
+.ok:
+    xor ax, ax
+    jmp .done
+.err:
+    mov al, ah
+    xor ah, ah
+    test ax, ax
+    jnz .done
+    mov ax, 1
+.done:
+    pop si
+    pop bx
+    pop bp
+    ret
+
+extern _mouse_handle_ps2_packet
+global _ps2_bios_callback
+_ps2_bios_callback:
+    push bp
+    mov bp, sp
+    push ds
+    push es
+    push ax
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+
+    mov ax, cs
+    mov ds, ax
+    mov es, ax
+    cld
+
+    ; Stack layout on entry:
+    ; [bp + 12] = Word 1: status flags
+    ; [bp + 10] = Word 2: X movement
+    ; [bp + 8]  = Word 3: Y movement
+    ; [bp + 6]  = Word 4: Z movement
+    ; [bp + 4]  = caller CS
+    ; [bp + 2]  = caller IP
+    ; [bp + 0]  = saved BP
+    push word [bp + 8]      ; raw_y
+    push word [bp + 10]     ; raw_x
+    push word [bp + 12]     ; status
+    call _mouse_handle_ps2_packet
+    add sp, 6
+
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop ax
+    pop es
+    pop ds
+    pop bp
+    retf
+
+global _isr_int33
+_isr_int33:
+    push es
+    push ds
+    push bp
+    push di
+    push si
+    push dx
+    push cx
+    push bx
+    push ax
+
+    mov dx, ss              ; dx:ax = pointer to syscall_regs_t
+    mov ax, sp
+
+    mov cx, cs
+    mov ds, cx
+    mov es, cx
+
+    cmp dx, cx
+    je .on_kstack
+    mov ss, cx
+    mov sp, [_kernel_saved_sp]
+.on_kstack:
+    sti
+    cld
+    push dx                 ; segment of regs
+    push ax                 ; offset of regs
+    call _mouse_dispatch
+    pop ax
+    pop dx
+
+    cli
+    mov ss, dx
+    mov sp, ax
+
+    pop ax
+    pop bx
+    pop cx
+    pop dx
+    pop si
+    pop di
+    pop bp
+    pop ds
+    pop es
+    iret

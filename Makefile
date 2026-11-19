@@ -8,8 +8,8 @@ PATH   := $(WATCOM)/binl64:$(PATH)
 IMG    := book8088/disk.img
 CFLAGS := -0 -fpi87 -ms -s -zl -ecc -zq -Iinclude -Ibuild
 
-KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
-USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin
+KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mouse.obj build/sound.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
+USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin build/mouse.bin build/play.bin build/volume.bin build/more.bin build/tree.bin build/vidsync.bin
 KEYMAPS     := build/us.map build/fr.map build/be.map
 
 all: $(IMG)
@@ -65,7 +65,25 @@ build/sam.mdl: tools/train_sam.py
 	mkdir -p build
 	python3 tools/train_sam.py $@
 
-$(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl boot.sh tools/fat16.py
+MUSIC_FILES := build/ode.imf build/wonderin.imf build/keen.imf build/chime.wav
+
+build/ode.imf: tools/gen_imf.py
+	mkdir -p build
+	python3 tools/gen_imf.py $@
+
+build/wonderin.imf: music/wonderin.imf
+	mkdir -p build
+	cp $< $@
+
+build/keen.imf: music/keen.imf
+	mkdir -p build
+	cp $< $@
+
+build/chime.wav: tools/gen_wav.py
+	mkdir -p build
+	python3 tools/gen_wav.py $@
+
+$(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(MUSIC_FILES) boot.sh tools/fat16.py
 	dd if=/dev/zero of=$@ bs=512 count=20808 status=none
 	/usr/sbin/mkfs.fat -a -F 16 -s 4 -R 1 -f 2 -r 512 -g 4/17 -M 0xF8 -D 0x80 -n "HOBBYOS" $@ >/dev/null
 	python3 tools/fat16.py $@ build/boot.bin \
@@ -83,7 +101,17 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl bo
 		build/ramdisk.bin:/BIN/RAMDISK.BIN \
 		build/har.bin:/BIN/HAR.BIN \
 		build/sam.bin:/BIN/SAM.BIN \
+		build/mouse.bin:/BIN/MOUSE.BIN \
+		build/play.bin:/BIN/PLAY.BIN \
+		build/volume.bin:/BIN/VOLUME.BIN \
+		build/more.bin:/BIN/MORE.BIN \
+		build/tree.bin:/BIN/TREE.BIN \
+		build/vidsync.bin:/BIN/VIDSYNC.BIN \
 		build/sam.mdl:/MODELS/SAM.MDL \
+		build/ode.imf:/MUSIC/ODE.IMF \
+		build/wonderin.imf:/MUSIC/WONDERIN.IMF \
+		build/keen.imf:/MUSIC/KEEN.IMF \
+		build/chime.wav:/MUSIC/CHIME.WAV \
 		build/boot.bin:/BIN/BOOT.BIN \
 		boot.sh:/BOOT.SH \
 		build/us.map:/KEYMAPS/US.MAP \

@@ -341,7 +341,11 @@ static uint16_t read_line(char *buf, uint16_t max_len) {
         uint8_t  u   = (uint8_t)(key & 0xFF);
         char     c   = (char)u;
 
-        if (c == '\r' || c == '\n') {
+        if (c == 0x03) {
+            os_puts("^C\n");
+            buf[0] = '\0';
+            return 0;
+        } else if (c == '\r' || c == '\n') {
             os_putc('\n');
             buf[len] = '\0';
             return len;
@@ -362,6 +366,17 @@ static uint16_t read_line(char *buf, uint16_t max_len) {
 static char char_upper(char c) {
     if (c >= 'a' && c <= 'z') return (char)(c - ('a' - 'A'));
     return c;
+}
+
+static int str_case_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        if (char_upper(*a) != char_upper(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0');
 }
 
 static int wildcard_match(const char *pattern, const char *text) {
@@ -472,6 +487,31 @@ static void combine_dir_file(const char *dir, const char *file, char out_path[64
     out_path[i] = '\0';
 }
 
+static int get_vol_info_for_path(const char *path, os_vol_info_t *out_vinfo) {
+    char dev[8];
+    int i;
+    uint8_t v;
+
+    if (path) {
+        while (*path == ' ') path++;
+        for (i = 0; i < 7 && path[i] != '\0'; i++) {
+            if (path[i] == ':') {
+                break;
+            }
+            dev[i] = path[i];
+        }
+        if (path[i] == ':') {
+            dev[i] = '\0';
+            for (v = 0; os_vol_info(v, (os_vol_info_t __far *)FP_HERE(out_vinfo)) == 0; v++) {
+                if (str_case_eq(out_vinfo->name, dev)) {
+                    return 0;
+                }
+            }
+        }
+    }
+    return os_vol_info(0xFF, (os_vol_info_t __far *)FP_HERE(out_vinfo));
+}
+
 static void cmd_ls(const char *path) {
     os_dir_entry_t dent;
     uint16_t idx = 0;
@@ -493,7 +533,12 @@ static void cmd_ls(const char *path) {
     }
 
     for (;;) {
-        int rc = os_dir_entry_at(dir_arg, idx, (os_dir_entry_t __far *)FP_HERE(&dent));
+        int rc;
+        if (os_kbhit() && (os_getc() & 0xFF) == 0x03) {
+            os_puts("^C\n");
+            return;
+        }
+        rc = os_dir_entry_at(dir_arg, idx, (os_dir_entry_t __far *)FP_HERE(&dent));
         if (rc != 0) {
             if (idx == 0) {
                 if (rc == -3) {
@@ -527,7 +572,7 @@ static void cmd_ls(const char *path) {
     }
 
     /* Print Volume Total and Free Space */
-    if (os_vol_info(0xFF, (os_vol_info_t __far *)FP_HERE(&vinfo)) == 0) {
+    if (get_vol_info_for_path(dir_arg ? dir_arg : path, &vinfo) == 0) {
         uint32_t total_kb = clusters_to_kb(vinfo.total_clusters, (uint8_t)vinfo.sectors_per_cluster);
         uint32_t free_kb  = clusters_to_kb(vinfo.free_clusters, (uint8_t)vinfo.sectors_per_cluster);
         os_puts("Volume ");
@@ -620,26 +665,39 @@ static void cmd_diskchange(const char *arg) {
 
 static void cmd_cat(const char *path) {
     static char file_buf[513];
+    uint32_t offset = 0;
     int n;
 
     if (!path || path[0] == '\0') {
         os_puts("Usage: cat <path>\n");
         return;
     }
-    n = os_file_read(path, FP_HERE(file_buf), 512);
-    if (n < 0) {
-        if (n == -3) {
-            os_puts("Drive not ready / No disk in drive: ");
-        } else {
-            os_puts("File not found: ");
+    for (;;) {
+        if (os_kbhit() && (os_getc() & 0xFF) == 0x03) {
+            os_puts("^C\n");
+            break;
         }
-        os_puts(path);
-        os_putc('\n');
-        return;
+        n = os_file_read_offset(path, FP_HERE(file_buf), 512, offset);
+        if (n <= 0) {
+            if (offset == 0) {
+                if (n == -3) {
+                    os_puts("Drive not ready / No disk in drive: ");
+                } else {
+                    os_puts("File not found: ");
+                }
+                os_puts(path);
+                os_putc('\n');
+            }
+            break;
+        }
+        file_buf[n] = '\0';
+        os_puts(file_buf);
+        offset += (uint32_t)n;
+        if (n < 512) {
+            break;
+        }
     }
-    file_buf[n] = '\0';
-    os_puts(file_buf);
-    if (n > 0 && file_buf[n - 1] != '\n') {
+    if (offset > 0 && file_buf[n > 0 ? n - 1 : 0] != '\n') {
         os_putc('\n');
     }
 }
@@ -1232,6 +1290,52 @@ static int find_script_or_bin(const char *cmd, char resolved[64], int *is_script
     return -1;
 }
 
+static char *find_unescaped_char(char *s, char target) {
+    int in_quote = 0;
+    while (*s) {
+        if (*s == '"') {
+            in_quote = !in_quote;
+        } else if (!in_quote && *s == target) {
+            return s;
+        }
+        s++;
+    }
+    return 0;
+}
+
+static char *find_unescaped_str2(char *s, char c1, char c2) {
+    int in_quote = 0;
+    while (*s && *(s + 1)) {
+        if (*s == '"') {
+            in_quote = !in_quote;
+        } else if (!in_quote && *s == c1 && *(s + 1) == c2) {
+            return s;
+        }
+        s++;
+    }
+    return 0;
+}
+
+static char *clean_file_arg(char *s) {
+    char *end;
+    while (*s == ' ') s++;
+    end = s;
+    while (*end && *end != ' ' && *end != '\r' && *end != '\n') end++;
+    *end = '\0';
+    return s;
+}
+
+static const char *get_pipe_staging_file(void) {
+    os_vol_info_t vinfo;
+    uint8_t v;
+    for (v = 0; os_vol_info(v, (os_vol_info_t __far *)FP_HERE(&vinfo)) == 0; v++) {
+        if (vinfo.bios_drive == 0xFF && vinfo.is_mounted) {
+            return "RAM:PIPE.TMP";
+        }
+    }
+    return "SYS:PIPE.TMP";
+}
+
 /* Execute a single line inside the shell / script environment */
 static int execute_line(char *raw_line, const char *script_args, uint16_t *out_goto_label_pos) {
     char expanded[128];
@@ -1273,6 +1377,67 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
     if (script_args && script_echo_on && !is_silent) {
         os_puts(p);
         os_putc('\n');
+        is_silent = 1;
+    }
+
+    /* Check for pipe '|' */
+    {
+        char *pipe_pos = find_unescaped_char(p, '|');
+        if (pipe_pos) {
+            const char *stage_file = get_pipe_staging_file();
+            int rc_left, rc_right;
+            *pipe_pos = '\0';
+            os_redir_stdout(stage_file, 0);
+            rc_left = execute_line(p, script_args, out_goto_label_pos);
+            os_redir_reset();
+
+            os_redir_stdin(stage_file);
+            rc_right = execute_line(pipe_pos + 1, script_args, out_goto_label_pos);
+            os_redir_reset();
+
+            os_file_delete(stage_file);
+            return rc_right;
+        }
+    }
+
+    /* Check for output/input redirection '>>', '>', '<' */
+    {
+        char *redir_app = find_unescaped_str2(p, '>', '>');
+        char *redir_out = find_unescaped_char(p, '>');
+        char *redir_in  = find_unescaped_char(p, '<');
+
+        if (redir_app || redir_out || redir_in) {
+            char *out_path = 0;
+            char *in_path  = 0;
+            int append_mode = 0;
+            int rc_sub;
+
+            if (redir_app) {
+                *redir_app = '\0';
+                out_path = clean_file_arg(redir_app + 2);
+                append_mode = 1;
+            } else if (redir_out) {
+                *redir_out = '\0';
+                out_path = clean_file_arg(redir_out + 1);
+                append_mode = 0;
+            }
+
+            if (redir_in) {
+                *redir_in = '\0';
+                in_path = clean_file_arg(redir_in + 1);
+            }
+
+            if (out_path && *out_path) {
+                os_redir_stdout(out_path, (uint8_t)append_mode);
+            }
+            if (in_path && *in_path) {
+                os_redir_stdin(in_path);
+            }
+
+            rc_sub = execute_line(p, script_args, out_goto_label_pos);
+            os_redir_reset();
+            return rc_sub;
+        }
     }
 
     cmd = split_word(p, &rest);
@@ -1344,9 +1509,11 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
     /* Built-ins */
     if (str_eq(cmd, "help")) {
         os_puts("Commands: help, ls [dir|pat], lsdisk, cd <dir>, pwd, mkdir <dir>, rmdir <dir>,\n");
-        os_puts("          cat <file>, write [-a] [file] \"<text>\", cp <src> <dst>, mv <s> <d>,\n");
-        os_puts("          rm <path>, edit <file>, forth, set [VAR=VAL], echo [text|on|off],\n");
-        os_puts("          keyb [us|fr|be], mem, cls, format [dev:] [/s], fdisk, chkdsk, ramdisk, har, sam, gfxdemo, diskchange, <DEV:>\n");
+        os_puts("          cat <file>, more [file], tree [path] [/f] [/a], write [-a] [file] \"<text>\",\n");
+        os_puts("          cp <src> <dst>, mv <s> <d>, rm <p>, edit <file>, forth, volume, play,\n");
+        os_puts("          set [VAR=VAL], echo [text|on|off], keyb [us|fr|be], mem, cls, format,\n");
+        os_puts("          fdisk, chkdsk, ramdisk, har, sam, gfxdemo, mouse, diskchange, <DEV:>\n");
+        os_puts("Redirection: <cmd> > <file>, <cmd> >> <file>, <cmd> < <file>, <cmd1> | <cmd2>\n");
     } else if (str_eq(cmd, "set")) {
         cmd_set(rest);
     } else if (str_eq(cmd, "ls") || str_eq(cmd, "dir")) {
@@ -1432,6 +1599,11 @@ static int run_script(const char *script_path, const char *script_args) {
         uint16_t line_start = cur_pos;
         uint16_t goto_flag = 0;
         int rc;
+
+        if (os_kbhit() && (os_getc() & 0xFF) == 0x03) {
+            os_puts("^C\n");
+            break;
+        }
 
         while (cur_pos < (uint16_t)n && script_buf[cur_pos] != '\r' && script_buf[cur_pos] != '\n') {
             if (lpos + 1 < sizeof(line)) {

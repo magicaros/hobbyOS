@@ -796,6 +796,7 @@ int app_main(void) {
 
     os_cls(ATTR_DEFAULT);
     put_row(HELP_ROW, help_text);
+    os_set_break_mode(BREAK_MODE_RAW);
 
     while (running) {
         uint16_t key;
@@ -837,6 +838,8 @@ int app_main(void) {
             do_save();
         } else if (c == CTRL('X')) {
             running = !confirm_exit();
+        } else if (c == CTRL('C')) {
+            msg_set("^C (press ^C again to force quit, ^X to exit)");
         } else if (c == CTRL('K')) {
             do_cut();
             update_want_col();
@@ -851,6 +854,7 @@ int app_main(void) {
         }
     }
 
+    os_set_break_mode(BREAK_MODE_NORMAL);
     os_cls(ATTR_DEFAULT);
     os_mem_free(seg);
     return 0;

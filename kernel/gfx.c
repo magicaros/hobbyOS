@@ -27,6 +27,52 @@
 
 static uint8_t cur_video_mode = OS_MODE_TEXT_80x25;
 
+void gfx_cga_lcd_sync(void) {
+    uint8_t mode;
+    volatile uint8_t __far *vram_b800 = (volatile uint8_t __far *)MK_FP(0xB800, 0);
+    volatile uint8_t __far *vram_ba00 = (volatile uint8_t __far *)MK_FP(0xBA00, 0);
+
+    /* Book 8088 LCD boundary sync is specific to CGA systems */
+    if (video_get_type() != VIDEO_TYPE_CGA) {
+        return;
+    }
+
+    mode = *((const uint8_t __far *)MK_FP(0x0040, 0x0049));
+    if (mode == 0) {
+        mode = cur_video_mode;
+    }
+
+    if (mode == 0x00 || mode == 0x01) {
+        /* 40x25 text mode (XOR attribute byte at top-left 0001h and bottom-right 07CFh) */
+        vram_b800[1]     ^= 0x70;
+        vram_b800[0x7CF] ^= 0x70;
+        cga_lcd_sync_delay();
+        vram_b800[1]     ^= 0x70;
+        vram_b800[0x7CF] ^= 0x70;
+    } else if (mode == OS_MODE_TEXT_80x25 || mode == 0x03 || mode == 0x02) {
+        /* 80x25 text mode (XOR attribute byte at top-left 0001h and bottom-right 0F9Fh) */
+        vram_b800[1]      ^= 0x70;
+        vram_b800[0x0F9F] ^= 0x70;
+        cga_lcd_sync_delay();
+        vram_b800[1]      ^= 0x70;
+        vram_b800[0x0F9F] ^= 0x70;
+    } else if (mode == OS_MODE_CGA_320x200 || mode == OS_MODE_CGA_320x200_ALT) {
+        /* 320x200 4-color graphics (top-left 0000h XOR C0h, bottom-right 1F3Fh XOR 03h) */
+        vram_b800[0]      ^= 0xC0;
+        vram_ba00[0x1F3F] ^= 0x03;
+        cga_lcd_sync_delay();
+        vram_b800[0]      ^= 0xC0;
+        vram_ba00[0x1F3F] ^= 0x03;
+    } else if (mode == OS_MODE_CGA_640x200) {
+        /* 640x200 2-color graphics (top-left 0000h XOR 80h, bottom-right 1F3Fh XOR 01h) */
+        vram_b800[0]      ^= 0x80;
+        vram_ba00[0x1F3F] ^= 0x01;
+        cga_lcd_sync_delay();
+        vram_b800[0]      ^= 0x80;
+        vram_ba00[0x1F3F] ^= 0x01;
+    }
+}
+
 int gfx_set_mode(uint8_t mode) {
     if (video_get_type() == VIDEO_TYPE_MDA) {
         if (mode == OS_MODE_TEXT_80x25 || mode == 0x07) {
@@ -60,15 +106,19 @@ int gfx_set_mode(uint8_t mode) {
 
     if (mode == OS_MODE_TEXT_80x25) {
         con_init();
+        gfx_cga_lcd_sync();
     } else if (mode == OS_MODE_CGA_320x200) {
         gfx_set_palette(1, 1, 0); /* Palette 1 (Cyan/Magenta/White), bright, black bg */
         gfx_clear(0);
+        gfx_cga_lcd_sync();
     } else if (mode == OS_MODE_CGA_320x200_ALT) {
         gfx_set_palette(2, 1, 0); /* Palette 2 (Cyan/Red/White), bright, black bg */
         gfx_clear(0);
+        gfx_cga_lcd_sync();
     } else if (mode == OS_MODE_CGA_640x200) {
         gfx_set_palette(0, 1, 0x0F); /* Bright white foreground on black */
         gfx_clear(0);
+        gfx_cga_lcd_sync();
     }
 
     return 0;

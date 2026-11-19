@@ -20,6 +20,10 @@ typedef signed short   int16_t;
 typedef unsigned long  uint32_t;
 typedef signed long    int32_t;
 
+#ifndef MK_FP
+#define MK_FP(seg, off) ((void __far *)(((unsigned long)(seg) << 16) | (uint16_t)(off)))
+#endif
+
 /* INT 0x21 System Call Numbers (passed in AH) */
 #define SYS_EXIT         0x00
 #define SYS_PUTC         0x01
@@ -34,6 +38,18 @@ typedef signed long    int32_t;
 #define SYS_CURSOR_VISIBLE 0x0A
 #define SYS_CPU_TYPE     0x0B
 #define SYS_VIDEO_TYPE   0x0C
+#define SYS_BREAK_MODE   0x0D
+#define SYS_REDIR        0x0E
+
+#define REDIR_STDOUT     0
+#define REDIR_STDIN      1
+#define REDIR_RESET      2
+#define REDIR_KEYB_GETC  3
+#define REDIR_KEYB_KBHIT 4
+#define REDIR_FLUSH      5
+
+#define BREAK_MODE_NORMAL 0  /* Single Ctrl+C breaks out of process (default) */
+#define BREAK_MODE_RAW    1  /* Full-screen/raw: 1st Ctrl+C delivered to app; 2nd in a row breaks out */
 
 /* CPU Types detected by hobbyOS */
 #define CPU_TYPE_8088     0  /* Intel 8088 (8-bit bus, 4-byte prefetch queue) */
@@ -121,6 +137,44 @@ typedef signed long    int32_t;
 #define SYS_GFX_TEXT     0x68
 #define SYS_GFX_BLIT     0x69
 #define SYS_GFX_SET_DAC  0x6A
+#define SYS_GFX_SYNC     0x6B
+
+#define SYS_SOUND_INFO       0x70
+#define SYS_SOUND_TONE       0x71
+#define SYS_SOUND_STOP       0x72
+#define SYS_SOUND_OPL_WRITE  0x73
+#define SYS_SOUND_GET_VOL    0x74
+#define SYS_SOUND_SET_VOL    0x75
+#define SYS_SOUND_PCM_PLAY   0x76
+#define SYS_SOUND_PCM_STATUS 0x77
+#define SYS_SOUND_PCM_STOP   0x78
+#define SYS_SOUND_BG_PLAY    0x79
+#define SYS_SOUND_BG_STOP    0x7A
+#define SYS_SOUND_BG_STATUS  0x7B
+
+typedef struct {
+    uint8_t  active;       /* 1 if playing, 0 if stopped */
+    uint8_t  loop;         /* 1 if looping */
+    uint16_t rate_hz;      /* 560 or 700 */
+    uint32_t current_pos;  /* current byte offset */
+    uint32_t total_bytes;  /* total file bytes */
+    char     name[16];     /* track filename */
+} os_sound_bg_status_t;
+
+#define SOUND_DEV_NONE       0
+#define SOUND_DEV_SPEAKER    1
+#define SOUND_DEV_OPL2       2
+#define SOUND_DEV_OPL3       3
+
+#define SOUND_VOL_MASTER     0
+#define SOUND_VOL_FM         1
+#define SOUND_VOL_PCM        2
+
+#define SB_TYPE_NONE         0
+#define SB_TYPE_SB10         1
+#define SB_TYPE_SB20         2
+#define SB_TYPE_PRO          3
+#define SB_TYPE_16           4
 
 /* Video Modes */
 #define OS_MODE_TEXT_80x25      0x03  /* 80x25 16-color text (default) */
@@ -365,6 +419,54 @@ uint16_t os_video_type(void);
     "mov ah, 0x0C" \
     "int 0x21" \
     value [ax];
+
+int os_set_break_mode(uint8_t mode);
+#pragma aux os_set_break_mode = \
+    "mov ah, 0x0D" \
+    "int 0x21" \
+    parm [al] value [ax];
+
+int os_redir_stdout(const char *path, uint8_t append);
+#pragma aux os_redir_stdout = \
+    "mov ah, 0x0E" \
+    "mov al, 0" \
+    "int 0x21" \
+    parm [dx] [cl] value [ax];
+
+int os_redir_stdin(const char *path);
+#pragma aux os_redir_stdin = \
+    "mov ah, 0x0E" \
+    "mov al, 1" \
+    "int 0x21" \
+    parm [dx] value [ax];
+
+void os_redir_reset(void);
+#pragma aux os_redir_reset = \
+    "mov ah, 0x0E" \
+    "mov al, 2" \
+    "int 0x21" \
+    modify [ax];
+
+uint16_t os_keyb_getc_direct(void);
+#pragma aux os_keyb_getc_direct = \
+    "mov ah, 0x0E" \
+    "mov al, 3" \
+    "int 0x21" \
+    value [ax];
+
+int os_keyb_kbhit_direct(void);
+#pragma aux os_keyb_kbhit_direct = \
+    "mov ah, 0x0E" \
+    "mov al, 4" \
+    "int 0x21" \
+    value [ax];
+
+void os_redir_flush(void);
+#pragma aux os_redir_flush = \
+    "mov ah, 0x0E" \
+    "mov al, 5" \
+    "int 0x21" \
+    modify [ax];
 
 static __inline const char *os_video_name(uint16_t type) {
     switch (type) {
@@ -748,6 +850,12 @@ void os_gfx_set_dac(uint8_t index, uint8_t r, uint8_t g, uint8_t b);
     "int 0x21" \
     parm [bl] [cl] [ch] [dl] modify [ax];
 
+void os_gfx_sync(void);
+#pragma aux os_gfx_sync = \
+    "mov ah, 0x6B" \
+    "int 0x21" \
+    modify [ax];
+
 /* Fast inline pixel plotting into a 16,000-byte linear backbuffer (80 bytes/row) */
 static __inline void os_buf_putpixel_320(uint8_t __far *buf, uint16_t x, uint16_t y, uint8_t color) {
     if (x < 320 && y < 200) {
@@ -772,6 +880,196 @@ static __inline void os_buf_putpixel_640(uint8_t __far *buf, uint16_t x, uint16_
         } else {
             buf[off] &= (uint8_t)~mask;
         }
+    }
+}
+
+/* Standard INT 0x33 Mouse Services */
+uint16_t os_mouse_reset(uint16_t *out_buttons);
+#pragma aux os_mouse_reset = \
+    "xor ax, ax" \
+    "int 0x33" \
+    "test si, si" \
+    "jz no_btn" \
+    "mov [si], bx" \
+    "no_btn:" \
+    parm [si] value [ax] modify [bx];
+
+void os_mouse_show(void);
+#pragma aux os_mouse_show = \
+    "mov ax, 1" \
+    "int 0x33" \
+    modify [ax];
+
+void os_mouse_hide(void);
+#pragma aux os_mouse_hide = \
+    "mov ax, 2" \
+    "int 0x33" \
+    modify [ax];
+
+uint16_t os_mouse_get_pos(uint16_t *out_x, uint16_t *out_y);
+#pragma aux os_mouse_get_pos = \
+    "mov ax, 3" \
+    "int 0x33" \
+    "test si, si" \
+    "jz no_x" \
+    "mov [si], cx" \
+    "no_x:" \
+    "test di, di" \
+    "jz no_y" \
+    "mov [di], dx" \
+    "no_y:" \
+    parm [si] [di] value [bx] modify [ax cx dx];
+
+void os_mouse_set_pos(uint16_t x, uint16_t y);
+#pragma aux os_mouse_set_pos = \
+    "mov ax, 4" \
+    "int 0x33" \
+    parm [cx] [dx] modify [ax];
+
+void os_mouse_set_hlimits(uint16_t min_x, uint16_t max_x);
+#pragma aux os_mouse_set_hlimits = \
+    "mov ax, 7" \
+    "int 0x33" \
+    parm [cx] [dx] modify [ax];
+
+void os_mouse_set_vlimits(uint16_t min_y, uint16_t max_y);
+#pragma aux os_mouse_set_vlimits = \
+    "mov ax, 8" \
+    "int 0x33" \
+    parm [cx] [dx] modify [ax];
+
+void os_mouse_get_mickeys(int16_t *out_dx, int16_t *out_dy);
+#pragma aux os_mouse_get_mickeys = \
+    "mov ax, 0x0B" \
+    "int 0x33" \
+    "test si, si" \
+    "jz no_mx" \
+    "mov [si], cx" \
+    "no_mx:" \
+    "test di, di" \
+    "jz no_my" \
+    "mov [di], dx" \
+    "no_my:" \
+    parm [si] [di] modify [ax cx dx];
+
+/* Unified Sound Subsystem Services */
+uint16_t os_sound_info(uint16_t *out_port, uint16_t *out_channels);
+#pragma aux os_sound_info = \
+    "mov ah, 0x70" \
+    "int 0x21" \
+    "test si, si" \
+    "jz no_sport" \
+    "mov [si], bx" \
+    "no_sport:" \
+    "test di, di" \
+    "jz no_sch" \
+    "mov [di], cx" \
+    "no_sch:" \
+    parm [si] [di] value [ax] modify [bx cx];
+
+void os_sound_tone(uint16_t freq_hz, uint16_t duration_ms, uint8_t channel);
+#pragma aux os_sound_tone = \
+    "mov ah, 0x71" \
+    "int 0x21" \
+    parm [bx] [cx] [dl] modify [ax];
+
+void os_sound_stop(void);
+#pragma aux os_sound_stop = \
+    "mov ah, 0x72" \
+    "int 0x21" \
+    modify [ax];
+
+void os_sound_opl_write(uint16_t reg, uint8_t val);
+#pragma aux os_sound_opl_write = \
+    "mov ah, 0x73" \
+    "int 0x21" \
+    parm [bx] [cl] modify [ax];
+
+int16_t os_sound_get_vol(uint8_t channel);
+#pragma aux os_sound_get_vol = \
+    "mov ah, 0x74" \
+    "xor bh, bh" \
+    "int 0x21" \
+    parm [bl] value [ax] modify [bx];
+
+int16_t os_sound_set_vol(uint8_t channel, uint8_t pct);
+#pragma aux os_sound_set_vol = \
+    "mov ah, 0x75" \
+    "xor bh, bh" \
+    "xor ch, ch" \
+    "int 0x21" \
+    parm [bl] [cl] value [ax] modify [bx cx];
+
+int16_t os_sound_pcm_play(uint16_t rate_hz, uint16_t len, const void __far *samples);
+#pragma aux os_sound_pcm_play = \
+    "mov ah, 0x76" \
+    "int 0x21" \
+    parm [bx] [cx] [es di] value [ax];
+
+int16_t os_sound_pcm_status(void);
+#pragma aux os_sound_pcm_status = \
+    "mov ah, 0x77" \
+    "int 0x21" \
+    value [ax];
+
+void os_sound_pcm_stop(void);
+#pragma aux os_sound_pcm_stop = \
+    "mov ah, 0x78" \
+    "int 0x21" \
+    modify [ax];
+
+int16_t os_sound_bg_play(uint16_t rate_hz, uint8_t loop, uint16_t len, const void __far *data, const char *name);
+#pragma aux os_sound_bg_play = \
+    "mov ah, 0x79" \
+    "int 0x21" \
+    parm [bx] [cl] [dx] [es di] [si] value [ax];
+
+void os_sound_bg_stop(void);
+#pragma aux os_sound_bg_stop = \
+    "mov ah, 0x7A" \
+    "int 0x21" \
+    modify [ax];
+
+int16_t os_sound_bg_status(os_sound_bg_status_t __far *st);
+#pragma aux os_sound_bg_status = \
+    "mov ah, 0x7B" \
+    "int 0x21" \
+    parm [es di] value [ax];
+
+static __inline int os_sound_info_ex(uint16_t *port, uint16_t *channels, uint8_t *sb_type, uint16_t *sb_base) {
+    int dev;
+    uint16_t p = 0, c = 0, dx_val = 0;
+    __asm {
+        mov ah, 0x70
+        int 0x21
+        mov dev, ax
+        mov p, bx
+        mov c, cx
+        mov dx_val, dx
+    }
+    if (port) *port = p;
+    if (channels) *channels = c;
+    if (sb_type) *sb_type = (uint8_t)(dx_val >> 8);
+    if (sb_base) *sb_base = (dx_val & 0xFF) ? (0x0200 | (dx_val & 0xFF)) : 0;
+    return dev;
+}
+
+static __inline const char *os_sound_sb_name(uint8_t sb_type) {
+    switch (sb_type) {
+    case SB_TYPE_16:  return "Sound Blaster 16 (CT1745 Mixer)";
+    case SB_TYPE_PRO: return "Sound Blaster Pro (CT1345 Mixer)";
+    case SB_TYPE_SB20: return "Sound Blaster 2.0";
+    case SB_TYPE_SB10: return "Sound Blaster 1.0/1.5";
+    default:          return "None / Unsupported";
+    }
+}
+
+static __inline const char *os_sound_device_name(uint16_t dev) {
+    switch (dev) {
+    case SOUND_DEV_OPL3:    return "Yamaha YMF262 (OPL3)";
+    case SOUND_DEV_OPL2:    return "Yamaha YM3812 (OPL2)";
+    case SOUND_DEV_SPEAKER: return "PC Speaker (PIT Timer 2)";
+    default:                return "None / Muted";
     }
 }
 

@@ -126,7 +126,7 @@ static void print_altman_easter_egg(int ems_present, uint16_t free_ems_pages) {
     os_puts(" KiB (");
     print_uint16_pad(free_ems_pages, 1);
     os_puts("/128 pages) of pristine 1980s-style SRAM doing\n");
-    os_puts("absolutely nothing at 0xE000. It's not for sale, I just like knowing\n");
+    os_puts("absolutely nothing at 0xC000. It's not for sale, I just like knowing\n");
     os_puts("it's there.\n\n");
 
     os_puts("Hoarding responsibly,\n");
@@ -251,7 +251,7 @@ int app_main(void) {
     os_puts(" / ");
     print_uint16_pad(total_ems_pages, 1);
     if (ems_present) {
-        os_puts(" (16 KB/page at 0xE000)\n");
+        os_puts(" (16 KB/page at 0xC000)\n");
     } else {
         os_puts(" (not present)\n");
     }

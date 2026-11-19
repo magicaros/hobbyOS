@@ -59,7 +59,7 @@ def encode_context(ctx):
 DATASET = [
     ([
         "hello", "hi", "hey", "hello sam", "hey sam", "greetings", "good morning", "sam", "sup"
-     ], "Greetings. Pristine 1980s SRAM at 0xE000 is ready for AGI."),
+     ], "Greetings. Pristine 1980s SRAM at 0xC000 is ready for AGI."),
 
     ([
         "how are you", "status", "how do you feel", "system status", "health", "ping"
@@ -74,8 +74,8 @@ DATASET = [
      ], "Tell Sam Altman to keep his 7 trillion. We bought this 8088 for 50 dollars."),
 
     ([
-        "memory", "what is your memory", "how much ram", "ems", "sram", "0xe000", "ram"
-     ], "Lo-tech 2MB EMS at 0xE000. Pure 1980s SRAM perfection."),
+        "memory", "what is your memory", "how much ram", "ems", "sram", "0xc000", "ram"
+     ], "Lo-tech 2MB EMS at 0xC000. Pure 1980s SRAM perfection."),
 
     ([
         "architecture", "what is your architecture", "how do you work", "attention", "transformer"

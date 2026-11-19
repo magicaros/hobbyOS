@@ -101,7 +101,10 @@ static uint8_t translate_attr(uint8_t attr) {
     return 0x07;
 }
 
+static uint8_t serial_console_enabled = 1;
+
 void serial_init(void) {
+    serial_console_enabled = 1;
     outb(COM1_BASE + 1, 0x00); /* Disable interrupts */
     outb(COM1_BASE + 3, 0x80); /* Enable DLAB */
     outb(COM1_BASE + 0, 0x0C); /* 9600 baud (divisor 12) */
@@ -110,10 +113,35 @@ void serial_init(void) {
     outb(COM1_BASE + 4, 0x03); /* DTR + RTS */
 }
 
+void serial_enable(void) {
+    serial_console_enabled = 1;
+}
+
+void serial_disable(void) {
+    serial_console_enabled = 0;
+}
+
 static void serial_putc(char c) {
     uint16_t timeout = 5000;
+    if (!serial_console_enabled) {
+        return;
+    }
     while ((inb(COM1_BASE + 5) & 0x20) == 0 && --timeout > 0);
     outb(COM1_BASE, (uint8_t)c);
+}
+
+void con_set_cell(uint16_t idx, uint16_t val) {
+    if (idx < CGA_CELLS) {
+        cga_shadow[idx] = val;
+        cga_write_cell(idx, val);
+    }
+}
+
+uint16_t con_get_cell(uint16_t idx) {
+    if (idx < CGA_CELLS) {
+        return cga_shadow[idx];
+    }
+    return 0;
 }
 
 static void put_cell(uint16_t idx, uint16_t val) {

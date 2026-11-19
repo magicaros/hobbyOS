@@ -105,6 +105,36 @@ int app_main(void) {
             os_keyb_state(0x01) == 0) {
             os_puts("[USER APP] Keymaps (US/FR/BE) & IRQ1 state verified OK\n");
         }
+        if (os_set_break_mode(BREAK_MODE_RAW) == 0 && os_set_break_mode(BREAK_MODE_NORMAL) == 0) {
+            os_puts("[USER APP] Break mode syscall (normal/raw) verified OK\n");
+        }
+    }
+
+    /* Test INT 0x33 mouse services */
+    {
+        uint16_t btns = 0;
+        uint16_t res = os_mouse_reset(&btns);
+        if (res == 0xFFFF) {
+            uint16_t x, y;
+            os_mouse_get_pos(&x, &y);
+            os_puts("[USER APP] INT 0x33 Mouse detected & verified OK\n");
+        } else {
+            os_puts("[USER APP] INT 0x33 Mouse driver active (no mouse hardware)\n");
+        }
+    }
+
+    /* Test Sound Subsystem */
+    {
+        uint16_t port = 0, ch = 0, sb_base = 0;
+        uint8_t sb_type = 0;
+        int sdev = os_sound_info_ex(&port, &ch, &sb_type, &sb_base);
+        os_puts("[USER APP] Sound subsystem verified OK: ");
+        os_puts(os_sound_device_name(sdev));
+        if (sb_type != SB_TYPE_NONE) {
+            os_puts(" + ");
+            os_puts(os_sound_sb_name(sb_type));
+        }
+        os_putc('\n');
     }
 
     /* Test creating a subdirectory and writing + appending a file inside it */

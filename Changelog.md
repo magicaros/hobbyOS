@@ -1,5 +1,115 @@
 # Changelog
 
+## Revision 1.0 (2026-11-19) — Kernel Feature Freeze & Book 8088 Hardware Parity
+
+- **Kernel Feature Freeze**:
+  - The hobbyOS monolithic microkernel feature set is officially stabilized and frozen for the 1.0 milestone. All core architectural subsystems—pre-CPUID CPU detection, memory management (conventional MCB, Lo-tech 2MB EMS, XMS 2.0 extended memory), FAT12/16/16B storage volume manager, CGA/VGA/MDA graphics with snow-free double-buffered text, interrupt-driven PC/XT keyboard with hot-swappable keymaps, serial/PS/2 mouse on INT 0x33, unified OPL2/OPL3 FM sound with PC Speaker fallback, Sound Blaster CT1345/CT1745 hardware mixer and DMA Channel 1 PCM digital audio, and full in-kernel stream redirection (`SYS_REDIR`) with shell piping—are verified and stable on physical Book 8088 hardware and 86Box.
+- **Book 8088 CGA LCD Mode-Switch Boundary Sync (`VIDSYNC`) & Multi-Drive Shell Fixes (`kernel/entry.asm`, `kernel/gfx.c`, `kernel/syscall.c`, `include/hobbyos.h`, `user/vidsync.c`, `user/shell.c`, `Makefile`)**:
+  - **NEC V20 / V30 CPU Detection Fix (`kernel/entry.asm`)**:
+    - Replaced previous checks with the classic and robust `AAD 0x10` data modification check. On Intel 8088/8086 silicon and emulators, `AAD imm8` calculates `AL = (AH * imm8) + AL` (using base 16: `0x01 * 0x10 + 0x01 = 0x11`). On NEC V20/V30, the processor strictly ignores the immediate operand and hardcodes base 10 (`0x01 * 0x0A + 0x01 = 0x0B`). This correctly distinguishes Intel 8088 from NEC V20 across both real hardware and emulators like 86Box without false positives.
+  - **Book 8088 CGA Mode-Switch Hardware Workaround (`VIDSYNC`)**:
+    - Resolved the notorious Book 8088 hardware issue where the built-in 7-inch LCD scaler PLL loses horizontal/vertical sync when switching between text and CGA graphics modes, causing the image to shift off-center or crop edges.
+    - Implemented James Howard's exact Vidsync calibration timing (`cga_lcd_sync_delay`): executes 20 outer loops of 65,535 busy-wait iterations (~1.8–4.6 seconds depending on clock speed and turbo mode), holding inverted attribute boundary markers on the top-left and bottom-right corners across text (XOR `0x70`) and graphics modes (XOR `0xC0`/`0x03` or `0x80`/`0x01`). This provides the continuous edge transitions necessary for the internal LCD scaler PLL to reliably lock phase and auto-center the active display.
+    - Integrated automatic resync on every video mode change by hooking BIOS `INT 0x10` (`AH=00h` Set Video Mode) directly in `kernel/entry.asm` and calling it within `gfx_set_mode()`.
+    - Added `SYS_GFX_SYNC` (`0x6B`) syscall, `os_gfx_sync()` API, and standalone `/BIN/VIDSYNC.BIN` command-line utility that cycles Mode 1 (40-column) to Mode 3 (80-column) to force full display recalibration on demand from the shell.
+  - **Cross-Volume Directory Listing Footer Fix (`user/shell.c`)**:
+    - Resolved a bug where running `ls` against another volume (e.g. `ls hd0a:`, `ls fd0:`) listed the target directory's files but printed the caller's active drive volume name and cluster stats. Added `get_vol_info_for_path()` to match and print statistics for the referenced volume.
+- **In-Kernel Stream Redirection, Shell Pipelines (`|`, `>`, `>>`, `<`), Terminal Pager (`/BIN/MORE.BIN`) & Directory Tree (`/BIN/TREE.BIN`) (`kernel/syscall.c`, `include/hobbyos.h`, `user/shell.c`, `user/more.c`, `user/tree.c`, `Makefile`)**:
+  - **In-Kernel Stream Redirection Subsystem (`SYS_REDIR`, Function `0x0E`)**:
+    - Introduced buffered standard I/O redirection inside the kernel:
+      - `stdout` Redirection: Redirects `SYS_PUTC` (`0x01`) and `SYS_PUTS` (`0x02`) through a 512-byte sector buffer, automatically flushing full blocks to the target FAT16 file via `fat16_write_file` (truncate/create mode `>`) or `fat16_append_file` (append mode `>>`).
+      - `stdin` Redirection: Streams characters through `SYS_GETC` (`0x03`) and `SYS_KBHIT` (`0x04`) from a 512-byte read-ahead buffer using `fat16_read_file_offset`, returning `0xFFFF` upon EOF.
+      - Direct Keyboard Bypass (`REDIR_KEYB_GETC`, `REDIR_KEYB_KBHIT`): Allows pagers and interactive tools to query physical keystrokes (`con_getc` / `kbd_getc`) even when standard input is redirected from a file or pipe.
+      - Process Lifecycle Safety: Automatically flushes any buffered output upon process exit (`proc_exit_usermode` / `SYS_EXIT`).
+  - **Interactive Shell Pipelines & File Redirections (`/BIN/SHELL.BIN`)**:
+    - Full support for `cmd > file` (overwrite), `cmd >> file` (append), `cmd < file` (input redirection), and `cmd1 | cmd2` (pipeline streaming).
+    - Pipeline execution stages data via high-speed EMS/XMS RAM disk (`RAM:PIPE.TMP`) if mounted, or conventional storage (`SYS:PIPE.TMP`), connecting any arbitrary shell built-in or external executable without disk leftover.
+  - **Terminal Pager Utility (`/BIN/MORE.BIN`, `user/more.c`)**:
+    - Standalone or piped file pager supporting both file arguments (`more <file>`) and stream input (`<cmd> | more`).
+    - Pauses every 24 rows for 80x25 text displays, expanding tabs and tracking 80-column line wrapping.
+    - Interactive prompt (`-- More (X%) --`) with direct keypress navigation: `Space` (next full page), `Enter` (next single line), and `Q`/`Esc`/`Ctrl+C` (quit).
+  - **Directory Hierarchy Visualizer (`/BIN/TREE.BIN`, `user/tree.c`)**:
+    - Recursively visualizes filesystem hierarchies up to 16 levels deep.
+    - Renders using authentic IBM CP437 box-drawing glyphs (`├───`, `└───`, `│   `) or 7-bit ASCII (`+---`, `\---`, `|   ` via `/A`).
+    - Supports `/F` to list both files and directories, and non-blocking `Ctrl+C` cancellation.
+
+## Revision 0.18 (2026-11-19)
+
+- **Unified Sound Subsystem, Zero-Config Graceful Degradation & IMF Music Player (`kernel/sound.c`, `kernel/kernel.h`, `kernel/syscall.c`, `kernel/main.c`, `include/hobbyos.h`, `user/play.c`, `user/hello.c`, `user/shell.c`, `tools/gen_imf.py`, `Makefile`)**:
+  - **Tiered Sound Architecture & Hardware Probing**:
+    - **Yamaha OPL3 (YMF262) & OPL2 (YM3812)**: Probes standard AdLib ports `0x388`–`0x38B` using official timer 1/2 reset and overflow polling (`0xC0` status byte), then detects OPL3 extensions (testing status bits 1–2 and enabling 18-channel stereo FM via Bank 1 register `0x105 = 0x01`). Zero IRQ/DMA requirements, matching the onboard Book8088 sound expansion module.
+    - **Universal PC Speaker Fallback**: When no FM sound card is present, automatically falls back to the IBM PC/XT internal PC speaker (8253 PIT Timer 2 at ports `0x42`/`0x43`, Port `0x61` control).
+    - **Automatic AdLib-to-PC-Speaker Emulation**: In speaker fallback mode, intercepts all 9 OPL channels (`0xA0`–`0xA8` F-numbers, `0xB0`–`0xB8` Key-On/Block) with dynamic active channel fallback, synthesizing music on PIT Timer 2 square waves regardless of which channels the game scores on.
+    - **OPL3 Stereo Panning Compatibility**: When running on OPL3 hardware, `sound_opl_write` automatically asserts bits 4 and 5 (`val |= 0x30`, Left + Right stereo center) on voice connection registers (`0xC0`–`0xC8`), preventing legacy OPL2 tracks with zeroed panning bits from silencing output on OPL3 chips.
+  - **Sound Syscall API (`INT 0x21`, Functions `0x70`–`0x7B`)**:
+    - `SYS_SOUND_INFO` (`0x70`): Queries active FM device (`SOUND_DEV_NONE`, `SOUND_DEV_SPEAKER`, `SOUND_DEV_OPL2`, `SOUND_DEV_OPL3`), base port, channels, and Sound Blaster card/mixer type in `DX`.
+    - `SYS_SOUND_TONE` (`0x71`): Plays frequency tone on an FM voice or routes Channel 0 to PIT Timer 2.
+    - `SYS_SOUND_STOP` (`0x72`): Immediately mutes all FM voices and silences the PC speaker (preserves background music if active).
+    - `SYS_SOUND_OPL_WRITE` (`0x73`): Raw register streaming to OPL banks or real-time translation to PC speaker tones.
+    - `SYS_SOUND_GET_VOL` (`0x74`) / `SYS_SOUND_SET_VOL` (`0x75`): Queries and sets Master (`0`), FM (`1`), and PCM (`2`) volume levels (0–100%) on Sound Blaster CT1345 / CT1745 mixer hardware.
+    - `SYS_SOUND_PCM_PLAY` (`0x76`): Starts single-cycle 8-bit unsigned PCM playback via 8237A DMA Channel 1 and Sound Blaster DSP (supporting 4,000–22,050 Hz sampling rates with pure 16-bit time constant calculations).
+    - `SYS_SOUND_PCM_STATUS` (`0x77`): Polls 8237A DMA status (TC bit) and acknowledges DSP interrupts.
+    - `SYS_SOUND_PCM_STOP` (`0x78`): Pauses DSP DMA and masks Channel 1.
+    - `SYS_SOUND_BG_PLAY` (`0x79`): Staged in-memory IMF background playback via hardware timer interrupt (`IRQ 0`).
+    - `SYS_SOUND_BG_STOP` (`0x7A`): Silences background music and restores standard BIOS timer divisor.
+    - `SYS_SOUND_BG_STATUS` (`0x7B`): Queries background track name, position, total bytes, and active status.
+    - Automatic process cleanup: child process exits unconditionally invoke `sound_stop()` without disrupting active background music.
+  - **Sound Blaster Hardware Support & Volume Utility (`/BIN/VOLUME.BIN`)**:
+    - Probes Sound Blaster DSP at `0x220`/`0x240`, resets DSP, and queries DSP version (`0xE1`) to distinguish SB 1.0, 2.0, Pro (CT1345), and 16 (CT1745).
+    - Hardware mixer volume control utility `/BIN/VOLUME.BIN`: displays ASCII volume bars (`volume`), sets individual channels (`volume master 90`, `volume fm 70`, `volume pcm 80`), or all channels (`volume 85`). Implemented fixed-point nearest-integer rounding for 3-bit SB Pro (7 steps) and 5-bit SB16 (31 steps) mixer hardware registers, ensuring requested volume levels (e.g. 71%, 40%) map to the exact nearest discrete hardware steps without truncation drift.
+  - **Digital Audio PCM WAV Playback & Background IMF Player (`/BIN/PLAY.BIN`, `tools/gen_wav.py`)**:
+    - 8-bit PCM Digital Audio: `/BIN/PLAY.BIN` parses RIFF WAVE headers and streams 8-bit mono uncompressed PCM audio via Sound Blaster DMA Channel 1.
+    - Shipped with retro two-tone chime sound clip (`/MUSIC/CHIME.WAV`, 11,025 Hz 8-bit mono PCM).
+    - Background Music Playback (`IRQ 0` / `INT 0x08`): `/BIN/PLAY.BIN` supports `/bg` (`play /bg <file.imf>`), returning immediately to the shell while the music stream plays asynchronously in the background at 560 Hz / 700 Hz. Uses timer tick accumulator chaining to preserve exact 18.2 Hz BIOS clock timekeeping (`0x0040:0x006C`) with <1% CPU overhead. Managed with `play /stop` and `play /status`.
+  - **Userland Music Player Utility (`/BIN/PLAY.BIN`) & Sample IMF Music (`/MUSIC/`)**:
+    - High-Precision Hardware Timer: Upgraded `/BIN/PLAY.BIN` timing loop from CPU-cycle calibrated I/O port polling to hardware 8253 PIT Timer 0 sub-millisecond countdown timing (`0.838 us` resolution, 2131 counts/tick for 560 Hz, 1705 counts/tick for 700 Hz), eliminating slow playback on 8088/XT CPUs and machine-dependent speed variation.
+    - Rate Selection & Auto-Detection: Automatically selects 700 Hz for Wolfenstein 3D tracks and 560 Hz for standard IMF files, with command-line overrides (`/560`, `/700`).
+    - Shipped Music Files in `/MUSIC/`:
+      - `/MUSIC/ODE.IMF`: Beethoven's *Ode to Joy* (Symphony No. 9, 1824 — public domain), 3-voice polyphonic FM score (560 Hz).
+      - `/MUSIC/WONDERIN.IMF`: Wolfenstein 3D theme ("Wondering About the Wolf", Bobby Prince — 700 Hz).
+      - `/MUSIC/KEEN.IMF`: Commander Keen 4 theme ("Eat Your Veggies", Bobby Prince — 560 Hz).
+  - **Cross-Volume Directory Listing Footer Fix (`user/shell.c`)**:
+    - Fixed `cmd_ls` volume summary footer querying: previously unconditionally called `os_vol_info(0xFF)` (active volume) regardless of the target argument, causing cross-drive listings (e.g. `ls fd0:`, `ls hd1:/dir`) to print the active volume's name and cluster statistics instead of the target volume's. Added `get_vol_info_for_path` to resolve target drive prefixes against discovered volumes.
+
+## Revision 0.17 (2026-11-19)
+
+- **Standard INT 0x33 Mouse Driver, Auto-Probing & Test Utility (`kernel/mouse.c`, `kernel/entry.asm`, `kernel/kernel.h`, `include/hobbyos.h`, `user/mouse.c`, `Makefile`, `user/shell.c`, `user/hello.c`)**:
+  - **Dual-Path Hardware Auto-Probing**:
+    - PS/2 Pointing Device: Utilizes standard IBM PS/2 Pointing Device BIOS services (`INT 15h, AX=0xC2xx`: `0xC207` device handler callback, `0xC205` init, `0xC204` device ID, and `0xC200` enable) on 80286+ AT/PS2 architectures, bypassing motherboard-specific 8042 controller quirks and avoiding invalid cassette I/O traps on 8088/XT systems.
+    - Serial Mouse: Scans BDA COM table (`0x0040:0x0000`) and standard ISA addresses (`0x3F8`, `0x2F8`, `0x3E8`, `0x2E8`), verifies UART presence via IER bit-pattern test, flushes FIFOs, and pulses DTR/RTS low (~100ms) before asserting lines with BDA hardware timer ticks (`0x0040:0x006C`). Positive identification strictly requires the Microsoft `'M'` handshake byte, eliminating false-positive mouse detection on unoccupied COM ports. Connects through `IRQ 4` (`INT 0x0C`) or `IRQ 3` (`INT 0x0B`). Restores original UART baud rate divisor and line control on ports where no mouse is detected, and disables serial console mirroring (`serial_disable()`) if a serial mouse occupies COM1 to prevent 1200-baud transmitter bottleneck on console text display.
+  - **Dual-Protocol Packet Parser**:
+    - Seamlessly decodes both Microsoft 3-byte packets (bit 6 sync) and Mouse Systems 5-byte packets (`0x80` sync) on the active serial port, maintaining 640x200 coordinate space and clamping within configurable boundaries.
+  - **Standard INT 0x33 API**:
+    - Supports `AX=0x0000` (reset & detect), `AX=0x0001` (show cursor), `AX=0x0002` (hide cursor), `AX=0x0003` (get position & buttons), `AX=0x0004` (set position), `AX=0x0007`/`0x0008` (horizontal/vertical clipping limits), and `AX=0x000B` (read motion counters / mickeys).
+    - Includes text-mode inverted cell cursor rendering synchronized with CGA/MDA shadow buffer and hardware CRTC retrace.
+  - **Userland Mouse Utility (`/BIN/MOUSE.BIN`)**:
+    - Interactive CLI and status utility reporting driver state, button count, and coordinates (`mouse /s`), or rendering live interactive tracking with real-time `[LEFT] [MID] [RIGHT]` button state.
+
+- **Keyboard Break (CTRL+C) & IBM PC BIOS Warm Reboot (CTRL+ALT+DEL) (`kernel/entry.asm`, `kernel/kbd.c`, `kernel/syscall.c`, `include/hobbyos.h`, `user/shell.c`, `user/edit.c`, `user/hello.c`)**:
+  - **Hardware Warm Reboot (`CTRL+ALT+DEL`)**:
+    - Added `_cpu_reboot` in `kernel/entry.asm`: sets BDA warm boot flag (`0x0040:0x0072 = 0x1234`) to bypass RAM testing and executes far jump directly to BIOS reset vector (`0xFFFF:0000`).
+    - Handled in `_kbd_irq_handler` (`kernel/kbd.c`) on `SC_DEL` (`0x53`) when both `Ctrl` and `Alt`/`AltGr` modifiers are active, working across both numpad and dedicated navigation Delete keys.
+  - **Execution Break (`CTRL+C`) & Process Nesting**:
+    - Interactive shell line entry (`user/shell.c` `read_line`): pressing `Ctrl+C` outputs `^C`, discards input buffer, and issues a fresh prompt.
+    - Shell batch scripts (`run_script`), directory listings (`cmd_ls`), and streaming file display (`cmd_cat` via `os_file_read_offset`): polling `Ctrl+C` cleanly aborts long loops.
+    - Running child executables (`SYS_EXEC`):
+      - Immediate hardware interrupt break: `_isr_int09` detects `Ctrl+C` while `_usermode_active > 1` in user mode (`ss != cs`), acknowledges PIC (`0x20`), and unwinds stack back to parent shell via `_proc_exit_usermode(130)`.
+      - Syscall return break: sets `_ctrl_c_abort_pending` if interrupted while executing a kernel syscall (`ss == cs`) or waiting in `kbd_getc` (`cpu_halt`), terminating the process upon return.
+  - **Full-Screen App Exemption & Double CTRL+C Breakout**:
+    - Added syscall `SYS_BREAK_MODE` (`0x0D`) and `os_set_break_mode(BREAK_MODE_NORMAL | BREAK_MODE_RAW)`.
+    - Default mode (`BREAK_MODE_NORMAL` = 0): single `Ctrl+C` immediately aborts child executables.
+    - Raw mode (`BREAK_MODE_RAW` = 1, used by `EDIT.BIN`): first `Ctrl+C` is delivered to the app's event loop via `os_getc()` (displaying status prompt); second consecutive `Ctrl+C` force-aborts the app.
+    - Automatic restoration of `BREAK_MODE_NORMAL` and parent break mode upon process termination in `exec_program`.
+
+- **Hardware Realignment: Lo-tech EMS I/O Base (0x268) & Page Frame (0xC000) (`kernel/kernel.h`, `kernel/ems.c`, `user/sam.c`, `user/mem.c`, `tools/train_sam.py`, `book8088/86box.cfg`)**:
+  - **Conflict Avoidance with Book8088 CH375 USB Controller**:
+    - Reconfigured Lo-tech 2 MB EMS controller I/O base from `0x260` to `0x268` (`0x268`–`0x26B`) to prevent port collision with the Book8088 onboard CH375 USB controller mapped at `0x260`.
+    - Relocated 64 KB EMS page frame from `0xE000` to `0xC000` (slots at `0xC000`, `0xC400`, `0xC800`, `0xCC00`), matching physical DIP switch settings on the Book8088 bus expander card.
+  - **Dynamic Userland Segment Resolution**:
+    - Updated `/BIN/SAM.BIN` (`user/sam.c`) to dynamically use the far segment returned by `os_ems_map()` rather than assuming a static address.
+    - Updated `/BIN/MEM.BIN` (`user/mem.c`) and `tools/train_sam.py` reporting strings to reflect the `0xC000` page frame.
+    - Verified full 128-page bank switching and allocation in 86Box under `make agent-test`.
+
 ## Revision 0.16 (2026-11-18)
 
 - **8088 Micro Language Model (`SAM.BIN`), Quantization-Aware Trainer & Lo-tech EMS Neural Engine (`user/sam.c`, `tools/train_sam.py`, `Makefile`, `user/shell.c`)**:

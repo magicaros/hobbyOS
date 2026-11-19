@@ -21,6 +21,8 @@
 #define SC_RSHIFT    0x36
 #define SC_LALT      0x38
 #define SC_CAPSLOCK  0x3A
+#define SC_C         0x2E
+#define SC_DEL       0x53
 #define SC_NUMLOCK   0x45
 #define SC_SCROLLOCK 0x46
 
@@ -93,6 +95,18 @@ static uint8_t mod_altgr    = 0;
 static uint8_t mod_capslock = 0;
 static uint8_t mod_numlock  = 0;
 
+static uint8_t kbd_break_mode   = BREAK_MODE_NORMAL;
+static uint8_t kbd_ctrl_c_count = 0;
+
+void kbd_set_break_mode(uint8_t mode) {
+    kbd_break_mode   = mode;
+    kbd_ctrl_c_count = 0;
+}
+
+uint8_t kbd_get_break_mode(void) {
+    return kbd_break_mode;
+}
+
 static void sync_bda_flags(void) {
     volatile uint8_t __far *bda_flags = (volatile uint8_t __far *)MK_FP(0x0040, 0x0017);
     uint8_t flags = 0;
@@ -127,12 +141,14 @@ void kbd_init(void) {
     mod_altgr    = 0;
     mod_capslock = 0;
     mod_numlock  = 0;
+    kbd_break_mode   = BREAK_MODE_NORMAL;
+    kbd_ctrl_c_count = 0;
     sync_bda_flags();
 
     kbd_install_vector();
 }
 
-void kbd_irq_handler(uint8_t raw) {
+uint8_t kbd_irq_handler(uint8_t raw) {
     uint8_t sc;
     uint8_t released;
     uint8_t ext;
@@ -141,11 +157,11 @@ void kbd_irq_handler(uint8_t raw) {
 
     if (raw == 0xE0) {
         e0_prefix = 1;
-        return;
+        return 0;
     }
     if (raw >= 0xE1) {
         e0_prefix = 0;
-        return;
+        return 0;
     }
 
     sc       = (uint8_t)(raw & 0x7F);
@@ -155,7 +171,7 @@ void kbd_irq_handler(uint8_t raw) {
 
     /* Ignore the fake Shift codes (E0 2A / E0 36) 101-key keyboards send around grey keys */
     if (ext && (sc == SC_LSHIFT || sc == SC_RSHIFT)) {
-        return;
+        return 0;
     }
 
     /* Update live 128-key press state bitmap */
@@ -169,17 +185,17 @@ void kbd_irq_handler(uint8_t raw) {
     if (sc == SC_LSHIFT) {
         mod_lshift = (uint8_t)!released;
         sync_bda_flags();
-        return;
+        return 0;
     }
     if (sc == SC_RSHIFT) {
         mod_rshift = (uint8_t)!released;
         sync_bda_flags();
-        return;
+        return 0;
     }
     if (sc == SC_LCTRL) {
         mod_ctrl = (uint8_t)!released;
         sync_bda_flags();
-        return;
+        return 0;
     }
     if (sc == SC_LALT) {
         if (ext) {
@@ -188,61 +204,94 @@ void kbd_irq_handler(uint8_t raw) {
             mod_alt = (uint8_t)!released;
         }
         sync_bda_flags();
-        return;
+        return 0;
     }
     if (sc == SC_CAPSLOCK) {
         if (!released) {
             mod_capslock ^= 1;
             sync_bda_flags();
         }
-        return;
+        return 0;
     }
     if (sc == SC_NUMLOCK) {
         if (!released) {
             mod_numlock ^= 1;
             sync_bda_flags();
         }
-        return;
+        return 0;
     }
     if (sc == SC_SCROLLOCK) {
-        return;
+        return 0;
     }
 
     /* Only enqueue character events on key press (make code) */
     if (released) {
-        return;
+        return 0;
     }
 
-    /* 1. AltGr / Alt layer (supports E0 RAlt, Ctrl+Alt, and XT Alt) */
-    if ((mod_altgr || mod_alt) && active_map.altgr[sc] != 0) {
-        ascii = active_map.altgr[sc];
+    /* 1. Check for CTRL+ALT+DEL warm reboot */
+    if (sc == SC_DEL && mod_ctrl && (mod_alt || mod_altgr)) {
+        cpu_reboot();
+        return 0;
     }
-    /* 2. Ctrl + letter -> ASCII control code 0x01..0x1A */
-    else if (mod_ctrl && !(mod_altgr || mod_alt)) {
-        uint8_t base = active_map.normal[sc];
-        if (base >= 'a' && base <= 'z') {
-            ascii = (uint8_t)(base - 'a' + 1);
-        } else if (base >= 'A' && base <= 'Z') {
-            ascii = (uint8_t)(base - 'A' + 1);
-        }
-    }
-    /* 3. Standard Normal / Shift / CapsLock / NumLock layers */
-    else {
-        uint8_t shift_active = (uint8_t)(mod_lshift || mod_rshift);
-        uint8_t use_shift;
 
-        /* Numpad cluster (0x47..0x53 except '-' 0x4A and '+' 0x4E) */
-        if (!ext && sc >= 0x47 && sc <= 0x53 && sc != 0x4A && sc != 0x4E) {
-            use_shift = (uint8_t)(shift_active ^ mod_numlock);
-        }
-        /* Alphabetic keys invert shift when CapsLock is active */
-        else if (active_map.normal[sc] >= 'a' && active_map.normal[sc] <= 'z') {
-            use_shift = (uint8_t)(shift_active ^ mod_capslock);
+    /* 2. Check for CTRL+C break */
+    if (sc == SC_C && mod_ctrl && !(mod_alt || mod_altgr)) {
+        if (get_usermode_active() > 1) {
+            if (kbd_break_mode == BREAK_MODE_NORMAL) {
+                con_puts("^C\n");
+                return 1; /* Abort child process */
+            } else {
+                /* BREAK_MODE_RAW: 1st Ctrl+C delivered to app; 2nd in a row breaks out */
+                kbd_ctrl_c_count++;
+                if (kbd_ctrl_c_count >= 2) {
+                    kbd_ctrl_c_count = 0;
+                    con_puts("^C\n");
+                    return 1; /* Abort child process */
+                }
+                ascii = 0x03;
+            }
         } else {
-            use_shift = shift_active;
+            /* Root shell or kernel prompt: queue ASCII 0x03 */
+            ascii = 0x03;
         }
+    } else {
+        /* Any other key resets the consecutive Ctrl+C counter */
+        kbd_ctrl_c_count = 0;
+    }
 
-        ascii = use_shift ? active_map.shift[sc] : active_map.normal[sc];
+    if (ascii == 0) {
+        /* 1. AltGr / Alt layer (supports E0 RAlt, Ctrl+Alt, and XT Alt) */
+        if ((mod_altgr || mod_alt) && active_map.altgr[sc] != 0) {
+            ascii = active_map.altgr[sc];
+        }
+        /* 2. Ctrl + letter -> ASCII control code 0x01..0x1A */
+        else if (mod_ctrl && !(mod_altgr || mod_alt)) {
+            uint8_t base = active_map.normal[sc];
+            if (base >= 'a' && base <= 'z') {
+                ascii = (uint8_t)(base - 'a' + 1);
+            } else if (base >= 'A' && base <= 'Z') {
+                ascii = (uint8_t)(base - 'A' + 1);
+            }
+        }
+        /* 3. Standard Normal / Shift / CapsLock / NumLock layers */
+        else {
+            uint8_t shift_active = (uint8_t)(mod_lshift || mod_rshift);
+            uint8_t use_shift;
+
+            /* Numpad cluster (0x47..0x53 except '-' 0x4A and '+' 0x4E) */
+            if (!ext && sc >= 0x47 && sc <= 0x53 && sc != 0x4A && sc != 0x4E) {
+                use_shift = (uint8_t)(shift_active ^ mod_numlock);
+            }
+            /* Alphabetic keys invert shift when CapsLock is active */
+            else if (active_map.normal[sc] >= 'a' && active_map.normal[sc] <= 'z') {
+                use_shift = (uint8_t)(shift_active ^ mod_capslock);
+            } else {
+                use_shift = shift_active;
+            }
+
+            ascii = use_shift ? active_map.shift[sc] : active_map.normal[sc];
+        }
     }
 
     next_head = (uint8_t)((kbd_head + 1) & (KBD_BUF_SIZE - 1));
@@ -250,6 +299,7 @@ void kbd_irq_handler(uint8_t raw) {
         kbd_buf[kbd_head] = ((uint16_t)sc << 8) | ascii;
         kbd_head = next_head;
     }
+    return 0;
 }
 
 int kbd_kbhit(void) {
@@ -259,7 +309,15 @@ int kbd_kbhit(void) {
 uint16_t kbd_getc(void) {
     uint16_t key;
     while (kbd_head == kbd_tail) {
+        if (ctrl_c_abort_pending && get_usermode_active() > 1) {
+            ctrl_c_abort_pending = 0;
+            proc_exit_usermode(130);
+        }
         cpu_halt();
+    }
+    if (ctrl_c_abort_pending && get_usermode_active() > 1) {
+        ctrl_c_abort_pending = 0;
+        proc_exit_usermode(130);
     }
     key = kbd_buf[kbd_tail];
     kbd_tail = (uint8_t)((kbd_tail + 1) & (KBD_BUF_SIZE - 1));

@@ -4,12 +4,10 @@
  *
  * user/sam.c - 8088-uLM ("Sam") Retro Language Model Engine
  * 4-bit quantized neural character LM running on Intel 8088 CPU @ 8 MHz.
- * Staged in Lo-tech 2MB EMS memory at 0xE000:0000 with conventional RAM fallback.
+ * Staged in Lo-tech 2MB EMS memory at 0xC000:0000 with conventional RAM fallback.
  */
 
 #include "hobbyos.h"
-
-#define MK_FP(seg, off) ((void __far *)(((uint32_t)(seg) << 16) | (uint16_t)(off)))
 
 #define MODEL_PATH_DEFAULT "/MODELS/SAM.MDL"
 #define MODEL_PATH_ALT     "SAM.MDL"
@@ -289,13 +287,14 @@ static int load_model(void) {
         int p0 = os_ems_alloc();
         int p1 = os_ems_alloc();
         if (p0 >= 0 && p1 >= 0) {
+            uint16_t seg0;
             s_ems_page0 = (uint16_t)p0;
             s_ems_page1 = (uint16_t)p1;
-            os_ems_map(0, s_ems_page0);
+            seg0 = os_ems_map(0, s_ems_page0);
             os_ems_map(1, s_ems_page1);
-            s_model = (const uint8_t __far *)MK_FP(0xE000, 0);
+            s_model = (const uint8_t __far *)MK_FP(seg0, 0);
             s_ems_active = 1;
-            os_puts("[SAM] Pristine 1980s SRAM engaged: 32 KB across 2 EMS pages at 0xE000.\n");
+            os_puts("[SAM] Pristine 1980s SRAM engaged: 32 KB across 2 EMS pages at 0xC000.\n");
         }
     }
 
