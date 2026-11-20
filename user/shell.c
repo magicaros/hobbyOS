@@ -62,6 +62,26 @@ static void print_uint32(uint32_t val) {
     }
 }
 
+static void print_uint32_padded(uint32_t val, int width) {
+    char buf[12];
+    int i = 0;
+    int pad;
+    if (val == 0) {
+        buf[i++] = '0';
+    } else {
+        while (val > 0 && i < 11) {
+            buf[i++] = (char)('0' + u32_div10(&val));
+        }
+    }
+    pad = width - i;
+    while (pad-- > 0) {
+        os_putc(' ');
+    }
+    while (i > 0) {
+        os_putc(buf[--i]);
+    }
+}
+
 static void print_uint16(uint16_t val) {
     char buf[8];
     int i = 0;
@@ -560,14 +580,70 @@ static void cmd_ls(const char *path) {
         }
         match_count++;
 
-        os_puts("  ");
-        os_puts(dent.name);
-        if (dent.attr & OS_ATTR_DIRECTORY) {
-            os_puts("\t<DIR>\n");
-        } else {
-            os_puts("\t");
-            print_uint32(dent.size);
-            os_puts(" B\n");
+        {
+            char base[9];
+            char ext[4];
+            int i, j, len;
+
+            /* Parse 8.3 filename into base (up to 8 chars) and ext (up to 3 chars) */
+            if (dent.name[0] == '.') {
+                base[0] = '.';
+                if (dent.name[1] == '.') {
+                    base[1] = '.';
+                    base[2] = '\0';
+                } else {
+                    base[1] = '\0';
+                }
+                ext[0] = '\0';
+            } else {
+                i = 0;
+                while (dent.name[i] && dent.name[i] != '.' && i < 8) {
+                    base[i] = dent.name[i];
+                    i++;
+                }
+                base[i] = '\0';
+
+                while (dent.name[i] && dent.name[i] != '.') {
+                    i++;
+                }
+                j = 0;
+                if (dent.name[i] == '.') {
+                    i++;
+                    while (dent.name[i] && j < 3) {
+                        ext[j++] = dent.name[i++];
+                    }
+                }
+                ext[j] = '\0';
+            }
+
+            os_puts("  ");
+            len = 0;
+            while (base[len]) {
+                os_putc(base[len++]);
+            }
+            while (len < 8) {
+                os_putc(' ');
+                len++;
+            }
+
+            os_putc(' ');
+
+            len = 0;
+            while (ext[len]) {
+                os_putc(ext[len++]);
+            }
+            while (len < 3) {
+                os_putc(' ');
+                len++;
+            }
+
+            os_puts("  ");
+            if (dent.attr & OS_ATTR_DIRECTORY) {
+                os_puts("     <DIR>\n");
+            } else {
+                print_uint32_padded(dent.size, 8);
+                os_puts(" B\n");
+            }
         }
     }
 
@@ -1512,7 +1588,7 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
         os_puts("          cat <file>, more [file], tree [path] [/f] [/a], write [-a] [file] \"<text>\",\n");
         os_puts("          cp <src> <dst>, mv <s> <d>, rm <p>, edit <file>, forth, volume, play,\n");
         os_puts("          set [VAR=VAL], echo [text|on|off], keyb [us|fr|be], mem, cls, format,\n");
-        os_puts("          fdisk, chkdsk, ramdisk, har, sam, gfxdemo, mouse, diskchange, <DEV:>\n");
+        os_puts("          fdisk, chkdsk, ramdisk, har, sam, gfxdemo, view, mouse, diskchange, <DEV:>\n");
         os_puts("Redirection: <cmd> > <file>, <cmd> >> <file>, <cmd> < <file>, <cmd1> | <cmd2>\n");
     } else if (str_eq(cmd, "set")) {
         cmd_set(rest);

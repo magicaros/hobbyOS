@@ -1,13 +1,44 @@
 # Changelog
 
-## Revision 1.0 (2026-11-19) — Kernel Feature Freeze & Book 8088 Hardware Parity
+## Revision 1.0.1 (2026-11-20)
 
-- **Kernel Feature Freeze**:
-  - The hobbyOS monolithic microkernel feature set is officially stabilized and frozen for the 1.0 milestone. All core architectural subsystems—pre-CPUID CPU detection, memory management (conventional MCB, Lo-tech 2MB EMS, XMS 2.0 extended memory), FAT12/16/16B storage volume manager, CGA/VGA/MDA graphics with snow-free double-buffered text, interrupt-driven PC/XT keyboard with hot-swappable keymaps, serial/PS/2 mouse on INT 0x33, unified OPL2/OPL3 FM sound with PC Speaker fallback, Sound Blaster CT1345/CT1745 hardware mixer and DMA Channel 1 PCM digital audio, and full in-kernel stream redirection (`SYS_REDIR`) with shell piping—are verified and stable on physical Book 8088 hardware and 86Box.
+- **Picture Viewer Utility with CGA, VGA & ZSoft PCX Support (`/BIN/VIEW.BIN`, `user/view.c`, `tools/gen_cga.py`, `tools/gen_pcx.py`, `tools/gen_vga.py`, `Makefile`)**:
+  - Implemented a dedicated retro graphics viewer (`VIEW.BIN`) designed for physical Book 8088 hardware and 86Box emulation.
+  - Queries video hardware type via `os_video_type()`; gracefully rejects execution with an informative message when run on IBM MDA adapters where graphics modes are unsupported.
+  - **ZSoft PCX Support (`.PCX`)**:
+    - Full 8-bit 256-color Mode 13h (320x200) PCX decoder (Version 5).
+    - Decodes RLE-compressed scanlines on the fly using a small 512-byte streaming buffer, streaming directly into physical VGA VRAM at `0xA000:0000` with minimal memory footprint.
+    - Reads the trailing 256-color palette block (`0x0C` marker + 768 RGB bytes) and programs the VGA DAC via direct I/O (`outb(0x3C8, 0)` and Port `0x3C9`).
+    - Added sample 256-color PCX generator (`tools/gen_pcx.py`) and bundled `/SAMPLE.PCX` on the system disk image.
+  - **Raw Mode 13h VGA Dumps (`.VGA`)**:
+    - Supports standard 64,768-byte dumps (64,000 bytes pixels + 768 bytes palette), 64,000-byte raw pixel dumps (using default BIOS palette), and 64,007-byte BSAVE format dumps.
+    - Added sample raw VGA generator (`tools/gen_vga.py`) and bundled `/SAMPLE.VGA` on the system disk image.
+  - **Hardware Verification for 256-Color Pictures**:
+    - When attempting to view `.PCX` or `.VGA` images on a system lacking VGA capability (e.g. CGA or MDA), `VIEW.BIN` detects the hardware and reports that a VGA adapter is required, displaying the detected hardware name.
+  - **Raw Interlaced CGA Picture Dumps (`.CGA`)**:
+    - Supports standard 320x200 4-color Mode 4 (`OS_MODE_CGA_320x200`) and 640x200 2-color Mode 6 (`OS_MODE_CGA_640x200` via `/6`).
+    - Automatically identifies dump formats based on file header and size: BSAVE format (7-byte header with `0xFD` marker at offset 0, even bank at offset 7, odd bank at offset 8,199), standard 16 KB unpadded/padded VRAM dumps (16,384 or 16,192 bytes: even bank at offset 0, odd bank at offset 8,192 / `0x2000`), and compact packed dumps (16,000 bytes: even bank at offset 0, odd bank at offset 8,000).
+    - Streams interleaved scanlines directly into physical CGA VRAM at `0xB800:0000` (even lines) and `0xB800:2000` (odd lines) via `os_file_read_offset`.
+  - **Interactive Viewer Controls**:
+    - Automatically detects adapter capability via `os_video_type()`: on VGA adapters where CGA intensity variation is not distinguishable, skips the low-intensity steps and directly cycles between the 3 main palettes (Palette 1 High, Palette 0 High, Palette 2 High), guaranteeing a distinct color change on every keypress.
+    - On CGA adapters, cycles through all 6 palette states (High and Normal variants of Palettes 1, 0, and 2).
+    - Supports initial palette selection via `/P:0|1|2` and intensity via `/I:0|1`.
+    - Pressing `B` cycles through 16 background colors in CGA mode.
+    - Pressing any key cleanly restores 80x25 text mode (`OS_MODE_TEXT_80x25`) and returns to the shell.
+- **Shell Directory Listing Alignment (`user/shell.c`)**:
+  - Replaced variable tab-stop formatting in `cmd_ls` with strict DOS-style 8.3 column alignment.
+  - Base filenames are space-padded to 8 characters, followed by a separator space and a 3-character space-padded extension column (handling special directories `.` and `..` seamlessly).
+  - Added `print_uint32_padded()` to right-align file sizes in an 8-character field followed by `" B"`.
+  - Subdirectories display `<DIR>` right-aligned in the same column, ensuring that every directory listing entry aligns into uniform columns regardless of filename length or console tab stop settings.
 - **Dynamic Multi-Cluster Subdirectory Growth Fix (`kernel/fat16.c`, `user/hello.c`)**:
   - Resolved a critical filesystem bug where subdirectories on all volumes (especially RAM disks with 1 sector/cluster) were hard-capped at 1 single cluster (14 files + `.` + `..` = 16 entries). When adding a 15th file into a full cluster, `find_free_dir_slot` returned an error instead of allocating and linking a new directory cluster.
   - Updated `find_free_dir_slot` to follow the directory cluster chain to the end, allocate a new cluster via `alloc_free_cluster`, link it in the FAT table, zero out all newly allocated directory sectors via `zero_cluster_sectors`, and return entry slot 0 of the new cluster.
   - Subdirectories on RAM disks, floppies, and hard disks can now dynamically grow to any number of clusters and hold arbitrary numbers of files. Verified via boot self-test writing 25 files to `RAM:/TESTDIR`.
+
+## Revision 1.0 (2026-11-19) — Kernel Feature Freeze & Book 8088 Hardware Parity
+
+- **Kernel Feature Freeze**:
+  - The hobbyOS monolithic microkernel feature set is officially stabilized and frozen for the 1.0 milestone. All core architectural subsystems—pre-CPUID CPU detection, memory management (conventional MCB, Lo-tech 2MB EMS, XMS 2.0 extended memory), FAT12/16/16B storage volume manager, CGA/VGA/MDA graphics with snow-free double-buffered text, interrupt-driven PC/XT keyboard with hot-swappable keymaps, serial/PS/2 mouse on INT 0x33, unified OPL2/OPL3 FM sound with PC Speaker fallback, Sound Blaster CT1345/CT1745 hardware mixer and DMA Channel 1 PCM digital audio, and full in-kernel stream redirection (`SYS_REDIR`) with shell piping—are verified and stable on physical Book 8088 hardware and 86Box.
 - **Book 8088 CGA LCD Mode-Switch Boundary Sync (`VIDSYNC`) & Multi-Drive Shell Fixes (`kernel/entry.asm`, `kernel/gfx.c`, `kernel/syscall.c`, `include/hobbyos.h`, `user/vidsync.c`, `user/shell.c`, `Makefile`)**:
   - **NEC V20 / V30 CPU Detection Fix (`kernel/entry.asm`)**:
     - Replaced previous checks with the classic and robust `AAD 0x10` data modification check. On Intel 8088/8086 silicon and emulators, `AAD imm8` calculates `AL = (AH * imm8) + AL` (using base 16: `0x01 * 0x10 + 0x01 = 0x11`). On NEC V20/V30, the processor strictly ignores the immediate operand and hardcodes base 10 (`0x01 * 0x0A + 0x01 = 0x0B`). This correctly distinguishes Intel 8088 from NEC V20 across both real hardware and emulators like 86Box without false positives.
