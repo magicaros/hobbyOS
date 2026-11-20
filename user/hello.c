@@ -169,6 +169,39 @@ int app_main(void) {
         }
     }
 
+    /* Test RAM disk subdirectory extension (more than 16 entries in 1-sector/cluster directory) */
+    {
+        uint16_t msize = 0;
+        if (os_ramdisk_mount(RAMDISK_TYPE_EMS, 128, (uint16_t __far *)FP_HERE(&msize)) == 0) {
+            int r = os_mkdir("RAM:/TESTDIR");
+            int all_ok = (r == 0);
+            int f;
+            char fname[24];
+            char tdata[16];
+            tdata[0] = 'T'; tdata[1] = 'E'; tdata[2] = 'S'; tdata[3] = 'T'; tdata[4] = '\0';
+            for (f = 0; f < 25; f++) {
+                fname[0] = 'R'; fname[1] = 'A'; fname[2] = 'M'; fname[3] = ':';
+                fname[4] = '/'; fname[5] = 'T'; fname[6] = 'E'; fname[7] = 'S';
+                fname[8] = 'T'; fname[9] = 'D'; fname[10] = 'I'; fname[11] = 'R';
+                fname[12] = '/'; fname[13] = 'F';
+                fname[14] = (char)('0' + (f / 10));
+                fname[15] = (char)('0' + (f % 10));
+                fname[16] = '.'; fname[17] = 'T'; fname[18] = 'X'; fname[19] = 'T';
+                fname[20] = '\0';
+                if (os_file_write(fname, (const void __far *)FP_HERE(tdata), 4) == 0xFFFF) {
+                    all_ok = 0;
+                    break;
+                }
+            }
+            if (all_ok) {
+                os_puts("[USER APP] RAM disk multi-cluster subdirectory (25 files in RAM:/TESTDIR) verified OK\n");
+            } else {
+                os_puts("[USER APP] RAM disk multi-cluster subdirectory FAILED\n");
+            }
+            os_ramdisk_unmount();
+        }
+    }
+
     /* List FAT16 Root Directory contents via SYS_DIR_ENTRY */
     os_puts("[USER APP] FAT16 Root Directory:\n");
     for (idx = 0; os_dir_entry((uint16_t)idx, (os_dir_entry_t __far *)FP_HERE(&dent)) == 0; idx++) {

@@ -305,6 +305,9 @@ static os_volume_t *resolve_vol_alias(os_volume_t *vol) {
     return vol;
 }
 
+static uint16_t alloc_free_cluster(os_volume_t *vol, uint16_t start_hint);
+static int      zero_cluster_sectors(os_volume_t *vol, uint16_t cluster);
+
 static char to_upper(char c) {
     if (c >= 'a' && c <= 'z') {
         return (char)(c - ('a' - 'A'));
@@ -888,6 +891,51 @@ static int find_free_dir_slot(os_volume_t *vol, uint16_t dir_cluster, uint32_t *
             }
         }
     }
+
+    /*
+     * If all existing directory slots are occupied:
+     * - Root directory (dir_cluster == 0) cannot be expanded on FAT12/FAT16.
+     * - Subdirectories (dir_cluster >= 2) can grow by allocating a new cluster.
+     */
+    if (dir_cluster >= 2) {
+        uint16_t last_clus = dir_cluster;
+        uint16_t new_clus;
+
+        /* Traverse to end of directory cluster chain */
+        while (1) {
+            uint16_t next = fat_get_cluster(vol, last_clus);
+            if (next < 2 || is_eof_cluster(vol, next)) {
+                break;
+            }
+            last_clus = next;
+        }
+
+        /* Allocate a free cluster for directory extension */
+        new_clus = alloc_free_cluster(vol, last_clus + 1);
+        if (new_clus == 0) {
+            return -1; /* Volume is full */
+        }
+
+        /* Link previous cluster to new cluster in FAT */
+        if (fat_set_cluster(vol, last_clus, new_clus) != 0) {
+            fat_set_cluster(vol, new_clus, 0x0000);
+            return -1;
+        }
+
+        /* Zero out all sectors of the new directory cluster */
+        if (zero_cluster_sectors(vol, new_clus) != 0) {
+            return -1;
+        }
+
+        if (fat_flush() != 0) {
+            return -1;
+        }
+
+        *out_sec_lba = cluster_to_lba(vol, new_clus);
+        *out_idx     = 0;
+        return 0;
+    }
+
     return -1;
 }
 
