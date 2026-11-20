@@ -11,16 +11,14 @@
 
 #include <hobbyos.h>
 
-#define MK_FP(seg, off) ((void __far *)(((uint32_t)(seg) << 16) | (uint16_t)(off)))
-
-#define HAR_MAGIC       "HAR1"
+#define HAR_MAGIC       "HAR2"
 #define HAR_ENTRY_MAGIC "HF"
 #define HAR_END_MAGIC   "HE"
 
 #define HAR_FLAG_COMPRESSED 0x0001
 
-#define BUF_PARAS_48K   3072  /* 48 KB = 49,152 bytes */
-#define BUF_BYTES_48K   49152U
+#define BUF_PARAS_32K   2048  /* 32 KB = 32,768 bytes */
+#define BUF_BYTES_32K   32768U
 #define HASH_PARAS_8K   512   /* 8 KB hash table */
 
 #define HASH_LOG        12
@@ -30,8 +28,8 @@
 #pragma pack(push, 1)
 
 typedef struct {
-    char     magic[4];      /* "HAR1" */
-    uint16_t version;       /* 1 */
+    char     magic[4];      /* "HAR1" or "HAR2" */
+    uint16_t version;       /* 1 or 2 */
     uint16_t flags;         /* Reserved */
 } har_header_t;
 
@@ -44,6 +42,11 @@ typedef struct {
     uint16_t flags;         /* Bit 0: HAR_FLAG_COMPRESSED */
     uint16_t crc;           /* CRC16 of uncompressed data */
 } har_entry_t;
+
+typedef struct {
+    uint16_t comp_len;      /* Compressed payload length in bytes */
+    uint16_t raw_len;       /* Uncompressed chunk length in bytes */
+} har_chunk_hdr_t;
 
 typedef struct {
     char     magic[2];      /* "HE" */
@@ -136,8 +139,7 @@ static void print_hex16(uint16_t val) {
     os_putc(hex[val & 0x0F]);
 }
 
-static uint16_t har_crc16(const uint8_t __far *buf, uint16_t len) {
-    uint16_t crc = 0xFFFF;
+static uint16_t har_crc16_update(uint16_t crc, const uint8_t __far *buf, uint16_t len) {
     uint16_t i;
     for (i = 0; i < len; i++) {
         uint8_t b = buf[i];
@@ -152,6 +154,10 @@ static uint16_t har_crc16(const uint8_t __far *buf, uint16_t len) {
         }
     }
     return crc;
+}
+
+static uint16_t har_crc16(const uint8_t __far *buf, uint16_t len) {
+    return har_crc16_update(0xFFFF, buf, len);
 }
 
 static uint16_t lz4_hash(uint16_t w0, uint16_t w1) {
@@ -518,7 +524,7 @@ static void print_usage(void) {
     uint16_t free_xms = os_xms_avail();
     uint16_t tot_xms  = os_xms_total();
 
-    os_puts("HobbyOS Archiver (HAR) v1.0 - LZ4 Block Compression\n");
+    os_puts("HobbyOS Archiver (HAR) v2.0 - Chunked LZ4 Streaming\n");
     os_puts("Usage:\n");
     os_puts("  har -c <archive.har> <files|dirs...>  Create archive (recursive dirs & wildcards)\n");
     os_puts("  har -a <archive.har> <files|dirs...>  Append files/dirs to archive\n");
@@ -553,8 +559,8 @@ static uint8_t __far *comp_buf = 0;
 static uint16_t __far *hash_tbl = 0;
 
 static int alloc_buffers(void) {
-    raw_seg = os_mem_alloc(BUF_PARAS_48K);
-    comp_seg = os_mem_alloc(BUF_PARAS_48K);
+    raw_seg = os_mem_alloc(BUF_PARAS_32K);
+    comp_seg = os_mem_alloc(BUF_PARAS_32K);
     hash_seg = os_mem_alloc(HASH_PARAS_8K);
 
     if (!raw_seg || !comp_seg || !hash_seg) {
@@ -583,10 +589,6 @@ static int append_single_file(const char *arc_name, const char *file_path,
 {
     uint8_t name_len;
     long sz;
-    uint16_t read_bytes;
-    uint16_t comp_bytes = 0;
-    uint16_t is_comp = 0;
-    uint16_t crc;
     har_entry_t entry;
     uint8_t hdr_buf[80];
     uint16_t i;
@@ -604,88 +606,208 @@ static int append_single_file(const char *arc_name, const char *file_path,
         os_putc('\n');
         return -1;
     }
-    if (sz > (long)BUF_BYTES_48K) {
-        os_puts("Warning: File exceeds 48 KB limit: ");
-        os_puts(file_path);
-        os_putc('\n');
-        return -1;
-    }
 
-    read_bytes = 0;
-    if (sz > 0) {
-        uint16_t r = os_file_read(file_path, raw_buf, (uint16_t)sz);
-        if (r == 0xFFFF || r != (uint16_t)sz) {
-            os_puts("Error reading: ");
-            os_puts(file_path);
-            os_putc('\n');
-            return -1;
-        }
-        read_bytes = r;
-    }
+    if (sz <= (long)BUF_BYTES_32K) {
+        uint16_t read_bytes = (uint16_t)sz;
+        uint16_t comp_bytes = 0;
+        uint16_t is_comp = 0;
+        uint16_t crc = 0xFFFF;
+        har_chunk_hdr_t chk;
 
-    crc = har_crc16(raw_buf, read_bytes);
+        if (read_bytes > 0) {
+            uint16_t r = os_file_read(file_path, raw_buf, read_bytes);
+            if (r == 0xFFFF || r != read_bytes) {
+                os_puts("Error reading: ");
+                os_puts(file_path);
+                os_putc('\n');
+                return -1;
+            }
+            crc = har_crc16(raw_buf, read_bytes);
 
-    if (read_bytes > 12) {
-        comp_bytes = lz4_compress_block(raw_buf, read_bytes, comp_buf, BUF_BYTES_48K, hash_tbl);
-        if (comp_bytes > 0 && comp_bytes < read_bytes) {
-            is_comp = 1;
+            if (read_bytes > 12) {
+                comp_bytes = lz4_compress_block(raw_buf, read_bytes, comp_buf, BUF_BYTES_32K, hash_tbl);
+                if (comp_bytes > 0 && comp_bytes < read_bytes) {
+                    is_comp = 1;
+                } else {
+                    is_comp = 0;
+                    comp_bytes = read_bytes;
+                }
+            } else {
+                is_comp = 0;
+                comp_bytes = read_bytes;
+            }
+            chk.comp_len = comp_bytes;
+            chk.raw_len  = read_bytes;
+            entry.comp_size = (uint32_t)sizeof(har_chunk_hdr_t) + comp_bytes;
         } else {
-            is_comp = 0;
-            comp_bytes = read_bytes;
+            entry.comp_size = 0;
         }
-    } else {
-        is_comp = 0;
-        comp_bytes = read_bytes;
-    }
 
-    entry.magic[0]    = 'H';
-    entry.magic[1]    = 'F';
-    entry.attr        = OS_ATTR_ARCHIVE;
-    entry.name_len    = name_len;
-    entry.uncomp_size = read_bytes;
-    entry.comp_size   = comp_bytes;
-    entry.flags       = is_comp ? HAR_FLAG_COMPRESSED : 0;
-    entry.crc         = crc;
+        entry.magic[0]    = 'H';
+        entry.magic[1]    = 'F';
+        entry.attr        = OS_ATTR_ARCHIVE;
+        entry.name_len    = name_len;
+        entry.uncomp_size = read_bytes;
+        entry.flags       = is_comp ? HAR_FLAG_COMPRESSED : 0;
+        entry.crc         = crc;
 
-    for (i = 0; i < sizeof(har_entry_t); i++) {
-        hdr_buf[i] = ((const uint8_t *)&entry)[i];
-    }
-    for (i = 0; i < name_len; i++) {
-        hdr_buf[sizeof(har_entry_t) + i] = (uint8_t)arc_path[i];
-    }
+        for (i = 0; i < sizeof(har_entry_t); i++) {
+            hdr_buf[i] = ((const uint8_t *)&entry)[i];
+        }
+        for (i = 0; i < name_len; i++) {
+            hdr_buf[sizeof(har_entry_t) + i] = (uint8_t)arc_path[i];
+        }
 
-    if (os_file_append(arc_name, (const void __far *)hdr_buf, sizeof(har_entry_t) + name_len) != sizeof(har_entry_t) + name_len) {
-        os_puts("Error appending entry header to ");
-        os_puts(arc_name);
-        os_putc('\n');
-        return -1;
-    }
-
-    if (comp_bytes > 0) {
-        const void __far *payload = is_comp ? (const void __far *)comp_buf : (const void __far *)raw_buf;
-        if (os_file_append(arc_name, payload, comp_bytes) != comp_bytes) {
-            os_puts("Error appending payload to ");
+        if (os_file_append(arc_name, (const void __far *)hdr_buf, sizeof(har_entry_t) + name_len) != sizeof(har_entry_t) + name_len) {
+            os_puts("Error appending entry header to ");
             os_puts(arc_name);
             os_putc('\n');
             return -1;
         }
+
+        if (read_bytes > 0) {
+            const void __far *payload = is_comp ? (const void __far *)comp_buf : (const void __far *)raw_buf;
+            if (os_file_append(arc_name, (const void __far *)&chk, sizeof(har_chunk_hdr_t)) != sizeof(har_chunk_hdr_t) ||
+                os_file_append(arc_name, payload, comp_bytes) != comp_bytes)
+            {
+                os_puts("Error appending payload to ");
+                os_puts(arc_name);
+                os_putc('\n');
+                return -1;
+            }
+        }
+    } else {
+        /* Multi-chunk streaming via temporary staging file */
+        const char *tmp_name = "_HARTMP.$$$";
+        uint32_t in_offset = 0;
+        uint32_t total_comp_payload = 0;
+        uint16_t crc = 0xFFFF;
+        int any_compressed = 0;
+
+        os_file_delete(tmp_name);
+
+        while (in_offset < (uint32_t)sz) {
+            uint16_t to_read = (sz - in_offset > (long)BUF_BYTES_32K) ? BUF_BYTES_32K : (uint16_t)(sz - in_offset);
+            uint16_t r = os_file_read_offset(file_path, raw_buf, to_read, in_offset);
+            uint16_t comp_bytes = 0;
+            uint16_t is_comp = 0;
+            har_chunk_hdr_t chk;
+            const void __far *payload;
+
+            if (r == 0xFFFF || r != to_read) {
+                os_puts("Error reading: ");
+                os_puts(file_path);
+                os_putc('\n');
+                os_file_delete(tmp_name);
+                return -1;
+            }
+
+            crc = har_crc16_update(crc, raw_buf, r);
+
+            if (r > 12) {
+                comp_bytes = lz4_compress_block(raw_buf, r, comp_buf, BUF_BYTES_32K, hash_tbl);
+                if (comp_bytes > 0 && comp_bytes < r) {
+                    is_comp = 1;
+                    any_compressed = 1;
+                } else {
+                    is_comp = 0;
+                    comp_bytes = r;
+                }
+            } else {
+                is_comp = 0;
+                comp_bytes = r;
+            }
+
+            chk.comp_len = comp_bytes;
+            chk.raw_len  = r;
+            payload = is_comp ? (const void __far *)comp_buf : (const void __far *)raw_buf;
+
+            if (in_offset == 0) {
+                if (os_file_write(tmp_name, (const void __far *)&chk, sizeof(har_chunk_hdr_t)) != sizeof(har_chunk_hdr_t)) {
+                    os_puts("Error creating temporary staging file.\n");
+                    os_file_delete(tmp_name);
+                    return -1;
+                }
+            } else {
+                if (os_file_append(tmp_name, (const void __far *)&chk, sizeof(har_chunk_hdr_t)) != sizeof(har_chunk_hdr_t)) {
+                    os_puts("Error appending to temporary staging file.\n");
+                    os_file_delete(tmp_name);
+                    return -1;
+                }
+            }
+
+            if (os_file_append(tmp_name, payload, comp_bytes) != comp_bytes) {
+                os_puts("Error appending payload to temporary staging file.\n");
+                os_file_delete(tmp_name);
+                return -1;
+            }
+
+            total_comp_payload += (uint32_t)sizeof(har_chunk_hdr_t) + comp_bytes;
+            in_offset += r;
+        }
+
+        entry.magic[0]    = 'H';
+        entry.magic[1]    = 'F';
+        entry.attr        = OS_ATTR_ARCHIVE;
+        entry.name_len    = name_len;
+        entry.uncomp_size = (uint32_t)sz;
+        entry.comp_size   = total_comp_payload;
+        entry.flags       = any_compressed ? HAR_FLAG_COMPRESSED : 0;
+        entry.crc         = crc;
+
+        for (i = 0; i < sizeof(har_entry_t); i++) {
+            hdr_buf[i] = ((const uint8_t *)&entry)[i];
+        }
+        for (i = 0; i < name_len; i++) {
+            hdr_buf[sizeof(har_entry_t) + i] = (uint8_t)arc_path[i];
+        }
+
+        if (os_file_append(arc_name, (const void __far *)hdr_buf, sizeof(har_entry_t) + name_len) != sizeof(har_entry_t) + name_len) {
+            os_puts("Error appending entry header to ");
+            os_puts(arc_name);
+            os_putc('\n');
+            os_file_delete(tmp_name);
+            return -1;
+        }
+
+        /* Stream temporary file into archive */
+        {
+            uint32_t tmp_off = 0;
+            while (tmp_off < total_comp_payload) {
+                uint16_t tr = (total_comp_payload - tmp_off > (uint32_t)BUF_BYTES_32K) ?
+                               BUF_BYTES_32K : (uint16_t)(total_comp_payload - tmp_off);
+                uint16_t r = os_file_read_offset(tmp_name, raw_buf, tr, tmp_off);
+                if (r == 0xFFFF || r != tr) {
+                    os_puts("Error streaming temporary payload to archive.\n");
+                    os_file_delete(tmp_name);
+                    return -1;
+                }
+                if (os_file_append(arc_name, (const void __far *)raw_buf, r) != r) {
+                    os_puts("Error writing payload to archive.\n");
+                    os_file_delete(tmp_name);
+                    return -1;
+                }
+                tmp_off += r;
+            }
+        }
+        os_file_delete(tmp_name);
     }
 
     os_puts("  Adding: ");
     os_puts(arc_path);
     os_puts(" (");
-    print_uint32(read_bytes);
+    print_uint32((uint32_t)sz);
     os_puts(" -> ");
-    print_uint32(comp_bytes);
+    print_uint32(entry.comp_size);
     os_puts(" bytes, ");
-    if (read_bytes > 0) {
-        uint16_t ratio = calc_ratio(comp_bytes, read_bytes);
+    if (sz > 0) {
+        uint16_t ratio = calc_ratio(entry.comp_size, (uint32_t)sz);
         print_uint32(ratio);
         os_puts("% ");
     } else {
         os_puts("0% ");
     }
-    os_puts(is_comp ? "LZ4)\n" : "stored)\n");
+    os_puts((entry.flags & HAR_FLAG_COMPRESSED) ? "LZ4)\n" : "stored)\n");
 
     (*total_count)++;
     return 0;
@@ -772,8 +894,8 @@ static int cmd_create(const char *arc_name, int num_files, const char **files) {
     hdr.magic[0] = 'H';
     hdr.magic[1] = 'A';
     hdr.magic[2] = 'R';
-    hdr.magic[3] = '1';
-    hdr.version  = 1;
+    hdr.magic[3] = '2';
+    hdr.version  = 2;
     hdr.flags    = 0;
 
     if (os_file_write(arc_name, (const void __far *)&hdr, sizeof(har_header_t)) != sizeof(har_header_t)) {
@@ -823,8 +945,16 @@ static int cmd_append(const char *arc_name, int num_files, const char **files) {
         return 1;
     }
 
-    if (hdr.magic[0] != 'H' || hdr.magic[1] != 'A' || hdr.magic[2] != 'R' || hdr.magic[3] != '1') {
+    if (hdr.magic[0] != 'H' || hdr.magic[1] != 'A' || hdr.magic[2] != 'R') {
         os_puts("Error: Not a valid HAR archive.\n");
+        return 1;
+    }
+    if (hdr.magic[3] == '1' || hdr.version == 1) {
+        os_puts("Error: Cannot append to legacy HAR1 archive. Please recreate with 'har -c'.\n");
+        return 1;
+    }
+    if (hdr.magic[3] != '2' && hdr.version != 2) {
+        os_puts("Error: Unsupported HAR archive version.\n");
         return 1;
     }
 
@@ -854,6 +984,7 @@ static int cmd_list_or_test(const char *arc_name, int is_test) {
     uint32_t total_uncomp = 0;
     uint32_t total_comp = 0;
     int has_errors = 0;
+    int is_har1 = 0;
 
     arc_sz = os_file_size(arc_name);
     if (arc_sz < (long)sizeof(har_header_t)) {
@@ -871,8 +1002,18 @@ static int cmd_list_or_test(const char *arc_name, int is_test) {
         return 1;
     }
 
-    if (hdr.magic[0] != 'H' || hdr.magic[1] != 'A' || hdr.magic[2] != 'R' || hdr.magic[3] != '1') {
+    if (hdr.magic[0] != 'H' || hdr.magic[1] != 'A' || hdr.magic[2] != 'R') {
         os_puts("Error: Not a valid HAR archive (invalid magic).\n");
+        free_buffers();
+        return 1;
+    }
+
+    if (hdr.magic[3] == '1' || hdr.version == 1) {
+        is_har1 = 1;
+    } else if (hdr.magic[3] == '2' || hdr.version == 2) {
+        is_har1 = 0;
+    } else {
+        os_puts("Error: Unsupported HAR archive version.\n");
         free_buffers();
         return 1;
     }
@@ -917,34 +1058,82 @@ static int cmd_list_or_test(const char *arc_name, int is_test) {
         offset += entry.name_len;
 
         if (is_test) {
-            uint16_t crc_calc = 0;
+            uint16_t crc_calc = 0xFFFF;
             int ok = 1;
 
             os_puts("Testing: ");
             os_puts(name_buf);
 
-            if (entry.comp_size > BUF_BYTES_48K) {
-                os_puts(" - FAILED (payload exceeds 48 KB buffer)\n");
-                ok = 0;
-                has_errors = 1;
-            } else if (entry.comp_size > 0) {
-                r = os_file_read_offset(arc_name, comp_buf, (uint16_t)entry.comp_size, offset);
-                if ((uint16_t)r != (uint16_t)entry.comp_size) {
-                    os_puts(" - FAILED (read error)\n");
+            if (is_har1) {
+                if (entry.comp_size > BUF_BYTES_32K) {
+                    os_puts(" - FAILED (payload exceeds buffer)\n");
                     ok = 0;
                     has_errors = 1;
-                } else if (entry.flags & HAR_FLAG_COMPRESSED) {
-                    uint16_t dlen = lz4_decompress_block(comp_buf, (uint16_t)entry.comp_size,
-                                                        raw_buf, BUF_BYTES_48K);
-                    if (dlen != (uint16_t)entry.uncomp_size) {
-                        os_puts(" - FAILED (decompression size mismatch)\n");
+                } else if (entry.comp_size > 0) {
+                    r = os_file_read_offset(arc_name, comp_buf, (uint16_t)entry.comp_size, offset);
+                    if ((uint16_t)r != (uint16_t)entry.comp_size) {
+                        os_puts(" - FAILED (read error)\n");
                         ok = 0;
                         has_errors = 1;
+                    } else if (entry.flags & HAR_FLAG_COMPRESSED) {
+                        uint16_t dlen = lz4_decompress_block(comp_buf, (uint16_t)entry.comp_size,
+                                                            raw_buf, BUF_BYTES_32K);
+                        if (dlen != (uint16_t)entry.uncomp_size) {
+                            os_puts(" - FAILED (decompression size mismatch)\n");
+                            ok = 0;
+                            has_errors = 1;
+                        } else {
+                            crc_calc = har_crc16(raw_buf, dlen);
+                        }
                     } else {
-                        crc_calc = har_crc16(raw_buf, dlen);
+                        crc_calc = har_crc16(comp_buf, (uint16_t)entry.comp_size);
                     }
-                } else {
-                    crc_calc = har_crc16(comp_buf, (uint16_t)entry.comp_size);
+                }
+            } else {
+                /* HAR2 chunked streaming verification */
+                uint32_t bytes_done = 0;
+                uint32_t payload_off = offset;
+
+                while (bytes_done < entry.uncomp_size) {
+                    har_chunk_hdr_t chk;
+                    r = os_file_read_offset(arc_name, (void __far *)&chk, sizeof(har_chunk_hdr_t), payload_off);
+                    if (r < (int)sizeof(har_chunk_hdr_t)) {
+                        os_puts(" - FAILED (chunk header read error)\n");
+                        ok = 0;
+                        has_errors = 1;
+                        break;
+                    }
+                    payload_off += sizeof(har_chunk_hdr_t);
+
+                    if (chk.comp_len > BUF_BYTES_32K) {
+                        os_puts(" - FAILED (chunk size exceeds buffer)\n");
+                        ok = 0;
+                        has_errors = 1;
+                        break;
+                    }
+
+                    r = os_file_read_offset(arc_name, comp_buf, chk.comp_len, payload_off);
+                    if ((uint16_t)r != chk.comp_len) {
+                        os_puts(" - FAILED (chunk payload read error)\n");
+                        ok = 0;
+                        has_errors = 1;
+                        break;
+                    }
+                    payload_off += chk.comp_len;
+
+                    if (chk.comp_len < chk.raw_len) {
+                        uint16_t dlen = lz4_decompress_block(comp_buf, chk.comp_len, raw_buf, BUF_BYTES_32K);
+                        if (dlen != chk.raw_len) {
+                            os_puts(" - FAILED (decompression error)\n");
+                            ok = 0;
+                            has_errors = 1;
+                            break;
+                        }
+                        crc_calc = har_crc16_update(crc_calc, raw_buf, dlen);
+                    } else {
+                        crc_calc = har_crc16_update(crc_calc, comp_buf, chk.raw_len);
+                    }
+                    bytes_done += chk.raw_len;
                 }
             }
 
@@ -1013,6 +1202,7 @@ static int cmd_extract(const char *arc_name, const char *dest_dir) {
     uint32_t offset = 0;
     uint16_t total_extracted = 0;
     int has_errors = 0;
+    int is_har1 = 0;
 
     arc_sz = os_file_size(arc_name);
     if (arc_sz < (long)sizeof(har_header_t)) {
@@ -1030,8 +1220,18 @@ static int cmd_extract(const char *arc_name, const char *dest_dir) {
         return 1;
     }
 
-    if (hdr.magic[0] != 'H' || hdr.magic[1] != 'A' || hdr.magic[2] != 'R' || hdr.magic[3] != '1') {
+    if (hdr.magic[0] != 'H' || hdr.magic[1] != 'A' || hdr.magic[2] != 'R') {
         os_puts("Error: Not a valid HAR archive.\n");
+        free_buffers();
+        return 1;
+    }
+
+    if (hdr.magic[3] == '1' || hdr.version == 1) {
+        is_har1 = 1;
+    } else if (hdr.magic[3] == '2' || hdr.version == 2) {
+        is_har1 = 0;
+    } else {
+        os_puts("Error: Unsupported HAR archive version.\n");
         free_buffers();
         return 1;
     }
@@ -1050,7 +1250,6 @@ static int cmd_extract(const char *arc_name, const char *dest_dir) {
         har_entry_t entry;
         char name_buf[65];
         char out_path[96];
-        uint16_t crc_calc = 0;
         int r;
 
         if (offset >= (uint32_t)arc_sz) break;
@@ -1082,43 +1281,135 @@ static int cmd_extract(const char *arc_name, const char *dest_dir) {
         os_puts("  Extracting: ");
         os_puts(name_buf);
 
-        if (entry.comp_size > BUF_BYTES_48K) {
-            os_puts(" - FAILED (payload exceeds 48 KB buffer)\n");
-            has_errors = 1;
-        } else {
-            if (entry.comp_size > 0) {
-                r = os_file_read_offset(arc_name, comp_buf, (uint16_t)entry.comp_size, offset);
-                if ((uint16_t)r != (uint16_t)entry.comp_size) {
-                    os_puts(" - FAILED (read error)\n");
-                    has_errors = 1;
-                    offset += entry.comp_size;
-                    continue;
-                }
-
-                if (entry.flags & HAR_FLAG_COMPRESSED) {
-                    uint16_t dlen = lz4_decompress_block(comp_buf, (uint16_t)entry.comp_size,
-                                                        raw_buf, BUF_BYTES_48K);
-                    if (dlen != (uint16_t)entry.uncomp_size) {
-                        os_puts(" - FAILED (decompression error)\n");
+        if (is_har1) {
+            uint16_t crc_calc = 0xFFFF;
+            if (entry.comp_size > BUF_BYTES_32K) {
+                os_puts(" - FAILED (payload exceeds buffer)\n");
+                has_errors = 1;
+            } else {
+                if (entry.comp_size > 0) {
+                    r = os_file_read_offset(arc_name, comp_buf, (uint16_t)entry.comp_size, offset);
+                    if ((uint16_t)r != (uint16_t)entry.comp_size) {
+                        os_puts(" - FAILED (read error)\n");
                         has_errors = 1;
                         offset += entry.comp_size;
                         continue;
                     }
-                    crc_calc = har_crc16(raw_buf, dlen);
+
+                    if (entry.flags & HAR_FLAG_COMPRESSED) {
+                        uint16_t dlen = lz4_decompress_block(comp_buf, (uint16_t)entry.comp_size,
+                                                            raw_buf, BUF_BYTES_32K);
+                        if (dlen != (uint16_t)entry.uncomp_size) {
+                            os_puts(" - FAILED (decompression error)\n");
+                            has_errors = 1;
+                            offset += entry.comp_size;
+                            continue;
+                        }
+                        crc_calc = har_crc16(raw_buf, dlen);
+                    } else {
+                        crc_calc = har_crc16(comp_buf, (uint16_t)entry.comp_size);
+                    }
+                }
+
+                if (crc_calc != entry.crc) {
+                    os_puts(" - FAILED (CRC mismatch)\n");
+                    has_errors = 1;
                 } else {
-                    crc_calc = har_crc16(comp_buf, (uint16_t)entry.comp_size);
+                    const void __far *out_data = (entry.flags & HAR_FLAG_COMPRESSED) ?
+                                                (const void __far *)raw_buf : (const void __far *)comp_buf;
+                    ensure_parent_dirs(out_path);
+                    if (os_file_write(out_path, out_data, (uint16_t)entry.uncomp_size) != (uint16_t)entry.uncomp_size) {
+                        os_puts(" - FAILED (write error)\n");
+                        has_errors = 1;
+                    } else {
+                        os_puts(" (");
+                        print_uint32(entry.uncomp_size);
+                        os_puts(" bytes) - OK\n");
+                        total_extracted++;
+                    }
+                }
+            }
+        } else {
+            /* HAR2 chunked streaming extraction */
+            uint32_t bytes_done = 0;
+            uint32_t payload_off = offset;
+            uint16_t crc_calc = 0xFFFF;
+            int ok = 1;
+
+            ensure_parent_dirs(out_path);
+
+            if (entry.uncomp_size == 0) {
+                if (os_file_write(out_path, (const void __far *)raw_buf, 0) != 0) {
+                    os_puts(" - FAILED (write error)\n");
+                    has_errors = 1;
+                    ok = 0;
                 }
             }
 
-            if (crc_calc != entry.crc) {
-                os_puts(" - FAILED (CRC mismatch)\n");
-                has_errors = 1;
-            } else {
-                const void __far *out_data = (entry.flags & HAR_FLAG_COMPRESSED) ?
-                                            (const void __far *)raw_buf : (const void __far *)comp_buf;
-                ensure_parent_dirs(out_path);
-                if (os_file_write(out_path, out_data, (uint16_t)entry.uncomp_size) != (uint16_t)entry.uncomp_size) {
+            while (bytes_done < entry.uncomp_size) {
+                har_chunk_hdr_t chk;
+                const void __far *out_ptr;
+                uint16_t w;
+
+                r = os_file_read_offset(arc_name, (void __far *)&chk, sizeof(har_chunk_hdr_t), payload_off);
+                if (r < (int)sizeof(har_chunk_hdr_t)) {
+                    os_puts(" - FAILED (chunk header read error)\n");
+                    has_errors = 1;
+                    ok = 0;
+                    break;
+                }
+                payload_off += sizeof(har_chunk_hdr_t);
+
+                if (chk.comp_len > BUF_BYTES_32K) {
+                    os_puts(" - FAILED (chunk size exceeds buffer)\n");
+                    has_errors = 1;
+                    ok = 0;
+                    break;
+                }
+
+                r = os_file_read_offset(arc_name, comp_buf, chk.comp_len, payload_off);
+                if ((uint16_t)r != chk.comp_len) {
+                    os_puts(" - FAILED (chunk payload read error)\n");
+                    has_errors = 1;
+                    ok = 0;
+                    break;
+                }
+                payload_off += chk.comp_len;
+
+                if (chk.comp_len < chk.raw_len) {
+                    uint16_t dlen = lz4_decompress_block(comp_buf, chk.comp_len, raw_buf, BUF_BYTES_32K);
+                    if (dlen != chk.raw_len) {
+                        os_puts(" - FAILED (decompression error)\n");
+                        has_errors = 1;
+                        ok = 0;
+                        break;
+                    }
+                    crc_calc = har_crc16_update(crc_calc, raw_buf, dlen);
+                    out_ptr = (const void __far *)raw_buf;
+                } else {
+                    crc_calc = har_crc16_update(crc_calc, comp_buf, chk.raw_len);
+                    out_ptr = (const void __far *)comp_buf;
+                }
+
+                if (bytes_done == 0) {
+                    w = os_file_write(out_path, out_ptr, chk.raw_len);
+                } else {
+                    w = os_file_append(out_path, out_ptr, chk.raw_len);
+                }
+
+                if (w != chk.raw_len) {
                     os_puts(" - FAILED (write error)\n");
+                    has_errors = 1;
+                    ok = 0;
+                    break;
+                }
+
+                bytes_done += chk.raw_len;
+            }
+
+            if (ok) {
+                if (crc_calc != entry.crc) {
+                    os_puts(" - FAILED (CRC mismatch)\n");
                     has_errors = 1;
                 } else {
                     os_puts(" (");

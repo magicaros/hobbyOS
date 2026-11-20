@@ -1254,6 +1254,23 @@ static void cmd_rmdir(const char *path) {
 static int execute_line(char *raw_line, const char *script_args, uint16_t *out_goto_label_pos);
 static int run_script(const char *script_path, const char *script_args);
 
+static int is_forbidden_executable(const char *cmd) {
+    const char *p = cmd;
+    const char *base = cmd;
+    if (!cmd || !*cmd) return 0;
+    while (*p) {
+        if (*p == '/' || *p == '\\' || *p == ':') {
+            base = p + 1;
+        }
+        p++;
+    }
+    if (str_case_eq(base, "KERNEL.BIN") || str_case_eq(base, "KERNEL") ||
+        str_case_eq(base, "BOOT.BIN")   || str_case_eq(base, "BOOT")) {
+        return 1;
+    }
+    return 0;
+}
+
 static void cmd_run(char *arg_line) {
     char *args = 0;
     char *fname = split_word(arg_line, &args);
@@ -1261,6 +1278,13 @@ static void cmd_run(char *arg_line) {
 
     if (fname[0] == '\0') {
         os_puts("Usage: run <program> [args]\n");
+        return;
+    }
+    if (is_forbidden_executable(fname)) {
+        os_puts("Cannot execute system kernel or bootloader: ");
+        os_puts(fname);
+        os_putc('\n');
+        last_exit_code = 1;
         return;
     }
     rc = os_exec(fname, args);
@@ -1588,7 +1612,7 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
         os_puts("          cat <file>, more [file], tree [path] [/f] [/a], write [-a] [file] \"<text>\",\n");
         os_puts("          cp <src> <dst>, mv <s> <d>, rm <p>, edit <file>, forth, volume, play,\n");
         os_puts("          set [VAR=VAL], echo [text|on|off], keyb [us|fr|be], mem, cls, format,\n");
-        os_puts("          fdisk, chkdsk, ramdisk, har, sam, gfxdemo, view, mouse, diskchange, <DEV:>\n");
+        os_puts("          fdisk, chkdsk, ramdisk, har, sam, gfxdemo, view, zcode, fm, mouse, diskchange, <DEV:>\n");
         os_puts("Redirection: <cmd> > <file>, <cmd> >> <file>, <cmd> < <file>, <cmd1> | <cmd2>\n");
     } else if (str_eq(cmd, "set")) {
         cmd_set(rest);
@@ -1640,6 +1664,11 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
             int is_script = 0;
             if (find_script_or_bin(cmd, resolved, &is_script) == 0 && is_script) {
                 last_exit_code = (uint16_t)run_script(resolved, rest);
+            } else if (is_forbidden_executable(cmd)) {
+                os_puts("Cannot execute system kernel or bootloader: ");
+                os_puts(cmd);
+                os_putc('\n');
+                last_exit_code = 1;
             } else {
                 int rc = os_exec(cmd, rest);
                 if (rc < 0) {

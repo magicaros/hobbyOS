@@ -9,7 +9,7 @@ IMG    := book8088/disk.img
 CFLAGS := -0 -fpi87 -ms -s -zl -ecc -zq -Iinclude -Ibuild
 
 KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mouse.obj build/sound.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
-USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin build/mouse.bin build/play.bin build/volume.bin build/more.bin build/tree.bin build/vidsync.bin build/view.bin build/zcode.bin
+USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin build/mouse.bin build/play.bin build/volume.bin build/more.bin build/tree.bin build/vidsync.bin build/view.bin build/zcode.bin build/fm.bin
 KEYMAPS     := build/us.map build/fr.map build/be.map
 
 all: $(IMG)
@@ -121,6 +121,7 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		build/vidsync.bin:/BIN/VIDSYNC.BIN \
 		build/view.bin:/BIN/VIEW.BIN \
 		build/zcode.bin:/BIN/ZCODE.BIN \
+		build/fm.bin:/BIN/FM.BIN \
 		games/zork1.z3:/GAMES/ZORK1.Z3 \
 		build/sample.cga:/PICS/SAMPLE.CGA \
 		build/sample.pcx:/PICS/SAMPLE.PCX \

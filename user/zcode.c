@@ -1305,14 +1305,8 @@ int app_main(void) {
     s_word_len = 0;
 
     /* Clear screen and draw initial status line */
-    os_puts("\033[2J"); /* In case ANSI, or standard cls via BIOS: */
-    {
-        uint16_t __far *vram = (uint16_t __far *)MK_FP(s_vram_seg, 0);
-        int i;
-        for (i = 0; i < 80 * 25; i++) {
-            vram[i] = ((uint16_t)0x07 << 8) | ' ';
-        }
-    }
+    os_cls(ATTR_DEFAULT);
+    os_set_cursor(1, 0);
     z_update_status_line();
 
     /* Main Execution Loop */

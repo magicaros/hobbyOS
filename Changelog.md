@@ -2,6 +2,60 @@
 
 ## Revision 1.0.1 (2026-11-20)
 
+- **Dual-Panel File Manager (`/BIN/FM.BIN`, `user/fm.c`, `Makefile`)**:
+  - Implemented an authentic Norton Commander / Midnight Commander inspired dual-panel file manager (`FM.BIN`) in pure user space with zero kernel changes.
+  - **Screen Layout & Visual Design**:
+    - Direct 80x25 text video memory rendering (`0xB800` on CGA/EGA/VGA, `0xB000` on MDA) with delta-cache screen updates eliminating visible CGA snow.
+    - Double and single CP437 line borders (`╔═╗║╚═╝`, `┌─┐│└─┘`, `╤`, `╧`), color-coded file extensions (yellow directories, light green executables, bright white files), and reverse/cyan selection highlight bars.
+    - Two 40-column side-by-side independent navigation panels (rows 1..21) displaying DOS 8.3 filename, size or `<DIR>`, and attributes (`R`, `H`, `S`, `A`).
+    - Top header (row 0), selected item summary and volume free space info (row 22), mini shell prompt (row 23), and bottom function key bar (row 24).
+  - **Interactive Live Shell Prompt (Row 23)**:
+    - Interactive command-line prompt at Row 23 with active panel path indicator (`SYS:/BIN> `) and hardware text cursor positioning.
+    - Single-clicking any executable binary (`.BIN`, `.COM`, `.EXE`, `.SH`) automatically pastes its filename with a trailing space into the prompt, placing the cursor ready for typing command-line arguments.
+    - Double-clicking an executable binary launches it directly without parameters.
+    - Full keyboard command editing with `Backspace`, `Delete`, `Left`, `Right`, `Home`, `End`, and `Esc` (clears prompt). Mouse click on Row 23 positions editing cursor directly.
+    - Pressing `Enter` executes the typed command line via `os_exec()`, supporting program parameters, path resolution, and system protection against forbidden binaries (`KERNEL.BIN`/`BOOT.BIN`), then automatically refreshes panels upon return.
+  - **Multi-File Selection & Batch Operations**:
+    - `Insert` key (`SC_INS 0x52`): tags/untags the highlighted file with a visual `*` tag marker at column `c1 + 1` and bright highlight attribute (`0x1E`/`0x3E` yellow on CGA, `0x0F` bright white on MDA), then automatically steps down one row.
+    - Row 22 dynamically displays total tagged file count and cumulative bytes (`X file(s) tagged (Y bytes)`) in bright yellow when files are tagged.
+    - `F5` Copy, `F6` Move/Rename, and `F8` Delete support batch processing across all tagged items when selection is active, or single highlighted item when no files are tagged.
+    - Group selection shortcuts: `+` (select by wildcard mask e.g. `*.TXT`), `-` (deselect by wildcard mask), and `*` (invert selection) using pure freestanding recursive wildcard matching.
+  - **F9 Pull-Down Menus**:
+    - Top menu bar (Row 0) with 4 pull-down categories: `Left`, `Files`, `Disk`, and `Right`.
+    - Activated via `F9`, mouse clicking on Row 0 category titles, or clicking `9 Menu` on Row 24.
+    - Seamless navigation with `Left`/`Right` to switch menus, `Up`/`Down` to navigate items (skipping divider lines), `Enter`/mouse click to activate, and `Esc`/`F9` to close.
+    - Sort mode controls for Left and Right panels: Sort by Name, Sort by Size (descending), and Sort by Extension with live checkmark (`√`) indicator on active sort mode.
+    - `Files` menu provides direct access to View, Edit, Copy, Move, Mkdir, Delete, Select Group, Deselect Group, Invert Selection, and Quit.
+    - `Disk` menu provides Drive Selection, Volume Rescan, and a Drive Information dialog detailing volume label, file system (FAT12/FAT16), removable media flag, and total/free capacity in KB using pure 16-bit multiplication routines (`mul_u16`).
+  - **Navigation & File Operations**:
+    - `Tab` switches focus between left and right panels.
+    - `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` navigation with automatic view scrolling across directories of up to 128 entries.
+    - `Enter`: enters directory (`..` navigates up) or executes `.BIN` binaries.
+    - `F2` / `Alt+F1` / `Alt+F2`: interactive pop-up drive/volume selection menu enumerating all mounted volumes (`SYS:`, `HD0A:`, `HD0B:`, `FD0:`, `RAM:`). Fixed a stack buffer overflow in `fm_drive_menu()`, re-queries volumes upon invocation, pre-selects current active drive, centers the menu vertically, and supports mouse click selection. Fixed MDA monochrome selection visibility by assigning distinct inverted attribute `ATTR_DLG_SEL` (`0x0F` bright white on black vs `0x70` black on white dialog background) along with a `►` pointer cursor. Drives are now enumerated with unique numbered shortcuts (`[1]`, `[2]`, `[3]`...) eliminating shortcut key collisions between drives sharing the same prefix letter (e.g. `FD0`/`FD1`, `HD0`/`HD0A`).
+    - `F3`: View (automatically launches `VIEW.BIN` for `.CGA`/`.VGA`/`.PCX` images or `MORE.BIN` for text files).
+    - `F4`: Edit (launches `EDIT.BIN`).
+    - `F5`: Copy active file to opposite panel directory via `os_file_copy()`.
+    - `F6`: Rename or Move active file via `os_file_rename()`.
+    - `F7`: Create directory via `os_mkdir()`.
+    - `F8` / `Delete`: Delete file or empty directory via `os_file_delete()` / `os_rmdir()` with confirmation dialog.
+    - `F10` / `Esc` / `q`: Exit cleanly to shell, restoring cursor and clearing screen.
+    - **Critical System Execution Safeguard**: Explicitly blocks execution of `KERNEL.BIN` and `BOOT.BIN` (via both Enter key and mouse double-click), displaying an alert dialog ("Cannot execute kernel or bootloader!"). Also omits green executable highlighting (`ATTR_PANEL_EXE`) for `KERNEL.BIN` and `BOOT.BIN`, displaying them as protected system files.
+  - **INT 0x33 Mouse Integration & Software Cursor**:
+    - Detects mouse hardware and displays a flicker-free software-rendered text-mode cursor via cell attribute inversion (`attr ^ 0x77`).
+    - Bypasses `os_mouse_show()` and `os_mouse_hide()` so the kernel's text-mode mouse ISR does not restore stale console characters from `cga_shadow` across direct-VRAM screens, completely eliminating mouse trails and screen corruption.
+    - Software cursor coordinates synchronize smoothly across screen redraws, dialog popups, and dragging. Supports clicking panel entries, double-clicking to open/execute, and clicking the bottom function key bar.
+
+- **User-Space Shell Execution Safeguard (`/BIN/SHELL.BIN`, `user/shell.c`)**:
+  - Implemented `is_forbidden_executable()` in `SHELL.BIN` to prevent direct command invocation, script execution, or `run` command execution of non-executable system files (`KERNEL.BIN`, `BOOT.BIN`, `kernel`, `boot`, `/BIN/BOOT.BIN`, `SYS:/KERNEL.BIN`).
+  - Emits `Cannot execute system kernel or bootloader: <file>` and sets exit code 1 instead of invoking `os_exec()`, protecting system stability.
+
+- **HobbyOS Archiver (HAR) v2.0 & Chunked LZ4 Streaming (`/BIN/HAR.BIN`, `user/har.c`)**:
+  - Upgraded archive format from HAR1 to HAR2 with a unified chunked LZ4 block streaming architecture.
+  - Eliminated the previous 48 KB single-file archive size limitation, enabling compression, testing, and extraction of arbitrarily large files (such as 86 KB `ZORK1.Z3`, 64 KB VGA dumps, and 55 KB PCX images) without segment wrap or buffer overflow.
+  - Streaming architecture operates in 32 KB blocks with an 8 KB hash table, reducing total conventional memory footprint from 104 KB down to ~72 KB.
+  - Added multi-chunk staging and rolling CRC-16 calculation (`har_crc16_update`), guaranteeing end-to-end data integrity across all chunks.
+  - Retained backward-compatibility to inspect, test, and extract legacy HAR1 archives.
+
 - **Z-Machine Version 3 Interpreter & Zork I: The Great Underground Empire (`/BIN/ZCODE.BIN`, `/GAMES/ZORK1.Z3`, `user/zcode.c`, `Makefile`)**:
   - Implemented an authentic Infocom Z-Machine Version 3 interpreter (`ZCODE.BIN`) for classic interactive fiction text adventures (Zork I, II, III, Planetfall, Enchanter, etc.), bringing rich adventure gaming to MDA monochrome users and all graphics configurations.
   - **Memory Management for 128 KB Real-Mode Execution**:
@@ -15,6 +69,8 @@
     - Z-String text decoding: alphabets A0, A1, A2, 32-entry abbreviation tables, 10-bit Z-characters, and ASCII fallback.
     - In-game text tokenization and dictionary binary search for player input parsing.
   - **Authentic Display & Formatting**:
+    - Replaced raw VRAM writes and ad-hoc ANSI escape sequences at startup with standard `os_cls(ATTR_DEFAULT)` and `os_set_cursor(1, 0)`, ensuring proper synchronization with kernel console tracking and eliminating screen garbage/desync.
+    - Added serial terminal clear-screen synchronization to `con_clear()` in `kernel/console.c`: emits `\033[2J\033[H` over COM1 whenever the screen is cleared (e.g. `cls`, `edit`, `zcode`), synchronizing both the physical PC display and attached serial terminals.
     - Adapts to detected display hardware: writes directly to Row 0 status line with reverse video attribute `0x70` on both MDA (`0xB000:0000`) and CGA/EGA/VGA (`0xB800:0000`).
     - Dynamic status line formatting: displays current room/location name at left and either `Score: <score> Moves: <turns>` or `Time: <hh:mm>` right-aligned at column 80.
     - Story window on rows 1..24 with intelligent 80-column word-wrapping and `[MORE]` page pausing when screen fills.

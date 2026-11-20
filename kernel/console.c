@@ -130,6 +130,15 @@ static void serial_putc(char c) {
     outb(COM1_BASE, (uint8_t)c);
 }
 
+static void serial_puts(const char *s) {
+    if (!serial_console_enabled) {
+        return;
+    }
+    while (*s) {
+        serial_putc(*s++);
+    }
+}
+
 void con_set_cell(uint16_t idx, uint16_t val) {
     if (idx < CGA_CELLS) {
         cga_shadow[idx] = val;
@@ -205,6 +214,7 @@ void con_clear(uint8_t attr) {
     cur_row = 0;
     cur_col = 0;
     update_hw_cursor();
+    serial_puts("\033[2J\033[H");
 }
 
 void con_init(void) {
