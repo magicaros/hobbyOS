@@ -2,6 +2,27 @@
 
 ## Revision 1.0.1 (2026-11-20)
 
+- **Z-Machine Version 3 Interpreter & Zork I: The Great Underground Empire (`/BIN/ZCODE.BIN`, `/GAMES/ZORK1.Z3`, `user/zcode.c`, `Makefile`)**:
+  - Implemented an authentic Infocom Z-Machine Version 3 interpreter (`ZCODE.BIN`) for classic interactive fiction text adventures (Zork I, II, III, Planetfall, Enchanter, etc.), bringing rich adventure gaming to MDA monochrome users and all graphics configurations.
+  - **Memory Management for 128 KB Real-Mode Execution**:
+    - Dynamically allocates a 128 KB buffer (8,192 paragraphs) in conventional RAM via `os_mem_alloc()`.
+    - Handles story file memory spanning multiple 64 KB segments transparently via normalized 16-bit segment arithmetic (`seg = base + (addr >> 4)`, `off = addr & 0x0F`), eliminating 16-bit offset wrap issues.
+  - **Instruction Set & Execution Engine**:
+    - Full V3 opcode support: 2OP (arithmetic, branches, object hierarchy, attributes, properties), 1OP, 0OP, and VAR (calls, formatted output, random number generation).
+    - Subroutine call frame stack supporting up to 64 call levels with independent local variables and store/branch targets.
+    - Evaluation stack supporting up to 512 words.
+    - Fixed operand resolution in 2OP opcodes `dec_chk` (0x04) and `inc_chk` (0x05): resolved the target variable directly from `operands[0]` rather than reading an outdated relative PC offset (`s_pc - 1`), which previously read operand 1 and inadvertently corrupted local variables (specifically the parser's directional walk flag in Zork I, causing action commands like `take egg` to fail with "You can't go that way").
+    - Z-String text decoding: alphabets A0, A1, A2, 32-entry abbreviation tables, 10-bit Z-characters, and ASCII fallback.
+    - In-game text tokenization and dictionary binary search for player input parsing.
+  - **Authentic Display & Formatting**:
+    - Adapts to detected display hardware: writes directly to Row 0 status line with reverse video attribute `0x70` on both MDA (`0xB000:0000`) and CGA/EGA/VGA (`0xB800:0000`).
+    - Dynamic status line formatting: displays current room/location name at left and either `Score: <score> Moves: <turns>` or `Time: <hh:mm>` right-aligned at column 80.
+    - Story window on rows 1..24 with intelligent 80-column word-wrapping and `[MORE]` page pausing when screen fills.
+  - **Game State Save & Restore**:
+    - Implements `save` and `restore` opcodes writing directly to `<STORY>.SAV` (e.g. `ZORK1.SAV`), capturing execution PC, evaluation stack, call frames, and modified dynamic memory.
+  - **Bundled Story File**:
+    - Bundled the official *Zork I: The Great Underground Empire* story file (`/GAMES/ZORK1.Z3`, Release 119). Defaults to launching `/GAMES/ZORK1.Z3` when invoked without arguments (`zcode`), or accepts a custom story path (`zcode <story.z3>`).
+
 - **Picture Viewer Utility with CGA, VGA & ZSoft PCX Support (`/BIN/VIEW.BIN`, `user/view.c`, `tools/gen_cga.py`, `tools/gen_pcx.py`, `tools/gen_vga.py`, `Makefile`)**:
   - Implemented a dedicated retro graphics viewer (`VIEW.BIN`) designed for physical Book 8088 hardware and 86Box emulation.
   - Queries video hardware type via `os_video_type()`; gracefully rejects execution with an informative message when run on IBM MDA adapters where graphics modes are unsupported.

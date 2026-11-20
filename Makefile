@@ -9,7 +9,7 @@ IMG    := book8088/disk.img
 CFLAGS := -0 -fpi87 -ms -s -zl -ecc -zq -Iinclude -Ibuild
 
 KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mouse.obj build/sound.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
-USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin build/mouse.bin build/play.bin build/volume.bin build/more.bin build/tree.bin build/vidsync.bin build/view.bin
+USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin build/mouse.bin build/play.bin build/volume.bin build/more.bin build/tree.bin build/vidsync.bin build/view.bin build/zcode.bin
 KEYMAPS     := build/us.map build/fr.map build/be.map
 
 all: $(IMG)
@@ -95,7 +95,7 @@ build/sample.vga: tools/gen_vga.py
 	mkdir -p build
 	python3 tools/gen_vga.py $@
 
-$(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(MUSIC_FILES) build/sample.cga build/sample.pcx build/sample.vga boot.sh tools/fat16.py
+$(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(MUSIC_FILES) build/sample.cga build/sample.pcx build/sample.vga games/zork1.z3 boot.sh tools/fat16.py
 	dd if=/dev/zero of=$@ bs=512 count=20808 status=none
 	/usr/sbin/mkfs.fat -a -F 16 -s 4 -R 1 -f 2 -r 512 -g 4/17 -M 0xF8 -D 0x80 -n "HOBBYOS" $@ >/dev/null
 	python3 tools/fat16.py $@ build/boot.bin \
@@ -120,6 +120,8 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		build/tree.bin:/BIN/TREE.BIN \
 		build/vidsync.bin:/BIN/VIDSYNC.BIN \
 		build/view.bin:/BIN/VIEW.BIN \
+		build/zcode.bin:/BIN/ZCODE.BIN \
+		games/zork1.z3:/GAMES/ZORK1.Z3 \
 		build/sample.cga:/PICS/SAMPLE.CGA \
 		build/sample.pcx:/PICS/SAMPLE.PCX \
 		build/sample.vga:/PICS/SAMPLE.VGA \
