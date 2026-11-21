@@ -268,6 +268,28 @@ void con_set_cursor_visible(uint8_t visible) {
     update_hw_cursor();
 }
 
+void con_get_shadow(uint16_t __far *dst) {
+    uint16_t i;
+    if (!dst) return;
+    for (i = 0; i < CGA_CELLS; i++) {
+        dst[i] = cga_shadow[i];
+    }
+}
+
+void con_sync_shadow(const uint16_t __far *src, uint8_t row, uint8_t col) {
+    uint16_t i;
+    if (src) {
+        for (i = 0; i < CGA_CELLS; i++) {
+            cga_shadow[i] = src[i];
+        }
+    }
+    con_set_cursor(row, col);
+}
+
+void con_redraw(void) {
+    cga_sync_copy(cga_shadow, CGA_CELLS);
+}
+
 static void putc_no_cursor(char c) {
     serial_putc(c);
     if (c == '\r') {

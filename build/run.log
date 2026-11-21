@@ -1,0 +1,78 @@
+#
+# 86Box v7.0 logfile, created 2026/11/21 17:18:27
+#
+# Emulator path: /usr/local/bin/
+# Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
+# VM: book8088
+#
+# Configuration file: /home/magicben/hobbyOS/book8088/86box.cfg
+#
+
+# Userfiles path: /home/magicben/hobbyOS/book8088/
+# ROM path: /home/magicben/hobbyOS/book8088/roms/
+# ROM path: /usr/local/bin/roms/
+# ROM path: /home/magicben/.local/share/86Box/roms/
+# ROM path: /usr/share/mate/86Box/roms/
+# ROM path: /usr/local/share/86Box/roms/
+# ROM path: /usr/share/86Box/roms/
+# ROM path: /var/lib/snapd/desktop/86Box/roms/
+# Asset path: /home/magicben/hobbyOS/book8088/assets/
+# Asset path: /usr/local/bin/assets/
+# Asset path: /home/magicben/.local/share/86Box/assets/
+# Asset path: /usr/share/mate/86Box/assets/
+# Asset path: /usr/local/share/86Box/assets/
+# Asset path: /usr/share/86Box/assets/
+# Asset path: /var/lib/snapd/desktop/86Box/assets/
+SDL: version 3.4.14
+GDB Stub: Listening on port 12345
+Allocated 0.62 megabytes of large pages for RAM
+[2J[H
+[BOOK8088] Booted hobbyOS kernel at segment 0x9000!
+[IRQ1 KBD] Custom INT 0x09 driver active (default layout: US)
+[CPU] Detected: Intel 8088 (8-bit bus, 4-byte prefetch queue)
+[VIDEO] Detected: IBM CGA (Color 80x25, 0xB800) (snow prevention active)
+[MEM MCB] Conventional arena 0x0060..0x8FFF initialized (574 KB free)
+[x87 FPU] Detected & math verified OK
+[LOTECH EMS] 2MB manager ready (128 x 16KB pages free)
+[XMS] Not supported (requires 80286+ CPU)
+[STORAGE] Mounted volumes: FD0:, FD1:, HD0:, HD0A:->HD0:, SYS:->HD0: OK
+[SYSCALL] INT 0x21 API installed OK
+[MOUSE] Not detected (INT 0x33 stub active)
+[SOUND] Yamaha YMF262 (OPL3) at 0x388 (18 channels stereo) ready
+[SOUND] Sound Blaster 16 (CT1745 Mixer) detected at port 0220
+[EXEC] Running /BIN/HELLO.BIN...
+[USER APP] HELLO.BIN running in user segment via INT 0x21!
+[USER APP] Args: boot-self-test
+[USER APP] CPU detected via INT 0x21: Intel 8088
+[USER APP] Video detected via INT 0x21: IBM CGA (Color 80x25, 0xB800)
+[USER APP] MCB alloc/free verified OK
+[USER APP] EMS alloc/map/free verified OK
+[USER APP] Keymaps (US/FR/BE) & IRQ1 state verified OK
+[USER APP] Break mode syscall (normal/raw) verified OK
+[USER APP] INT 0x33 Mouse driver active (no mouse hardware)
+[USER APP] Sound subsystem verified OK: Yamaha YMF262 (OPL3) + Sound Blaster 16 (CT1745 Mixer)
+[USER APP] Wrote & appended /DOCS/NOTES.TXT OK
+[USER APP] Read back /DOCS/NOTES.TXT: "Line 1 from user-space app
+Line 2 appended via SYS_FILE_APPEND
+"
+[USER APP] AmigaDOS device paths (SYS: & HD0A:) verified OK
+[USER APP] RAM disk multi-cluster subdirectory (25 files in RAM:/TESTDIR) verified OK
+[USER APP] FAT16 Root Directory:
+  - KERNEL.BIN (46099 bytes)
+  - BIN/ <DIR>
+  - GAMES/ <DIR>
+  - PICS/ <DIR>
+  - MODELS/ <DIR>
+  - MUSIC/ <DIR>
+  - BOOT.SH (92 bytes)
+  - KEYMAPS/ <DIR>
+  - WS4/ <DIR>
+  - CPM/ <DIR>
+  - DOCS/ <DIR>
+[EXEC] /BIN/HELLO.BIN exited with code 0
+Keyboard layout set to FR (/KEYMAPS/FR.MAP)
+Running /BOOT.SH...
+System ready.
+
+hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.
+SYS:/> 

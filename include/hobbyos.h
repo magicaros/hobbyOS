@@ -40,6 +40,11 @@ typedef signed long    int32_t;
 #define SYS_VIDEO_TYPE   0x0C
 #define SYS_BREAK_MODE   0x0D
 #define SYS_REDIR        0x0E
+#define SYS_CONSOLE_SHADOW 0x0F
+
+#define CONSOLE_SHADOW_GET     0
+#define CONSOLE_SHADOW_SET     1
+#define CONSOLE_SHADOW_REDRAW  2
 
 #define REDIR_STDOUT     0
 #define REDIR_STDIN      1
@@ -49,7 +54,7 @@ typedef signed long    int32_t;
 #define REDIR_FLUSH      5
 
 #define BREAK_MODE_NORMAL 0  /* Single Ctrl+C breaks out of process (default) */
-#define BREAK_MODE_RAW    1  /* Full-screen/raw: 1st Ctrl+C delivered to app; 2nd in a row breaks out */
+#define BREAK_MODE_RAW    1  /* Full-screen/raw: Ctrl+C delivered to app; Ctrl+Alt+C breaks out */
 
 /* CPU Types detected by hobbyOS */
 #define CPU_TYPE_8088     0  /* Intel 8088 (8-bit bus, 4-byte prefetch queue) */
@@ -467,6 +472,27 @@ void os_redir_flush(void);
     "mov al, 5" \
     "int 0x21" \
     modify [ax];
+
+int os_console_get_shadow(void __far *buf);
+#pragma aux os_console_get_shadow = \
+    "mov ah, 0x0F" \
+    "mov al, 0" \
+    "int 0x21" \
+    parm [es di] value [ax];
+
+int os_console_set_shadow(const void __far *buf, uint8_t row, uint8_t col);
+#pragma aux os_console_set_shadow = \
+    "mov ah, 0x0F" \
+    "mov al, 1" \
+    "int 0x21" \
+    parm [es di] [dh] [dl] value [ax];
+
+int os_console_redraw(void);
+#pragma aux os_console_redraw = \
+    "mov ah, 0x0F" \
+    "mov al, 2" \
+    "int 0x21" \
+    value [ax];
 
 static __inline const char *os_video_name(uint16_t type) {
     switch (type) {

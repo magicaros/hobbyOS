@@ -149,6 +149,170 @@ static void str_copy(char *dst, const char *src, uint16_t max_len) {
     dst[i] = '\0';
 }
 
+static void str_cat(char *dst, const char *src, uint16_t max_len) {
+    uint16_t dlen = str_len(dst);
+    uint16_t i = 0;
+    if (max_len == 0) return;
+    while (src[i] != '\0' && dlen + i + 1 < max_len) {
+        dst[dlen + i] = src[i];
+        i++;
+    }
+    dst[dlen + i] = '\0';
+}
+
+static char char_upper(char c) {
+    if (c >= 'a' && c <= 'z') return (char)(c - ('a' - 'A'));
+    return c;
+}
+
+static int str_case_eq(const char *a, const char *b) {
+    while (*a && *b) {
+        if (char_upper(*a) != char_upper(*b)) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    return (*a == '\0' && *b == '\0');
+}
+
+static int check_single_cpm_file(const char *path) {
+    uint8_t buf[256];
+    int16_t n;
+    uint32_t off = 0;
+    int i;
+    uint16_t clen = str_len(path);
+
+    if (clen < 4) return 0;
+    if (path[clen - 4] != '.' ||
+        (path[clen - 3] != 'c' && path[clen - 3] != 'C') ||
+        (path[clen - 2] != 'o' && path[clen - 2] != 'O') ||
+        (path[clen - 1] != 'm' && path[clen - 1] != 'M')) {
+        return 0;
+    }
+
+    if (os_file_size(path) < 4) return 0;
+
+    n = (int16_t)os_file_read_offset(path, (void __far *)FP_HERE(buf), sizeof(buf), 0);
+    if (n < 4) return 0;
+
+    /* 8080 CP/M common entry opcodes: JMP, LXI SP, LXI H, LXI B, LXI D, LHLD */
+    if (buf[0] == 0xC3 || buf[0] == 0x31 || buf[0] == 0x21 ||
+        buf[0] == 0x01 || buf[0] == 0x11 || buf[0] == 0x2A) {
+        return 1;
+    }
+
+    /* Scan up to 32KB for CALL 0005h (CD 05 00) or JMP 0005h (C3 05 00) */
+    while (off < 32768UL) {
+        if (off > 0) {
+            n = os_file_read_offset(path, (void __far *)FP_HERE(buf), sizeof(buf), off);
+            if (n < 3) break;
+        }
+        for (i = 0; i < (int)n - 2; i++) {
+            if ((buf[i] == 0xCD || buf[i] == 0xC3) && buf[i+1] == 0x05 && buf[i+2] == 0x00) {
+                return 1;
+            }
+        }
+        if (n < sizeof(buf)) break;
+        off += (sizeof(buf) - 2);
+    }
+    return 0;
+}
+
+static int is_cpm_binary_file(const char *cmd, char resolved[64]) {
+    char cand[64];
+    uint16_t clen = str_len(cmd);
+    int has_slash = 0;
+    int has_dot = 0;
+    uint16_t i;
+
+    /* 'cpm' and 'cpm.bin' are the native hobbyOS CP/M launcher, not a CP/M-80 payload */
+    if (str_case_eq(cmd, "cpm") || str_case_eq(cmd, "cpm.bin")) {
+        return 0;
+    }
+
+    for (i = 0; i < clen; i++) {
+        if (cmd[i] == '/' || cmd[i] == '\\' || cmd[i] == ':') has_slash = 1;
+        if (cmd[i] == '.') has_dot = 1;
+    }
+
+    /* 1. Direct path check */
+    if (check_single_cpm_file(cmd)) {
+        str_copy(resolved, cmd, 64);
+        return 1;
+    }
+    if (!has_dot && clen + 4 < 63) {
+        str_copy(cand, cmd, 64);
+        str_cat(cand, ".COM", 64);
+        if (check_single_cpm_file(cand)) {
+            str_copy(resolved, cand, 64);
+            return 1;
+        }
+    }
+
+    if (has_slash) return 0;
+
+    /* 2. Check standard search locations: /CPM and along PATH */
+    {
+        char kpath[128];
+        uint16_t p = 0;
+
+        /* Try /CPM/<cmd>[.COM] */
+        str_copy(cand, "/CPM/", sizeof(cand));
+        str_cat(cand, cmd, sizeof(cand));
+        if (check_single_cpm_file(cand)) {
+            str_copy(resolved, cand, 64);
+            return 1;
+        }
+        if (!has_dot && str_len(cand) + 4 < 63) {
+            str_cat(cand, ".COM", sizeof(cand));
+            if (check_single_cpm_file(cand)) {
+                str_copy(resolved, cand, 64);
+                return 1;
+            }
+        }
+
+        /* Try PATH */
+        if (os_get_path((char __far *)FP_HERE(kpath), sizeof(kpath)) == 0) {
+            while (kpath[p] != '\0') {
+                uint16_t d_start = p;
+                uint16_t d_len;
+                uint16_t pos = 0;
+                while (kpath[p] != '\0' && kpath[p] != ';') p++;
+                d_len = p - d_start;
+                if (kpath[p] == ';') p++;
+
+                if (d_len > 0 && !(d_len == 1 && kpath[d_start] == '.')) {
+                    for (i = 0; i < d_len && pos < 40; i++) {
+                        cand[pos++] = kpath[d_start + i];
+                    }
+                    if (pos > 0 && cand[pos - 1] != '/' && cand[pos - 1] != '\\') {
+                        cand[pos++] = '/';
+                    }
+                }
+                for (i = 0; i < clen && pos < 50; i++) {
+                    cand[pos++] = cmd[i];
+                }
+                cand[pos] = '\0';
+
+                if (check_single_cpm_file(cand)) {
+                    str_copy(resolved, cand, 64);
+                    return 1;
+                }
+                if (!has_dot && pos + 4 < 63) {
+                    str_cat(cand, ".COM", sizeof(cand));
+                    if (check_single_cpm_file(cand)) {
+                        str_copy(resolved, cand, 64);
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 static char *skip_spaces(char *s) {
     while (*s == ' ' || *s == '\t') {
         s++;
@@ -381,22 +545,6 @@ static uint16_t read_line(char *buf, uint16_t max_len) {
             }
         }
     }
-}
-
-static char char_upper(char c) {
-    if (c >= 'a' && c <= 'z') return (char)(c - ('a' - 'A'));
-    return c;
-}
-
-static int str_case_eq(const char *a, const char *b) {
-    while (*a && *b) {
-        if (char_upper(*a) != char_upper(*b)) {
-            return 0;
-        }
-        a++;
-        b++;
-    }
-    return (*a == '\0' && *b == '\0');
 }
 
 static int wildcard_match(const char *pattern, const char *text) {
@@ -1661,6 +1809,7 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
         }
         if (!has_eq) {
             char resolved[64];
+            char cpm_resolved[64];
             int is_script = 0;
             if (find_script_or_bin(cmd, resolved, &is_script) == 0 && is_script) {
                 last_exit_code = (uint16_t)run_script(resolved, rest);
@@ -1669,6 +1818,16 @@ static int execute_line(char *raw_line, const char *script_args, uint16_t *out_g
                 os_puts(cmd);
                 os_putc('\n');
                 last_exit_code = 1;
+            } else if (is_cpm_binary_file(cmd, cpm_resolved)) {
+                char cpm_args[80];
+                int rc;
+                str_copy(cpm_args, cpm_resolved, sizeof(cpm_args));
+                if (rest && *rest) {
+                    str_cat(cpm_args, " ", sizeof(cpm_args));
+                    str_cat(cpm_args, rest, sizeof(cpm_args));
+                }
+                rc = os_exec("/BIN/CPM.BIN", cpm_args);
+                last_exit_code = (rc < 0) ? 1 : (uint16_t)rc;
             } else {
                 int rc = os_exec(cmd, rest);
                 if (rc < 0) {

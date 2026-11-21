@@ -96,11 +96,9 @@ static uint8_t mod_capslock = 0;
 static uint8_t mod_numlock  = 0;
 
 static uint8_t kbd_break_mode   = BREAK_MODE_NORMAL;
-static uint8_t kbd_ctrl_c_count = 0;
 
 void kbd_set_break_mode(uint8_t mode) {
     kbd_break_mode   = mode;
-    kbd_ctrl_c_count = 0;
 }
 
 uint8_t kbd_get_break_mode(void) {
@@ -142,7 +140,6 @@ void kbd_init(void) {
     mod_capslock = 0;
     mod_numlock  = 0;
     kbd_break_mode   = BREAK_MODE_NORMAL;
-    kbd_ctrl_c_count = 0;
     sync_bda_flags();
 
     kbd_install_vector();
@@ -235,29 +232,29 @@ uint8_t kbd_irq_handler(uint8_t raw) {
         return 0;
     }
 
-    /* 2. Check for CTRL+C break */
+    /* 2. Check for CTRL+ALT+C emergency process break */
+    if (sc == SC_C && mod_ctrl && (mod_alt || mod_altgr)) {
+        if (get_usermode_active() > 1) {
+            con_puts("^C\n");
+            return 1; /* Abort child process */
+        }
+        return 0;
+    }
+
+    /* 3. Check for CTRL+C break */
     if (sc == SC_C && mod_ctrl && !(mod_alt || mod_altgr)) {
         if (get_usermode_active() > 1) {
             if (kbd_break_mode == BREAK_MODE_NORMAL) {
                 con_puts("^C\n");
                 return 1; /* Abort child process */
             } else {
-                /* BREAK_MODE_RAW: 1st Ctrl+C delivered to app; 2nd in a row breaks out */
-                kbd_ctrl_c_count++;
-                if (kbd_ctrl_c_count >= 2) {
-                    kbd_ctrl_c_count = 0;
-                    con_puts("^C\n");
-                    return 1; /* Abort child process */
-                }
+                /* BREAK_MODE_RAW: deliver Ctrl+C directly to app without breaking */
                 ascii = 0x03;
             }
         } else {
             /* Root shell or kernel prompt: queue ASCII 0x03 */
             ascii = 0x03;
         }
-    } else {
-        /* Any other key resets the consecutive Ctrl+C counter */
-        kbd_ctrl_c_count = 0;
     }
 
     if (ascii == 0) {

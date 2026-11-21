@@ -109,6 +109,9 @@ uint16_t con_getc(void);
 uint16_t con_getline(char *buf, uint16_t max_len);
 void     con_set_cell(uint16_t idx, uint16_t val);
 uint16_t con_get_cell(uint16_t idx);
+void     con_get_shadow(uint16_t __far *dst);
+void     con_sync_shadow(const uint16_t __far *src, uint8_t row, uint8_t col);
+void     con_redraw(void);
 
 /* Mouse & INT 0x33 subsystem (kernel/mouse.c) */
 #define MOUSE_TYPE_NONE             0

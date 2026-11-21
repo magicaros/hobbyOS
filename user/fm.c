@@ -229,6 +229,41 @@ static int is_binary_name(const char *name) {
             !fm_is_forbidden_bin(name));
 }
 
+static int is_cpm_binary(const char *path) {
+    uint8_t buf[256];
+    uint16_t n;
+    uint32_t off = 0;
+    int i;
+    int clen = str_len(path);
+    if (clen < 4) return 0;
+    if (!str_ends_with_ic(path, ".COM")) return 0;
+
+    n = os_file_read_offset(path, (void __far *)FP_HERE(buf), sizeof(buf), 0);
+    if (n < 4) return 0;
+
+    /* 8080 CP/M common entry opcodes: JMP, LXI SP, LXI H, LXI B, LXI D, LHLD */
+    if (buf[0] == 0xC3 || buf[0] == 0x31 || buf[0] == 0x21 ||
+        buf[0] == 0x01 || buf[0] == 0x11 || buf[0] == 0x2A) {
+        return 1;
+    }
+
+    /* Scan up to 32KB for CALL 0005h (CD 05 00) or JMP 0005h (C3 05 00) */
+    while (off < 32768UL) {
+        if (off > 0) {
+            n = os_file_read_offset(path, (void __far *)FP_HERE(buf), sizeof(buf), off);
+            if (n < 3) break;
+        }
+        for (i = 0; i < (int)n - 2; i++) {
+            if ((buf[i] == 0xCD || buf[i] == 0xC3) && buf[i+1] == 0x05 && buf[i+2] == 0x00) {
+                return 1;
+            }
+        }
+        if (n < sizeof(buf)) break;
+        off += (sizeof(buf) - 2);
+    }
+    return 0;
+}
+
 static int wildcard_match(const char *pat, const char *str) {
     while (*pat) {
         if (*pat == '*') {
@@ -1278,9 +1313,20 @@ static void fm_execute_cmd(const char *cmd_line) {
     os_set_cursor_visible(1);
 
     {
-        int rc = os_exec(prog, args);
-        if (rc < 0) {
-            rc = os_exec(cmd, args);
+        int rc;
+        if (is_cpm_binary(prog) || is_cpm_binary(cmd)) {
+            char cpm_args[80];
+            str_copy_n(cpm_args, prog, sizeof(cpm_args));
+            if (args[0]) {
+                str_cat(cpm_args, " ");
+                str_cat(cpm_args, args);
+            }
+            rc = os_exec("/BIN/CPM.BIN", cpm_args);
+        } else {
+            rc = os_exec(prog, args);
+            if (rc < 0) {
+                rc = os_exec(cmd, args);
+            }
         }
         if (rc < 0) {
             os_puts("Bad command or file name: ");
@@ -1568,7 +1614,11 @@ static void fm_action_enter(void) {
         fm_hide_cursor();
         fm_get_full_path(ap, ap->files[ap->cursor].name, full, sizeof(full));
         os_cls(ATTR_DEFAULT);
-        os_exec(full, "");
+        if (is_cpm_binary(full)) {
+            os_exec("/BIN/CPM.BIN", full);
+        } else {
+            os_exec(full, "");
+        }
         os_puts("\n[Press any key to return to FM...]");
         os_getc();
         os_cls(ATTR_DEFAULT);

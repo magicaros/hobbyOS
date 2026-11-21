@@ -839,7 +839,7 @@ int app_main(void) {
         } else if (c == CTRL('X')) {
             running = !confirm_exit();
         } else if (c == CTRL('C')) {
-            msg_set("^C (press ^C again to force quit, ^X to exit)");
+            msg_set("^C ignored (use ^X to exit, Ctrl+Alt+C to abort)");
         } else if (c == CTRL('K')) {
             do_cut();
             update_want_col();

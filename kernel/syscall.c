@@ -175,6 +175,26 @@ int exec_program(const char __far *filename, const char __far *args) {
         return -1;
     }
 
+    /* Safety guard: prevent 8080 CP/M code from executing as native 8086 code */
+    if (bin_size >= 3) {
+        uint8_t __far *code = (uint8_t __far *)MK_FP(user_seg, 0);
+        uint16_t tlen = 0;
+        while (target_name[tlen] != '\0') tlen++;
+        if (tlen >= 4 && target_name[tlen - 4] == '.' &&
+            (target_name[tlen - 3] == 'c' || target_name[tlen - 3] == 'C') &&
+            (target_name[tlen - 2] == 'o' || target_name[tlen - 2] == 'O') &&
+            (target_name[tlen - 1] == 'm' || target_name[tlen - 1] == 'M')) {
+            if (code[0] == 0xC3 || code[0] == 0x31 || code[0] == 0x21 ||
+                code[0] == 0x01 || code[0] == 0x11 || code[0] == 0x2A) {
+                con_puts("Cannot execute CP/M-80 binary directly (use 'cpm <file.com>'): ");
+                con_puts(resolved_buf);
+                con_putc('\n');
+                mem_free(user_seg);
+                return -1;
+            }
+        }
+    }
+
     /* Copy optional command-line argument string into user_seg:0xFF00 */
     arg_dst = (char __far *)MK_FP(user_seg, USER_ARGS_OFFSET);
     if (args) {
@@ -198,6 +218,9 @@ int exec_program(const char __far *filename, const char __far *args) {
 
         kbd_set_break_mode(saved_break_mode);
         ctrl_c_abort_pending = 0;
+
+        /* Restore break mode to normal in case child process altered it */
+        kbd_set_break_mode(BREAK_MODE_NORMAL);
 
         /* Restore 80x25 text console if the process exited while in CGA graphics mode */
         if (gfx_get_mode() != OS_MODE_TEXT_80x25 && gfx_get_mode() != 0x07) {
@@ -444,6 +467,30 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
             break;
         case REDIR_FLUSH:
             redir_stdout_flush();
+            regs->ax = 0;
+            break;
+        default:
+            regs->ax = 0xFFFF;
+            break;
+        }
+        break;
+
+    case SYS_CONSOLE_SHADOW:
+        switch (al) {
+        case CONSOLE_SHADOW_GET: {
+            uint16_t __far *dst = (uint16_t __far *)MK_FP(regs->es, regs->di);
+            con_get_shadow(dst);
+            regs->ax = 0;
+            break;
+        }
+        case CONSOLE_SHADOW_SET: {
+            const uint16_t __far *src = (const uint16_t __far *)MK_FP(regs->es, regs->di);
+            con_sync_shadow(src, (uint8_t)(regs->dx >> 8), (uint8_t)(regs->dx & 0xFF));
+            regs->ax = 0;
+            break;
+        }
+        case CONSOLE_SHADOW_REDRAW:
+            con_redraw();
             regs->ax = 0;
             break;
         default:
