@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/21 17:18:27
+# 86Box v7.0 logfile, created 2026/11/22 15:13:44
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -29,7 +29,7 @@ Allocated 0.62 megabytes of large pages for RAM
 [2J[H
 [BOOK8088] Booted hobbyOS kernel at segment 0x9000!
 [IRQ1 KBD] Custom INT 0x09 driver active (default layout: US)
-[CPU] Detected: Intel 8088 (8-bit bus, 4-byte prefetch queue)
+[CPU] Detected: NEC V20 (8-bit bus, 4-byte prefetch queue)
 [VIDEO] Detected: IBM CGA (Color 80x25, 0xB800) (snow prevention active)
 [MEM MCB] Conventional arena 0x0060..0x8FFF initialized (574 KB free)
 [x87 FPU] Detected & math verified OK
@@ -43,7 +43,7 @@ Allocated 0.62 megabytes of large pages for RAM
 [EXEC] Running /BIN/HELLO.BIN...
 [USER APP] HELLO.BIN running in user segment via INT 0x21!
 [USER APP] Args: boot-self-test
-[USER APP] CPU detected via INT 0x21: Intel 8088
+[USER APP] CPU detected via INT 0x21: NEC V20
 [USER APP] Video detected via INT 0x21: IBM CGA (Color 80x25, 0xB800)
 [USER APP] MCB alloc/free verified OK
 [USER APP] EMS alloc/map/free verified OK
@@ -64,7 +64,7 @@ Line 2 appended via SYS_FILE_APPEND
   - PICS/ <DIR>
   - MODELS/ <DIR>
   - MUSIC/ <DIR>
-  - BOOT.SH (92 bytes)
+  - BOOT.SH (127 bytes)
   - KEYMAPS/ <DIR>
   - WS4/ <DIR>
   - CPM/ <DIR>
@@ -75,4 +75,4 @@ Running /BOOT.SH...
 System ready.
 
 hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.
-SYS:/> 
+SYS:/CPM/BDSC160> 

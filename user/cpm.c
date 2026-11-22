@@ -18,6 +18,19 @@ uint16_t get_ds(void);
 uint16_t get_cs(void);
 #pragma aux get_cs = "mov ax, cs" value [ax];
 
+void cpm_zero_seg(uint16_t seg);
+#pragma aux cpm_zero_seg = \
+    "push es" \
+    "mov es, ax" \
+    "xor di, di" \
+    "xor ax, ax" \
+    "mov cx, 0x8000" \
+    "cld" \
+    "rep stosw" \
+    "pop es" \
+    parm [ax] \
+    modify [cx di];
+
 #define CPM_TPA_BASE        0x0100
 #define CPM_STACK_TOP       0xFC00
 #define CPM_BDOS_ENTRY      0xFD00
@@ -31,6 +44,11 @@ uint16_t get_cs(void);
 #define TERM_STATE_CSI      2
 #define TERM_STATE_ROW      3
 #define TERM_STATE_COL      4
+#define TERM_STATE_ESC_B    5
+#define TERM_STATE_ESC_C    6
+
+#define TERM_MODE_VT52      0
+#define TERM_MODE_KAYPRO    1
 
 /* Global CP/M Runtime State */
 static uint16_t s_cpm_seg = 0;
@@ -40,6 +58,7 @@ int             s_cpm_running = 0;
 static uint8_t  s_cpu_type = 0;
 
 /* Terminal state */
+static int      s_term_mode = TERM_MODE_VT52;
 static int      s_term_state = TERM_STATE_NORMAL;
 static int      s_term_row = 0;
 static int      s_term_col = 0;
@@ -240,13 +259,20 @@ static void cpm_vram_setup(void) {
 }
 
 static void cpm_term_putc(char ch) {
+    uint8_t uch = (uint8_t)ch;
+
+    /* Ignore ASCII / terminal padding and delay bytes (NUL, DEL, 0xFE, 0xFF) */
+    if (uch == 0x00 || uch == 0x7F || uch == 0xFE || uch == 0xFF) {
+        return;
+    }
+
     if (s_term_state == TERM_STATE_NORMAL) {
         if (ch == 0x1B) {
             s_term_state = TERM_STATE_ESC;
         } else if (ch == 0x07) {
             /* Bell - ignore */
         } else if (ch == 0x08) {
-            /* Backspace */
+            /* Backspace / Cursor Left */
             if (s_term_col > 0) {
                 s_term_col--;
                 os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
@@ -264,13 +290,44 @@ static void cpm_term_putc(char ch) {
                 cpm_term_scroll_up();
             }
             os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
-        } else if (ch == 0x0C || ch == 0x1A) {
-            /* Form Feed / CP/M ADM-3A Clear Screen */
-            cpm_term_cls(s_term_attr);
+        } else if (ch == 0x0B) {
+            /* ADM-3A / Kaypro Cursor Up */
+            if (s_term_mode == TERM_MODE_KAYPRO) {
+                if (s_term_row > 0) s_term_row--;
+                os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
+            }
+        } else if (ch == 0x0C) {
+            /* ADM-3A / Kaypro Cursor Right or VT52 Clear Screen */
+            if (s_term_mode == TERM_MODE_KAYPRO) {
+                if (s_term_col < 79) s_term_col++;
+                os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
+            } else {
+                cpm_term_cls(s_term_attr);
+            }
         } else if (ch == 0x0D) {
             /* Carriage Return */
             s_term_col = 0;
             os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
+        } else if (ch == 0x17) {
+            /* Kaypro Clear to End of Screen */
+            if (s_term_mode == TERM_MODE_KAYPRO) {
+                cpm_term_erase_eos();
+            }
+        } else if (ch == 0x18) {
+            /* Kaypro Clear to End of Line */
+            if (s_term_mode == TERM_MODE_KAYPRO) {
+                cpm_term_erase_eol();
+            }
+        } else if (ch == 0x1A) {
+            /* ADM-3A / Kaypro Clear Screen */
+            cpm_term_cls(s_term_attr);
+        } else if (ch == 0x1E) {
+            /* ADM-3A / Kaypro Cursor Home */
+            if (s_term_mode == TERM_MODE_KAYPRO) {
+                s_term_row = 0;
+                s_term_col = 0;
+                os_set_cursor(0, 0);
+            }
         } else if ((unsigned char)ch >= 32) {
             cpm_write_cell(s_term_row, s_term_col, ((uint16_t)s_term_attr << 8) | (uint8_t)ch);
             if (s_term_col < 79) {
@@ -292,8 +349,13 @@ static void cpm_term_putc(char ch) {
             s_csi_p1 = 0;
             s_csi_p2 = 0;
             s_csi_has_p2 = 0;
-        } else if (ch == '=' || ch == 'Y') {
-            /* ADM-3A (ESC =) and DEC VT52 (ESC Y) cursor addressing: row+32 col+32 */
+        } else if (ch == '=') {
+            /* ADM-3A / Kaypro cursor addressing: row+32 col+32 */
+            /* Automatically promote session to Kaypro / ADM-3A mode */
+            s_term_mode = TERM_MODE_KAYPRO;
+            s_term_state = TERM_STATE_ROW;
+        } else if (ch == 'Y') {
+            /* DEC VT52 cursor addressing: row+32 col+32 */
             s_term_state = TERM_STATE_ROW;
         } else if (ch == 'K' || ch == 'T') {
             /* Erase to end of line (VT52 ESC K / Televideo ESC T) */
@@ -327,15 +389,25 @@ static void cpm_term_putc(char ch) {
             os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
             s_term_state = TERM_STATE_NORMAL;
         } else if (ch == 'B') {
-            /* Cursor Down */
-            if (s_term_row < 24) s_term_row++;
-            os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
-            s_term_state = TERM_STATE_NORMAL;
+            if (s_term_mode == TERM_MODE_KAYPRO) {
+                /* Kaypro Video Attribute ON */
+                s_term_state = TERM_STATE_ESC_B;
+            } else {
+                /* DEC VT52 Cursor Down */
+                if (s_term_row < 24) s_term_row++;
+                os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
+                s_term_state = TERM_STATE_NORMAL;
+            }
         } else if (ch == 'C') {
-            /* Cursor Right */
-            if (s_term_col < 79) s_term_col++;
-            os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
-            s_term_state = TERM_STATE_NORMAL;
+            if (s_term_mode == TERM_MODE_KAYPRO) {
+                /* Kaypro Video Attribute OFF */
+                s_term_state = TERM_STATE_ESC_C;
+            } else {
+                /* DEC VT52 Cursor Right */
+                if (s_term_col < 79) s_term_col++;
+                os_set_cursor((uint8_t)s_term_row, (uint8_t)s_term_col);
+                s_term_state = TERM_STATE_NORMAL;
+            }
         } else if (ch == 'D') {
             /* Cursor Left */
             if (s_term_col > 0) s_term_col--;
@@ -358,6 +430,30 @@ static void cpm_term_putc(char ch) {
             /* Drop unknown/unsupported 2-byte escape safely */
             s_term_state = TERM_STATE_NORMAL;
         }
+    } else if (s_term_state == TERM_STATE_ESC_B) {
+        if (ch >= '0' && ch <= '5') {
+            /* Kaypro Video Attribute ON */
+            if (ch == '0') {
+                /* Inverse Video ON */
+                s_term_attr = 0x70;
+            } else if (ch == '1') {
+                /* Dim / Reduced Intensity ON */
+                s_term_attr = 0x08;
+            } else if (ch == '2') {
+                /* Blinking ON */
+                s_term_attr |= 0x80;
+            } else if (ch == '3') {
+                /* Underline ON */
+                s_term_attr = 0x01;
+            }
+        }
+        s_term_state = TERM_STATE_NORMAL;
+    } else if (s_term_state == TERM_STATE_ESC_C) {
+        if (ch >= '0' && ch <= '5') {
+            /* Kaypro Video Attribute OFF */
+            s_term_attr = 0x07;
+        }
+        s_term_state = TERM_STATE_NORMAL;
     } else if (s_term_state == TERM_STATE_ROW) {
         s_term_tmp_row = (int)((unsigned char)ch) - 32;
         if (s_term_tmp_row < 0) s_term_tmp_row = 0;
@@ -1161,8 +1257,8 @@ static void run_software_8080(void) {
             uint16_t hl = ((uint16_t)s_8080_h << 8) | s_8080_l;
             uint16_t res = cpm_bdos_dispatch(s_8080_c, de, hl, s_8080_a);
             s_8080_a = (uint8_t)(res & 0xFF);
+            s_8080_l = (uint8_t)(res & 0xFF); /* CP/M 2.2 standard: single-byte results in A are mirrored in L */
             if (s_8080_c == 27 || s_8080_c == 31) {
-                s_8080_l = (uint8_t)(res & 0xFF);
                 s_8080_h = (uint8_t)(res >> 8);
             }
 
@@ -1537,6 +1633,11 @@ static void cpm_setup_zeropage(uint16_t cpm_seg, const char *tail) {
         mem[i] = 0;
     }
 
+    /* Push 0x0000 return address onto CP/M stack top (0xFC00) so a top-level RET exits via Warm Boot */
+    for (i = 0; i < 32; i++) {
+        mem[CPM_STACK_TOP + i] = 0;
+    }
+
     /* 0x0000: Warm boot vector -> JMP 0xFE03 (WBOOT in BIOS Jump Table) */
     mem[0] = 0xC3; /* JMP */
     mem[1] = 0x03;
@@ -1691,8 +1792,22 @@ int app_main(void) {
         } else {
             os_puts("Engine: Intel 8088 Emulation (Software Interpreter Fallback)\n");
         }
-        os_puts("Usage: cpm <program.com> [arguments]\n");
+        os_puts("Usage: cpm [/k] <program.com> [arguments]\n");
         return 1;
+    }
+
+    /* Check for /k or -k (force Kaypro 2X / ADM-3A) or /v or -v (force VT52) flag */
+    if (args[i] == '/' || args[i] == '-') {
+        char opt = args[i + 1];
+        if ((opt == 'k' || opt == 'K') && (args[i + 2] == ' ' || args[i + 2] == '\0')) {
+            s_term_mode = TERM_MODE_KAYPRO;
+            i += 2;
+            while (args[i] == ' ') i++;
+        } else if ((opt == 'v' || opt == 'V') && (args[i + 2] == ' ' || args[i + 2] == '\0')) {
+            s_term_mode = TERM_MODE_VT52;
+            i += 2;
+            while (args[i] == ' ') i++;
+        }
     }
 
     while (args[i] && args[i] != ' ' && j < sizeof(prog_name) - 1) {
@@ -1721,6 +1836,9 @@ int app_main(void) {
         os_puts("CPM: Out of conventional memory (64KB required)\n");
         return 1;
     }
+
+    /* Zero the entire 64 KB CP/M segment so TPA, heap and BSS are pristine */
+    cpm_zero_seg(s_cpm_seg);
 
     /* Setup Zero page and command tail */
     cpm_setup_zeropage(s_cpm_seg, tail);

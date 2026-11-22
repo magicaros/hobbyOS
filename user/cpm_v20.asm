@@ -165,6 +165,7 @@ _v20_bdos_isr:
     je .ret_hl
     cmp byte cs:[s_v20_bdos_func], 31
     je .ret_hl
+    mov bl, cs:[s_v20_ret_a] ; CP/M 2.2 standard: single-byte results in A are mirrored in L (BL)
     jmp .ret_done
 
 .ret_hl:
