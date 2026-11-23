@@ -1,5 +1,31 @@
 # Changelog
 
+## Revision 1.0.3 (2026-11-23)
+
+- **GW-BASIC Compatible Native BASIC Subsystem (`/BIN/BASIC.BIN`, `user/basic.c`, `user/basic_tokens.h`, `tools/gen_basic_tokens.py`)**:
+  - Initiated development of a native, pure user-space GW-BASIC / BASICA compatible interpreter subsystem based on PC-BASIC (GPL v3) token and language specifications.
+  - **Phase 1: Interactive REPL, Line Management, Tokenizer, Lister & Basic Execution**:
+    - **64 KB Program Memory Segment**: Dynamically allocates a full 64 KB segment via `os_mem_alloc(4096)` managing a linked list of tokenized program lines (`next_offset`, `line_num`, token data, `0x00` delimiter).
+    - **GW-BASIC Token Dictionary (`user/basic_tokens.h`)**: Generated from PC-BASIC token tables, supporting all 182 GW-BASIC / BASICA keyword and function tokens (single-byte `0x81..0xF4`, two-byte prefixes `0xFD`, `0xFE`, `0xFF`, and special number tokens).
+    - **Fast Case-Insensitive Tokenizer (`basic_tokenize`)**: Tokenizes ASCII input lines with word-boundary checks (preserving identifiers like `PRINTER` vs `PRINT`), string literal preservation, and comment shorthands (`?` for `PRINT`, `'` for `REM`).
+    - **Lister (`basic_cmd_list`)**: De-tokenizes bytecode back into formatted ASCII BASIC program listings supporting range arguments (`LIST`, `LIST 10`, `LIST 10-50`, `LIST -30`).
+    - **Line Insertion / Replacement / Deletion**: Entering a numbered line inserts or replaces lines in sorted numerical order; entering a bare line number deletes the line.
+    - **Immediate & Program Execution**: Supports immediate commands (`NEW`, `LIST`, `RUN`, `CLS`, `SYSTEM`) and basic statement execution (`PRINT` with string literals, semicolons, and 14-column commas; `REM`; `END`/`STOP`; `CLS`). Includes non-blocking `Ctrl+C` break handling during program runs.
+  - **Phase 2: Variables (%, $), Expression Evaluator & Control Flow (`LET`, `INPUT`, `IF/THEN/ELSE`, `GOTO`, `GOSUB/RETURN`)**:
+    - **Variable Subsystem & Symbol Table**: Case-insensitive scalar variables (up to 96 variables) supporting 16-bit signed integer (`%` or default unsuffixed) and dynamic strings (`$`, up to 128 characters). Automatically allocates on first assignment and clears upon `RUN`, `NEW`, or `CLEAR`.
+    - **Recursive Descent Expression Evaluator (`basic_eval_expr`)**: Full operator precedence climbing evaluating binary and unary operations:
+      - Relational operators (`=`, `<>`, `<`, `>`, `<=`, `>=`) returning standard GW-BASIC truth values (`-1` for TRUE, `0` for FALSE), with string comparisons.
+      - Bitwise / logical operators (`AND`, `OR`, `XOR`, `NOT`).
+      - Additive & multiplicative arithmetic (`+`, `-`, `*`, `/`, `\`, `MOD`) with zero-division traps and string concatenation (`+`).
+      - Integer literals (decimal, `&H` hex, `&O` octal), string literals (`"..."`), and parentheses `( ... )`.
+      - Built-in functions: `INKEY$`, `CHR$`, `ASC`, `LEN`, `VAL`, `STR$`, `ABS`, `SGN`, `RND`, `LEFT$`, `RIGHT$`, `MID$`.
+    - **Control Flow Statements**:
+      - `LET` and implicit variable assignment (e.g. `LET A = 5`, `A = 5`, `NAME$ = "HELLO"`).
+      - `INPUT` with optional prompt strings, semicolons/commas (`INPUT "Prompt"; A, B$`), reading comma-delimited input lines.
+      - `IF <expr> THEN <statement|linenum> [ELSE <statement|linenum>]` supporting nested IFs, clause skipping, and branch redirection.
+      - `GOTO <linenum>` with fast sorted linked-list line lookup.
+      - `GOSUB <linenum>` / `RETURN` with a dedicated 32-level return call stack tracking return line and statement position.
+
 ## Revision 1.0.2 (2026-11-21)
 
 - **CP/M-80 2.2 Execution Subsystem (`/BIN/CPM.BIN`, `/BIN/TEST80.COM`, `user/cpm.c`, `user/cpm_v20.asm`, `tools/gen_test80.py`)**:
