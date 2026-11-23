@@ -5,6 +5,7 @@
 // Phase 1: Interactive REPL, Line Storage, Tokenizer, Lister & Basic Commands
 // Phase 2: Variables (%, $), Expressions & Math Parser, Control Flow (LET, INPUT, IF/THEN/ELSE, GOTO, GOSUB/RETURN)
 // Phase 3: Loops (FOR/NEXT, WHILE/WEND), Arrays (DIM, 1D/2D), Data (DATA/READ/RESTORE), Screen (LOCATE, SWAP)
+// Phase 4: File I/O & Persistence (SAVE, LOAD, FILES, OPEN, CLOSE, PRINT#, WRITE#, INPUT#, LINE INPUT, EOF)
 
 #include "hobbyos.h"
 #include "basic_tokens.h"
@@ -24,6 +25,9 @@
 #define BASIC_MAX_WHILE_NEST 16
 #define BASIC_MAX_ARRAYS    32
 #define BASIC_STR_ELEM_LEN  32
+
+#define BASIC_MAX_FILES     4
+#define BASIC_FILE_BUF_SIZE 256
 
 #define BASIC_TYPE_INT      1
 #define BASIC_TYPE_STR      2
@@ -61,6 +65,19 @@ typedef struct {
     uint16_t dim2;      /* e.g. 1 for 1D, or dim2 for 2D */
     uint16_t data_off;  /* Offset in s_basic_seg */
 } basic_array_t;
+
+/* File handle structure */
+typedef struct {
+    int      is_open;
+    uint8_t  mode;      /* 'I', 'O', 'A' */
+    char     filename[32];
+    uint32_t file_pos;
+    uint32_t file_len;
+    uint8_t  buf[BASIC_FILE_BUF_SIZE];
+    uint16_t buf_pos;
+    uint16_t buf_len;
+    uint8_t  eof;
+} basic_file_t;
 
 /* Call stack frame for GOSUB / RETURN */
 typedef struct {
@@ -128,6 +145,9 @@ static uint16_t            s_while_sp       = 0;
 static uint16_t s_data_line_off     = 0;
 static uint16_t s_data_stmt_pos     = 0;
 
+/* File handles (#1..#4) */
+static basic_file_t s_files[BASIC_MAX_FILES];
+
 /* Random number seed */
 static uint16_t s_rnd_seed          = 0x1234;
 
@@ -136,6 +156,10 @@ static int basic_eval_expr(const uint8_t __far *tok, uint16_t *pos, basic_val_t 
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos);
 static int basic_skip_to_next(const uint8_t __far *tok, uint16_t *pos, const char *var_name);
 static int basic_skip_to_wend(const uint8_t __far *tok, uint16_t *pos);
+static void basic_close_all_files(void);
+static void basic_cmd_run(void);
+static int basic_insert_line(uint16_t line_num, const uint8_t *tok_data, uint16_t tok_len);
+static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out);
 
 /* --------------------------------------------------------------------------
  * Helper String & Math Functions
@@ -301,6 +325,45 @@ static int16_t basic_rand(void) {
     return (int16_t)(s_rnd_seed & 0x7FFF);
 }
 
+static int basic_wildcard_match(const char *pat, const char *str) {
+    while (*pat != '\0') {
+        if (*pat == '*') {
+            pat++;
+            if (*pat == '\0') return 1;
+            while (*str != '\0') {
+                if (basic_wildcard_match(pat, str)) return 1;
+                str++;
+            }
+            return 0;
+        } else if (*pat == '?' || basic_toupper(*pat) == basic_toupper(*str)) {
+            if (*str == '\0') return 0;
+            pat++;
+            str++;
+        } else {
+            return 0;
+        }
+    }
+    return (*str == '\0');
+}
+
+static void basic_normalize_filename(char *dst, const char *src, uint16_t max_len) {
+    uint16_t i = 0;
+    int has_dot = 0;
+    while (src[i] != '\0' && i + 1 < max_len) {
+        dst[i] = basic_toupper(src[i]);
+        if (dst[i] == '.') has_dot = 1;
+        i++;
+    }
+    dst[i] = '\0';
+    if (!has_dot && i + 4 < max_len) {
+        dst[i++] = '.';
+        dst[i++] = 'B';
+        dst[i++] = 'A';
+        dst[i++] = 'S';
+        dst[i] = '\0';
+    }
+}
+
 /* --------------------------------------------------------------------------
  * Variable Storage & Symbol Table
  * -------------------------------------------------------------------------- */
@@ -382,7 +445,7 @@ static basic_array_t *basic_find_array(const char *name) {
 }
 
 static basic_array_t *basic_create_default_array(const char *name, uint8_t num_dims) {
-    uint16_t dim1 = 11; /* 0..10 */
+    uint16_t dim1 = 11;
     uint16_t dim2 = (num_dims == 2) ? 11 : 1;
     uint16_t total_elems = (num_dims == 1) ? dim1 : (dim1 * dim2);
     uint16_t len = basic_strlen(name);
@@ -494,6 +557,69 @@ static int basic_write_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, co
 }
 
 /* --------------------------------------------------------------------------
+ * File Subsystem Support (Handles #1..#4)
+ * -------------------------------------------------------------------------- */
+
+static void basic_close_all_files(void) {
+    uint8_t i;
+    for (i = 0; i < BASIC_MAX_FILES; i++) {
+        s_files[i].is_open = 0;
+    }
+}
+
+static int basic_file_getc(uint8_t fnum) {
+    basic_file_t *f;
+    if (fnum < 1 || fnum > BASIC_MAX_FILES) return -1;
+    f = &s_files[fnum - 1];
+    if (!f->is_open || f->mode != 'I') return -1;
+
+    if (f->buf_pos >= f->buf_len) {
+        uint16_t to_read;
+        uint16_t rd;
+        if (f->file_pos >= f->file_len) {
+            f->eof = 1;
+            return -1;
+        }
+        to_read = (uint16_t)((f->file_len - f->file_pos > BASIC_FILE_BUF_SIZE) ?
+                             BASIC_FILE_BUF_SIZE : (f->file_len - f->file_pos));
+        rd = os_file_read_offset(f->filename, (void __far *)FP_HERE(f->buf), to_read, f->file_pos);
+        if (rd == 0) {
+            f->eof = 1;
+            return -1;
+        }
+        f->file_pos += rd;
+        f->buf_pos = 0;
+        f->buf_len = rd;
+    }
+    return (int)f->buf[f->buf_pos++];
+}
+
+static void basic_file_ungetc(uint8_t fnum) {
+    basic_file_t *f;
+    if (fnum < 1 || fnum > BASIC_MAX_FILES) return;
+    f = &s_files[fnum - 1];
+    if (!f->is_open || f->mode != 'I') return;
+    if (f->buf_pos > 0) {
+        f->buf_pos--;
+        f->eof = 0;
+    }
+}
+
+static int basic_file_write_data(uint8_t fnum, const char *data, uint16_t len) {
+    basic_file_t *f;
+    if (fnum < 1 || fnum > BASIC_MAX_FILES) return -1;
+    f = &s_files[fnum - 1];
+    if (!f->is_open || (f->mode != 'O' && f->mode != 'A')) {
+        os_puts("Bad file mode\n");
+        return -1;
+    }
+    os_file_append(f->filename, (const void __far *)FP_HERE(data), len);
+    f->file_pos += len;
+    f->file_len += len;
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
  * Tokenizer
  * -------------------------------------------------------------------------- */
 
@@ -504,14 +630,12 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
     while (in[ip] != '\0' && op + 2 < max_out) {
         char c = in[ip];
 
-        /* Whitespace outside strings */
         if (c == ' ' || c == '\t') {
             out[op++] = (uint8_t)c;
             ip++;
             continue;
         }
 
-        /* String literal */
         if (c == '"') {
             out[op++] = (uint8_t)c;
             ip++;
@@ -526,9 +650,8 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
             continue;
         }
 
-        /* Comment shorthand single-quote ' */
         if (c == '\'') {
-            out[op++] = TOK_SQUOTE; /* 0xD9 */
+            out[op++] = TOK_SQUOTE;
             ip++;
             while (in[ip] != '\0' && op + 1 < max_out) {
                 out[op++] = (uint8_t)in[ip++];
@@ -536,14 +659,12 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
             break;
         }
 
-        /* Question mark shorthand for PRINT */
         if (c == '?') {
-            out[op++] = TOK_PRINT;  /* 0x91 */
+            out[op++] = TOK_PRINT;
             ip++;
             continue;
         }
 
-        /* Check against keyword table */
         {
             uint16_t k;
             uint16_t tok;
@@ -595,15 +716,30 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
 }
 
 /* --------------------------------------------------------------------------
- * Lister
+ * Lister & De-tokenizer
  * -------------------------------------------------------------------------- */
 
-static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
+static uint16_t basic_detokenize_line(uint16_t line_num, const uint8_t __far *tok_data, char *out_buf, uint16_t max_out) {
     uint16_t p = 0;
-    basic_print_uint(line_num);
-    os_putc(' ');
+    uint16_t op = 0;
+    char num_buf[8];
+    int np = 0;
+    uint16_t v = line_num;
 
-    while (tok_data[p] != 0x00) {
+    if (v == 0) {
+        if (op + 1 < max_out) out_buf[op++] = '0';
+    } else {
+        while (v > 0) {
+            num_buf[np++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (np > 0 && op + 1 < max_out) {
+            out_buf[op++] = num_buf[--np];
+        }
+    }
+    if (op + 1 < max_out) out_buf[op++] = ' ';
+
+    while (tok_data[p] != 0x00 && op + 2 < max_out) {
         uint8_t b = tok_data[p++];
 
         if (b == 0xFD || b == 0xFE || b == 0xFF) {
@@ -611,23 +747,31 @@ static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
             uint16_t tok = ((uint16_t)b << 8) | b2;
             const char *name = basic_token_to_name(tok);
             if (name) {
-                os_puts(name);
-                if (tok_data[p] >= 'A' && tok_data[p] <= 'Z') {
-                    os_putc(' ');
+                while (*name && op + 1 < max_out) out_buf[op++] = *name++;
+                if (tok_data[p] >= 'A' && tok_data[p] <= 'Z' && op + 1 < max_out) {
+                    out_buf[op++] = ' ';
                 }
             }
         } else if (b >= 0x81) {
             const char *name = basic_token_to_name((uint16_t)b);
             if (name) {
-                os_puts(name);
-                if (b != TOK_SQUOTE && tok_data[p] >= 'A' && tok_data[p] <= 'Z') {
-                    os_putc(' ');
+                while (*name && op + 1 < max_out) out_buf[op++] = *name++;
+                if (b != TOK_SQUOTE && tok_data[p] >= 'A' && tok_data[p] <= 'Z' && op + 1 < max_out) {
+                    out_buf[op++] = ' ';
                 }
             }
         } else {
-            os_putc((char)b);
+            out_buf[op++] = (char)b;
         }
     }
+    out_buf[op] = '\0';
+    return op;
+}
+
+static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
+    char buf[BASIC_MAX_LINE_LEN];
+    basic_detokenize_line(line_num, tok_data, buf, sizeof(buf));
+    os_puts(buf);
     os_putc('\n');
 }
 
@@ -639,6 +783,7 @@ static void basic_new(void) {
     s_prog_head = 0;
     s_prog_tail = 4;
     basic_clear_vars();
+    basic_close_all_files();
     s_gosub_sp = 0;
     s_for_sp = 0;
     s_while_sp = 0;
@@ -753,6 +898,37 @@ static void basic_cmd_list(uint16_t start_line, uint16_t end_line) {
 
         cur = next;
     }
+}
+
+static void basic_cmd_files(const char *pattern) {
+    os_dir_entry_t entry;
+    uint16_t idx = 0;
+    int col = 0;
+
+    for (;;) {
+        int res = os_dir_entry(idx++, (os_dir_entry_t __far *)FP_HERE(&entry));
+        if (res < 0) break;
+        if (entry.name[0] == '\0') break;
+
+        if (pattern && pattern[0] != '\0') {
+            if (!basic_wildcard_match(pattern, entry.name)) continue;
+        }
+
+        os_puts(entry.name);
+        {
+            uint16_t len = basic_strlen(entry.name);
+            while (len < 15) {
+                os_putc(' ');
+                len++;
+            }
+        }
+        col++;
+        if (col >= 4) {
+            os_putc('\n');
+            col = 0;
+        }
+    }
+    if (col != 0) os_putc('\n');
 }
 
 /* --------------------------------------------------------------------------
@@ -909,6 +1085,27 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             return -1;
         }
         p++;
+
+        /* EOF(filenum) */
+        if (fn == (uint8_t)(TOK_EOF & 0xFF)) {
+            basic_val_t arg;
+            uint8_t fnum;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            fnum = (uint8_t)arg.ival;
+            out_val->type = BASIC_TYPE_INT;
+            if (fnum >= 1 && fnum <= BASIC_MAX_FILES && s_files[fnum - 1].is_open) {
+                basic_file_t *f = &s_files[fnum - 1];
+                int is_eof = f->eof || (f->buf_pos >= f->buf_len && f->file_pos >= f->file_len);
+                out_val->ival = is_eof ? -1 : 0;
+            } else {
+                out_val->ival = -1;
+            }
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
 
         /* CHR$(X) */
         if (fn == (uint8_t)(TOK_CHR & 0xFF)) {
@@ -1122,7 +1319,6 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             return -1;
         }
 
-        /* Check if array access */
         while (tok[p] == ' ' || tok[p] == '\t') p++;
         if (tok[p] == '(') {
             basic_val_t i1_val, i2_val;
@@ -1156,7 +1352,6 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             return 0;
         }
 
-        /* Scalar variable lookup */
         {
             basic_var_t *var = basic_find_var(var_name);
             if (var) {
@@ -1376,7 +1571,549 @@ static int basic_eval_expr(const uint8_t __far *tok, uint16_t *pos, basic_val_t 
 }
 
 /* --------------------------------------------------------------------------
- * Statement Execution (Phase 1, Phase 2 & Phase 3)
+ * Persistence & File Commands (SAVE, LOAD, FILES, OPEN, CLOSE)
+ * -------------------------------------------------------------------------- */
+
+static int basic_exec_save(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t fname_val;
+    char fname[32];
+    int ascii_mode = 0;
+
+    p++; /* skip TOK_SAVE */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &fname_val) != 0) return -1;
+    if (fname_val.type != BASIC_TYPE_STR || !fname_val.sval) {
+        os_puts("Type mismatch in SAVE filename\n");
+        return -1;
+    }
+    basic_normalize_filename(fname, fname_val.sval, sizeof(fname));
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == 'A' || tok[p] == 'a') {
+            ascii_mode = 1;
+            p++;
+        } else if (tok[p] == 'P' || tok[p] == 'p') {
+            p++;
+        } else {
+            os_puts("Syntax error in SAVE option\n");
+            return -1;
+        }
+    }
+
+    if (ascii_mode) {
+        uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+        uint16_t cur = s_prog_head;
+        char line_buf[BASIC_MAX_LINE_LEN + 4];
+
+        os_file_write(fname, (const void __far *)FP_HERE(""), 0);
+
+        while (cur != 0) {
+            uint16_t next = (uint16_t)mem[cur] | ((uint16_t)mem[cur + 1] << 8);
+            uint16_t num  = (uint16_t)mem[cur + 2] | ((uint16_t)mem[cur + 3] << 8);
+            uint16_t len  = basic_detokenize_line(num, &mem[cur + 4], line_buf, sizeof(line_buf) - 2);
+
+            line_buf[len++] = '\r';
+            line_buf[len++] = '\n';
+            line_buf[len]   = '\0';
+
+            os_file_append(fname, (const void __far *)FP_HERE(line_buf), len);
+            cur = next;
+        }
+    } else {
+        uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+        uint16_t cur = s_prog_head;
+        uint16_t out_off = (s_prog_tail + 15) & ~15;
+        uint16_t p_out = out_off;
+
+        if ((uint32_t)out_off + 2048 >= 65000L) {
+            os_puts("Out of memory in SAVE\n");
+            return -1;
+        }
+
+        mem[p_out++] = 0xFF; /* Binary GW-BASIC magic header */
+
+        while (cur != 0) {
+            uint16_t next = (uint16_t)mem[cur] | ((uint16_t)mem[cur + 1] << 8);
+            uint16_t num  = (uint16_t)mem[cur + 2] | ((uint16_t)mem[cur + 3] << 8);
+            uint16_t tok_p = cur + 4;
+
+            mem[p_out++] = 0x01; /* non-zero link placeholder */
+            mem[p_out++] = 0x00;
+            mem[p_out++] = (uint8_t)(num & 0xFF);
+            mem[p_out++] = (uint8_t)(num >> 8);
+
+            while (mem[tok_p] != 0x00 && p_out < 65000U) {
+                mem[p_out++] = mem[tok_p++];
+            }
+            mem[p_out++] = 0x00;
+            cur = next;
+        }
+
+        mem[p_out++] = 0x00;
+        mem[p_out++] = 0x00;
+
+        os_file_write(fname, (const void __far *)MK_FP(s_basic_seg, out_off), p_out - out_off);
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_load(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t fname_val;
+    char fname[32];
+    int run_after = 0;
+    long sz;
+    uint8_t __far *mem;
+    uint16_t load_seg_off = 0x8000;
+    uint16_t bytes_read;
+
+    p++; /* skip TOK_LOAD */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &fname_val) != 0) return -1;
+    if (fname_val.type != BASIC_TYPE_STR || !fname_val.sval) {
+        os_puts("Type mismatch in LOAD filename\n");
+        return -1;
+    }
+    basic_normalize_filename(fname, fname_val.sval, sizeof(fname));
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == 'R' || tok[p] == 'r') {
+            run_after = 1;
+            p++;
+        } else if (tok[p] == 'A' || tok[p] == 'a') {
+            /* Optional ASCII specifier (ASCII/binary is autodetected) */
+            p++;
+        } else {
+            os_puts("Syntax error in LOAD option\n");
+            return -1;
+        }
+    }
+
+    sz = os_file_size(fname);
+    if (sz <= 0 || sz > 32000L) {
+        os_puts("File not found\n");
+        return -1;
+    }
+
+    mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+    bytes_read = os_file_read(fname, (void __far *)MK_FP(s_basic_seg, load_seg_off), (uint16_t)sz);
+    if (bytes_read == 0) {
+        os_puts("Read error\n");
+        return -1;
+    }
+
+    basic_new();
+
+    if (mem[load_seg_off] == 0xFF) {
+        /* Binary GW-BASIC file */
+        uint16_t fp = load_seg_off + 1;
+        while (fp + 4 < load_seg_off + bytes_read) {
+            uint16_t next_ptr = (uint16_t)mem[fp] | ((uint16_t)mem[fp + 1] << 8);
+            uint16_t num;
+            uint16_t tok_start;
+            uint16_t tok_len = 0;
+
+            if (next_ptr == 0) break;
+
+            num = (uint16_t)mem[fp + 2] | ((uint16_t)mem[fp + 3] << 8);
+            tok_start = fp + 4;
+            while (mem[tok_start + tok_len] != 0x00 && tok_start + tok_len < load_seg_off + bytes_read) {
+                tok_len++;
+            }
+
+            {
+                uint8_t tok_tmp[BASIC_MAX_LINE_LEN];
+                uint16_t k;
+                for (k = 0; k < tok_len && k < sizeof(tok_tmp) - 1; k++) {
+                    tok_tmp[k] = mem[tok_start + k];
+                }
+                tok_tmp[k] = 0x00;
+                basic_insert_line(num, tok_tmp, k);
+            }
+            fp = tok_start + tok_len + 1;
+        }
+    } else {
+        /* ASCII text file */
+        uint16_t fp = load_seg_off;
+        char line_buf[BASIC_MAX_LINE_LEN];
+        uint8_t tok_tmp[BASIC_MAX_LINE_LEN];
+
+        while (fp < load_seg_off + bytes_read) {
+            uint16_t lp = 0;
+            uint16_t sp = 0;
+
+            while (fp < load_seg_off + bytes_read && mem[fp] != '\r' && mem[fp] != '\n') {
+                if (lp + 1 < sizeof(line_buf)) line_buf[lp++] = (char)mem[fp];
+                fp++;
+            }
+            line_buf[lp] = '\0';
+            while (fp < load_seg_off + bytes_read && (mem[fp] == '\r' || mem[fp] == '\n')) fp++;
+
+            while (line_buf[sp] == ' ' || line_buf[sp] == '\t') sp++;
+            if (basic_is_digit(line_buf[sp])) {
+                uint16_t num = basic_parse_uint(line_buf, &sp);
+                uint16_t tlen;
+                while (line_buf[sp] == ' ' || line_buf[sp] == '\t') sp++;
+                tlen = basic_tokenize(&line_buf[sp], tok_tmp, sizeof(tok_tmp));
+                basic_insert_line(num, tok_tmp, tlen);
+            }
+        }
+    }
+
+    if (run_after) {
+        basic_cmd_run();
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_open(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t arg1;
+    uint8_t mode = 'I';
+    char fname[32];
+    uint8_t fnum = 1;
+    long sz;
+
+    p++; /* skip TOK_OPEN */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &arg1) != 0) return -1;
+    if (arg1.type != BASIC_TYPE_STR || !arg1.sval) {
+        os_puts("Type mismatch in OPEN\n");
+        return -1;
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == ',') {
+        /* Syntax 1: OPEN "mode", #n, "filename" */
+        basic_val_t fnum_val, fname_val;
+        mode = (uint8_t)basic_toupper(arg1.sval[0]);
+        p++; /* skip ',' */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == '#') p++;
+
+        if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+        fnum = (uint8_t)fnum_val.ival;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',') {
+            os_puts("Syntax error in OPEN (expected ',')\n");
+            return -1;
+        }
+        p++;
+
+        if (basic_eval_expr(tok, &p, &fname_val) != 0) return -1;
+        if (fname_val.type != BASIC_TYPE_STR || !fname_val.sval) {
+            os_puts("Type mismatch in filename\n");
+            return -1;
+        }
+        basic_strncpy(fname, fname_val.sval, sizeof(fname) - 1);
+        fname[sizeof(fname) - 1] = '\0';
+    } else if (tok[p] == TOK_FOR) {
+        /* Syntax 2: OPEN "filename" FOR INPUT/OUTPUT/APPEND AS #n */
+        basic_val_t fnum_val;
+        basic_strncpy(fname, arg1.sval, sizeof(fname) - 1);
+        fname[sizeof(fname) - 1] = '\0';
+
+        p++; /* skip TOK_FOR */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+        if (basic_strnicmp((const char *)&tok[p], "OUTPUT", 6) == 0) {
+            mode = 'O';
+            p += 6;
+        } else if (tok[p] == TOK_INPUT || basic_strnicmp((const char *)&tok[p], "INPUT", 5) == 0) {
+            mode = 'I';
+            p = (tok[p] == TOK_INPUT) ? (p + 1) : (p + 5);
+        } else if (basic_strnicmp((const char *)&tok[p], "APPEND", 6) == 0) {
+            mode = 'A';
+            p += 6;
+        } else {
+            os_puts("Bad file mode in OPEN\n");
+            return -1;
+        }
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (basic_strnicmp((const char *)&tok[p], "AS", 2) == 0) {
+            p += 2;
+        }
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == '#') p++;
+
+        if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+        fnum = (uint8_t)fnum_val.ival;
+    } else {
+        os_puts("Syntax error in OPEN\n");
+        return -1;
+    }
+
+    if (fnum < 1 || fnum > BASIC_MAX_FILES) {
+        os_puts("Bad file number\n");
+        return -1;
+    }
+
+    {
+        basic_file_t *f = &s_files[fnum - 1];
+        if (f->is_open) {
+            os_puts("File already open\n");
+            return -1;
+        }
+
+        f->mode = mode;
+        basic_strncpy(f->filename, fname, sizeof(f->filename) - 1);
+        f->filename[sizeof(f->filename) - 1] = '\0';
+        f->buf_pos = 0;
+        f->buf_len = 0;
+        f->eof = 0;
+
+        if (mode == 'O') {
+            os_file_write(f->filename, (const void __far *)FP_HERE(""), 0);
+            f->file_pos = 0;
+            f->file_len = 0;
+        } else if (mode == 'A') {
+            sz = os_file_size(f->filename);
+            f->file_pos = (sz > 0) ? (uint32_t)sz : 0;
+            f->file_len = f->file_pos;
+        } else {
+            sz = os_file_size(f->filename);
+            if (sz < 0) {
+                os_puts("File not found\n");
+                return -1;
+            }
+            f->file_pos = 0;
+            f->file_len = (uint32_t)sz;
+        }
+        f->is_open = 1;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_close(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_CLOSE */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == 0x00 || tok[p] == ':') {
+        basic_close_all_files();
+        *pos = p;
+        return 0;
+    }
+
+    for (;;) {
+        basic_val_t fnum_val;
+        uint8_t fnum;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == '#') p++;
+        if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+        fnum = (uint8_t)fnum_val.ival;
+        if (fnum >= 1 && fnum <= BASIC_MAX_FILES) {
+            s_files[fnum - 1].is_open = 0;
+        }
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            continue;
+        }
+        break;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_write_file(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t fnum_val;
+    uint8_t fnum;
+
+    p++; /* skip TOK_WRITE */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] != '#') {
+        os_puts("Syntax error in WRITE (expected '#')\n");
+        return -1;
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+    fnum = (uint8_t)fnum_val.ival;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in WRITE (expected ',')\n");
+        return -1;
+    }
+    p++;
+
+    {
+        int first = 1;
+        char num_buf[16];
+
+        while (tok[p] != 0x00 && tok[p] != ':') {
+            basic_val_t val;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == 0x00 || tok[p] == ':') break;
+
+            if (!first) {
+                basic_file_write_data(fnum, ",", 1);
+            }
+            first = 0;
+
+            if (basic_eval_expr(tok, &p, &val) != 0) return -1;
+
+            if (val.type == BASIC_TYPE_STR) {
+                basic_file_write_data(fnum, "\"", 1);
+                if (val.sval) {
+                    basic_file_write_data(fnum, val.sval, basic_strlen(val.sval));
+                }
+                basic_file_write_data(fnum, "\"", 1);
+            } else {
+                int16_t v = val.ival;
+                int np = 0;
+                int sign = 0;
+                if (v < 0) { sign = 1; v = -v; }
+                if (v == 0) {
+                    num_buf[np++] = '0';
+                } else {
+                    char tmp[8];
+                    int tp = 0;
+                    while (v > 0) {
+                        tmp[tp++] = (char)('0' + (v % 10));
+                        v /= 10;
+                    }
+                    if (sign) num_buf[np++] = '-';
+                    while (tp > 0) num_buf[np++] = tmp[--tp];
+                }
+                basic_file_write_data(fnum, num_buf, (uint16_t)np);
+            }
+
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ',') {
+                p++;
+                continue;
+            }
+            break;
+        }
+        basic_file_write_data(fnum, "\r\n", 2);
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static uint16_t basic_read_line(char *buf, uint16_t max_len);
+
+static int basic_exec_line_input(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_INPUT */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == '#') {
+        /* LINE INPUT #n, var$ */
+        basic_val_t fnum_val;
+        uint8_t fnum;
+        char var_name[BASIC_MAX_VARNAME];
+        basic_var_t *var;
+        char line_buf[BASIC_MAX_STR_LEN + 1];
+        uint16_t lp = 0;
+
+        p++;
+        if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+        fnum = (uint8_t)fnum_val.ival;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',') {
+            os_puts("Syntax error in LINE INPUT (expected ',')\n");
+            return -1;
+        }
+        p++;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+            os_puts("Syntax error in variable name\n");
+            return -1;
+        }
+
+        var = basic_get_or_create_var(var_name);
+        if (!var || var->type != BASIC_TYPE_STR) {
+            os_puts("Type mismatch in LINE INPUT\n");
+            return -1;
+        }
+
+        for (;;) {
+            int ch = basic_file_getc(fnum);
+            if (ch < 0) break;
+            if (ch == '\r') continue;
+            if (ch == '\n') break;
+            if (lp < BASIC_MAX_STR_LEN) {
+                line_buf[lp++] = (char)ch;
+            }
+        }
+        line_buf[lp] = '\0';
+        basic_strcpy(var->sval, line_buf);
+    } else {
+        /* Console LINE INPUT [prompt;] var$ */
+        char prompt_buf[80];
+        char in_buf[BASIC_MAX_LINE_LEN];
+        char var_name[BASIC_MAX_VARNAME];
+        basic_var_t *var;
+        int has_prompt = 0;
+
+        if (tok[p] == '"') {
+            uint16_t pp = 0;
+            p++;
+            while (tok[p] != 0 && tok[p] != '"') {
+                if (pp + 1 < sizeof(prompt_buf)) prompt_buf[pp++] = (char)tok[p];
+                p++;
+            }
+            if (tok[p] == '"') p++;
+            prompt_buf[pp] = '\0';
+            has_prompt = 1;
+
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ';' || tok[p] == ',') p++;
+        }
+
+        if (has_prompt) os_puts(prompt_buf);
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+            os_puts("Syntax error in LINE INPUT variable\n");
+            return -1;
+        }
+
+        var = basic_get_or_create_var(var_name);
+        if (!var || var->type != BASIC_TYPE_STR) {
+            os_puts("Type mismatch in LINE INPUT\n");
+            return -1;
+        }
+
+        basic_read_line(in_buf, sizeof(in_buf));
+        basic_strncpy(var->sval, in_buf, sizeof(var->sval) - 1);
+        var->sval[sizeof(var->sval) - 1] = '\0';
+    }
+
+    *pos = p;
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Statement Execution (Phase 1, Phase 2, Phase 3 & Phase 4)
  * -------------------------------------------------------------------------- */
 
 static int basic_skip_to_else(const uint8_t __far *tok, uint16_t *pos) {
@@ -1440,7 +2177,6 @@ static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
         return -1;
     }
 
-    /* Check if assignment to array element: var(i [, j]) = expr */
     while (tok[p] == ' ' || tok[p] == '\t') p++;
     if (tok[p] == '(') {
         basic_val_t i1_val, i2_val;
@@ -1483,7 +2219,6 @@ static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
         return 0;
     }
 
-    /* Scalar variable assignment */
     while (tok[p] == ' ' || tok[p] == '\t') p++;
     if (tok[p] != TOK_EQ && tok[p] != '=') {
         os_puts("Syntax error (expected '=')\n");
@@ -2256,91 +2991,86 @@ static int basic_exec_if(const uint8_t __far *tok, uint16_t *pos) {
     }
 }
 
-static uint16_t basic_read_line(char *buf, uint16_t max_len);
-
 static int basic_exec_input(const uint8_t __far *tok, uint16_t *pos) {
-    char prompt_buf[80];
-    char in_buf[BASIC_MAX_LINE_LEN];
     uint16_t p = *pos;
-    int has_prompt = 0;
-    int print_qmark = 1;
-
     p++;
     while (tok[p] == ' ' || tok[p] == '\t') p++;
 
-    if (tok[p] == '"') {
-        uint16_t pp = 0;
+    /* File INPUT: INPUT #filenum, var1 [, var2 ...] */
+    if (tok[p] == '#') {
+        basic_val_t fnum_val;
+        uint8_t fnum;
         p++;
-        while (tok[p] != 0 && tok[p] != '"') {
-            if (pp + 1 < sizeof(prompt_buf)) {
-                prompt_buf[pp++] = (char)tok[p];
-            }
-            p++;
-        }
-        if (tok[p] == '"') p++;
-        prompt_buf[pp] = '\0';
-        has_prompt = 1;
+        if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+        fnum = (uint8_t)fnum_val.ival;
 
         while (tok[p] == ' ' || tok[p] == '\t') p++;
-        if (tok[p] == ';') {
-            print_qmark = 1;
-            p++;
-        } else if (tok[p] == ',') {
-            print_qmark = 0;
-            p++;
+        if (tok[p] != ',') {
+            os_puts("Syntax error in INPUT (expected ',')\n");
+            return -1;
         }
-    }
+        p++;
 
-    if (has_prompt) {
-        os_puts(prompt_buf);
-    }
-    if (print_qmark) {
-        os_puts("? ");
-    }
-
-    if (basic_read_line(in_buf, sizeof(in_buf)) == 0 && in_buf[0] == '\0') {
-        s_running = 0;
-        return -1;
-    }
-
-    {
-        uint16_t ip = 0;
         for (;;) {
             char var_name[BASIC_MAX_VARNAME];
             basic_var_t *var;
+            char val_str[BASIC_MAX_STR_LEN + 1];
+            uint16_t vp = 0;
+            int ch;
 
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
-                os_puts("Syntax error in INPUT\n");
+                os_puts("Syntax error in INPUT variable\n");
                 return -1;
             }
 
             var = basic_get_or_create_var(var_name);
             if (!var) return -1;
 
-            while (in_buf[ip] == ' ' || in_buf[ip] == '\t') ip++;
-            if (var->type == BASIC_TYPE_STR) {
-                uint16_t sp = 0;
-                if (in_buf[ip] == '"') {
-                    ip++;
-                    while (in_buf[ip] != '\0' && in_buf[ip] != '"') {
-                        if (sp < BASIC_MAX_STR_LEN) var->sval[sp++] = in_buf[ip];
-                        ip++;
-                    }
-                    if (in_buf[ip] == '"') ip++;
-                } else {
-                    while (in_buf[ip] != '\0' && in_buf[ip] != ',') {
-                        if (sp < BASIC_MAX_STR_LEN) var->sval[sp++] = in_buf[ip];
-                        ip++;
-                    }
-                }
-                var->sval[sp] = '\0';
-            } else {
-                var->ival = basic_atoi(&in_buf[ip]);
-                while (in_buf[ip] != '\0' && in_buf[ip] != ',') ip++;
+            /* Read next item from file */
+            do {
+                ch = basic_file_getc(fnum);
+            } while (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+
+            if (ch < 0) {
+                os_puts("Input past end of file\n");
+                return -1;
             }
 
-            if (in_buf[ip] == ',') ip++;
+            if (ch == '"') {
+                for (;;) {
+                    ch = basic_file_getc(fnum);
+                    if (ch < 0 || ch == '"' || ch == '\n') break;
+                    if (vp < BASIC_MAX_STR_LEN && ch != '\r') val_str[vp++] = (char)ch;
+                }
+                /* Consume trailing spaces and the delimiter comma/newline */
+                do {
+                    ch = basic_file_getc(fnum);
+                } while (ch == ' ' || ch == '\t');
+                if (ch == '\r') {
+                    int next_ch = basic_file_getc(fnum);
+                    if (next_ch != '\n' && next_ch >= 0) basic_file_ungetc(fnum);
+                } else if (ch != ',') {
+                    if (ch >= 0) basic_file_ungetc(fnum);
+                }
+            } else {
+                while (ch >= 0 && ch != ',' && ch != '\r' && ch != '\n') {
+                    if (vp < BASIC_MAX_STR_LEN) val_str[vp++] = (char)ch;
+                    ch = basic_file_getc(fnum);
+                }
+                while (vp > 0 && (val_str[vp - 1] == ' ' || val_str[vp - 1] == '\t')) vp--;
+                if (ch == '\r') {
+                    int next_ch = basic_file_getc(fnum);
+                    if (next_ch != '\n' && next_ch >= 0) basic_file_ungetc(fnum);
+                }
+            }
+            val_str[vp] = '\0';
+
+            if (var->type == BASIC_TYPE_STR) {
+                basic_strcpy(var->sval, val_str);
+            } else {
+                var->ival = basic_atoi(val_str);
+            }
 
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == ',') {
@@ -2348,6 +3078,100 @@ static int basic_exec_input(const uint8_t __far *tok, uint16_t *pos) {
                 continue;
             }
             break;
+        }
+
+        *pos = p;
+        return 0;
+    }
+
+    /* Console INPUT [prompt;] var1 [, var2 ...] */
+    {
+        char prompt_buf[80];
+        char in_buf[BASIC_MAX_LINE_LEN];
+        int has_prompt = 0;
+        int print_qmark = 1;
+
+        if (tok[p] == '"') {
+            uint16_t pp = 0;
+            p++;
+            while (tok[p] != 0 && tok[p] != '"') {
+                if (pp + 1 < sizeof(prompt_buf)) {
+                    prompt_buf[pp++] = (char)tok[p];
+                }
+                p++;
+            }
+            if (tok[p] == '"') p++;
+            prompt_buf[pp] = '\0';
+            has_prompt = 1;
+
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ';') {
+                print_qmark = 1;
+                p++;
+            } else if (tok[p] == ',') {
+                print_qmark = 0;
+                p++;
+            }
+        }
+
+        if (has_prompt) {
+            os_puts(prompt_buf);
+        }
+        if (print_qmark) {
+            os_puts("? ");
+        }
+
+        if (basic_read_line(in_buf, sizeof(in_buf)) == 0 && in_buf[0] == '\0') {
+            s_running = 0;
+            return -1;
+        }
+
+        {
+            uint16_t ip = 0;
+            for (;;) {
+                char var_name[BASIC_MAX_VARNAME];
+                basic_var_t *var;
+
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+                    os_puts("Syntax error in INPUT\n");
+                    return -1;
+                }
+
+                var = basic_get_or_create_var(var_name);
+                if (!var) return -1;
+
+                while (in_buf[ip] == ' ' || in_buf[ip] == '\t') ip++;
+                if (var->type == BASIC_TYPE_STR) {
+                    uint16_t sp = 0;
+                    if (in_buf[ip] == '"') {
+                        ip++;
+                        while (in_buf[ip] != '\0' && in_buf[ip] != '"') {
+                            if (sp < BASIC_MAX_STR_LEN) var->sval[sp++] = in_buf[ip];
+                            ip++;
+                        }
+                        if (in_buf[ip] == '"') ip++;
+                    } else {
+                        while (in_buf[ip] != '\0' && in_buf[ip] != ',') {
+                            if (sp < BASIC_MAX_STR_LEN) var->sval[sp++] = in_buf[ip];
+                            ip++;
+                        }
+                    }
+                    var->sval[sp] = '\0';
+                } else {
+                    var->ival = basic_atoi(&in_buf[ip]);
+                    while (in_buf[ip] != '\0' && in_buf[ip] != ',') ip++;
+                }
+
+                if (in_buf[ip] == ',') ip++;
+
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] == ',') {
+                    p++;
+                    continue;
+                }
+                break;
+            }
         }
     }
 
@@ -2372,11 +3196,70 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return 0;
     }
 
-    /* PRINT statement */
+    /* PRINT statement (Console and File PRINT #n) */
     if (tok[p] == TOK_PRINT || tok[p] == '?') {
         int newline = 1;
         p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
 
+        if (tok[p] == '#') {
+            /* PRINT #filenum, expr ... */
+            basic_val_t fnum_val;
+            uint8_t fnum;
+            p++;
+            if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+            fnum = (uint8_t)fnum_val.ival;
+
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] != ',') {
+                os_puts("Syntax error in PRINT # (expected ',')\n");
+                return -1;
+            }
+            p++;
+
+            while (tok[p] != 0x00 && tok[p] != ':') {
+                basic_val_t val;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] == 0x00 || tok[p] == ':') break;
+
+                if (tok[p] == ';') {
+                    newline = 0;
+                    p++;
+                } else if (tok[p] == ',') {
+                    basic_file_write_data(fnum, "              ", 14);
+                    newline = 0;
+                    p++;
+                } else {
+                    if (basic_eval_expr(tok, &p, &val) != 0) return -1;
+                    if (val.type == BASIC_TYPE_STR) {
+                        if (val.sval) basic_file_write_data(fnum, val.sval, basic_strlen(val.sval));
+                    } else {
+                        char nbuf[16];
+                        int16_t v = val.ival;
+                        int np = 0;
+                        if (v >= 0) nbuf[np++] = ' ';
+                        else { nbuf[np++] = '-'; v = -v; }
+                        if (v == 0) nbuf[np++] = '0';
+                        else {
+                            char tmp[8];
+                            int tp = 0;
+                            while (v > 0) { tmp[tp++] = (char)('0' + (v % 10)); v /= 10; }
+                            while (tp > 0) nbuf[np++] = tmp[--tp];
+                        }
+                        nbuf[np++] = ' ';
+                        basic_file_write_data(fnum, nbuf, (uint16_t)np);
+                    }
+                    newline = 1;
+                }
+            }
+            if (newline) {
+                basic_file_write_data(fnum, "\r\n", 2);
+            }
+            *pos = p;
+            return 0;
+        }
+
+        /* Console PRINT */
         while (tok[p] != 0x00 && tok[p] != ':') {
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == 0x00 || tok[p] == ':' || tok[p] == TOK_ELSE) break;
@@ -2421,6 +3304,24 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return 0;
     }
 
+    /* WRITE statement */
+    if (tok[p] == TOK_WRITE) {
+        *pos = p;
+        return basic_exec_write_file(tok, pos);
+    }
+
+    /* LINE INPUT statement */
+    if (tok[p] == TOK_LINE) {
+        uint16_t save_p = p;
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == TOK_INPUT) {
+            *pos = p;
+            return basic_exec_line_input(tok, pos);
+        }
+        p = save_p;
+    }
+
     /* LET statement */
     if (tok[p] == TOK_LET) {
         p++;
@@ -2432,6 +3333,49 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == TOK_INPUT) {
         *pos = p;
         return basic_exec_input(tok, pos);
+    }
+
+    /* OPEN statement */
+    if (tok[p] == TOK_OPEN) {
+        *pos = p;
+        return basic_exec_open(tok, pos);
+    }
+
+    /* CLOSE statement */
+    if (tok[p] == TOK_CLOSE) {
+        *pos = p;
+        return basic_exec_close(tok, pos);
+    }
+
+    /* SAVE statement */
+    if (tok[p] == TOK_SAVE) {
+        *pos = p;
+        return basic_exec_save(tok, pos);
+    }
+
+    /* LOAD statement */
+    if (tok[p] == TOK_LOAD) {
+        *pos = p;
+        return basic_exec_load(tok, pos);
+    }
+
+    /* FILES statement (2-byte token 0xFE, 0x81) */
+    if (tok[p] == (uint8_t)(TOK_FILES >> 8) && tok[p + 1] == (uint8_t)(TOK_FILES & 0xFF)) {
+        char pat[32];
+        p += 2;
+        pat[0] = '\0';
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != 0 && tok[p] != ':') {
+            basic_val_t pat_val;
+            basic_eval_expr(tok, &p, &pat_val);
+            if (pat_val.type == BASIC_TYPE_STR && pat_val.sval) {
+                basic_strncpy(pat, pat_val.sval, sizeof(pat) - 1);
+                pat[sizeof(pat) - 1] = '\0';
+            }
+        }
+        basic_cmd_files(pat);
+        *pos = p;
+        return 0;
     }
 
     /* IF statement */
@@ -2587,6 +3531,7 @@ static void basic_cmd_run(void) {
     uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
 
     basic_clear_vars();
+    basic_close_all_files();
     s_gosub_sp = 0;
     s_for_sp = 0;
     s_while_sp = 0;
@@ -2753,6 +3698,7 @@ static void basic_process_input(char *line) {
         }
 
         if (tok_buf[0] == (uint8_t)(TOK_SYSTEM >> 8) && tok_buf[1] == (uint8_t)(TOK_SYSTEM & 0xFF)) {
+            basic_close_all_files();
             s_running = 0;
             os_exit(0);
             return;
@@ -2796,6 +3742,7 @@ int app_main(void) {
         }
     }
 
+    basic_close_all_files();
     os_mem_free(s_basic_seg);
     return 0;
 }

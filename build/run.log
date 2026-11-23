@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/23 15:23:46
+# 86Box v7.0 logfile, created 2026/11/23 16:02:55
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -73,4 +73,4 @@ Running /BOOT.SH...
 System ready.
 
 hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.
-SYS:/> 
+SYS:/> corrupted double-linked list

@@ -33,6 +33,20 @@
     - **Console Utilities**:
       - `LOCATE row, col`: 1-based cursor positioning (`1..25`, `1..80`) via `os_set_cursor()`.
       - `SWAP var1, var2`: Type-safe variable value exchange for integer and string scalar variables.
+  - **Phase 4: Program Persistence (SAVE, LOAD, FILES) & Sequential File I/O (OPEN, CLOSE, PRINT#, WRITE#, INPUT#, LINE INPUT#, EOF)**:
+    - **GW-BASIC Program Persistence**:
+      - `SAVE "filename" [, A]`: Saves program to disk. By default writes standard GW-BASIC tokenized binary `.BAS` format (magic byte `0xFF`, 2-byte line links, 2-byte line numbers, tokenized byte streams, terminated by `0x00, 0x00`). When `, A` is supplied, exports de-tokenized plain ASCII source.
+      - `LOAD "filename" [, R]`: Clears current program and variables, then loads from disk. Autodetects binary tokenized format (`0xFF` header) vs ASCII text lines; tokenizes ASCII lines line-by-line upon load. If `, R` is given, immediately executes after loading.
+      - `FILES [filespec]`: Catalogs disk files matching pattern (or `*.*`) via `os_dir_entry()`, formatted in standard multi-column display with file size.
+    - **Sequential File I/O Subsystem**:
+      - Manages up to 4 concurrent file channels (`#1..#4`) with 256-byte streaming I/O buffers.
+      - `OPEN mode, #n, "filespec"` and `OPEN "filespec" FOR INPUT/OUTPUT/APPEND AS #n`: Supports Input (`"I"`), Output (`"O"`), and Append (`"A"`) modes with hobbyOS FAT12/FAT16 file syscalls.
+      - `CLOSE [#n [, #m ...]]`: Flushes pending buffers and closes specified channels, or all open channels if no arguments specified. Automatic file cleanup on program end (`END`, `STOP`, `NEW`, `RUN`, `SYSTEM`).
+      - `PRINT #n, expr...`: Sequential formatted data output to file channel #n with commas, semicolons, and newline control.
+      - `WRITE #n, expr...`: GW-BASIC delimited record output with comma separation and quoted string encapsulation.
+      - `INPUT #n, var...`: Parses comma-delimited sequential fields from file channel #n into numeric and string variables.
+      - `LINE INPUT #n, var$`: Reads an entire line from file channel #n into a string variable.
+      - `EOF(n)`: Built-in boolean function returning `-1` (TRUE) when channel #n has reached end-of-file, or `0` (FALSE) otherwise.
 
 ## Revision 1.0.2 (2026-11-21)
 
