@@ -8,7 +8,7 @@
     - **64 KB Program Memory Segment**: Dynamically allocates a full 64 KB segment via `os_mem_alloc(4096)` managing a linked list of tokenized program lines (`next_offset`, `line_num`, token data, `0x00` delimiter).
     - **GW-BASIC Token Dictionary (`user/basic_tokens.h`)**: Generated from PC-BASIC token tables, supporting all 182 GW-BASIC / BASICA keyword and function tokens (single-byte `0x81..0xF4`, two-byte prefixes `0xFD`, `0xFE`, `0xFF`, and special number tokens).
     - **Fast Case-Insensitive Tokenizer (`basic_tokenize`)**: Tokenizes ASCII input lines with word-boundary checks (preserving identifiers like `PRINTER` vs `PRINT`), string literal preservation, and comment shorthands (`?` for `PRINT`, `'` for `REM`).
-    - **Lister (`basic_cmd_list`)**: De-tokenizes bytecode back into formatted ASCII BASIC program listings supporting range arguments (`LIST`, `LIST 10`, `LIST 10-50`, `LIST -30`).
+    - **Lister (`basic_cmd_list`)**: De-tokenizes bytecode back into formatted ASCII BASIC program listings supporting range arguments (`LIST`, `LIST 10`, `LIST 10-50`, `LIST -30`). Fixed pointer offset in `LIST` argument parsing that previously double-indexed into the token buffer.
     - **Line Insertion / Replacement / Deletion**: Entering a numbered line inserts or replaces lines in sorted numerical order; entering a bare line number deletes the line.
     - **Immediate & Program Execution**: Supports immediate commands (`NEW`, `LIST`, `RUN`, `CLS`, `SYSTEM`) and basic statement execution (`PRINT` with string literals, semicolons, and 14-column commas; `REM`; `END`/`STOP`; `CLS`). Includes non-blocking `Ctrl+C` break handling during program runs.
   - **Phase 2: Variables (%, $), Expression Evaluator & Control Flow (`LET`, `INPUT`, `IF/THEN/ELSE`, `GOTO`, `GOSUB/RETURN`)**:
@@ -25,6 +25,14 @@
       - `IF <expr> THEN <statement|linenum> [ELSE <statement|linenum>]` supporting nested IFs, clause skipping, and branch redirection.
       - `GOTO <linenum>` with fast sorted linked-list line lookup.
       - `GOSUB <linenum>` / `RETURN` with a dedicated 32-level return call stack tracking return line and statement position.
+  - **Phase 3: Loops (FOR/NEXT, WHILE/WEND), Arrays (DIM, 1D/2D), Data (DATA/READ/RESTORE) & Console (LOCATE, SWAP)**:
+    - **FOR ... NEXT Loops**: 16-level nested loop stack tracking loop variable, end target, step increment (`STEP`), and loop body statement position. Supports positive/negative steps, initial out-of-bounds loop skipping, and multi-variable `NEXT I, J`.
+    - **WHILE ... WEND Loops**: 16-level nested loop stack evaluating conditions at loop head and branching back upon `WEND`, with forward skipping when false. Fixed return statement pointer to re-execute `TOK_WHILE` on loop iterations rather than skipping into the expression body.
+    - **1D & 2D Arrays (`DIM`)**: Up to 32 array descriptors in DS with element data allocated directly in the 60 KB segment heap (`s_basic_seg`). Supports 1D and 2D arrays (`DIM A(10)`, `DIM M(5, 5)`, `DIM NAMES$(20)`), array access and assignment in expressions, bounds checking (`Subscript out of range`), and un-DIM'd default dimension (0..10).
+    - **DATA, READ & RESTORE**: Global DATA cursor reading numbers and strings (quoted and unquoted) across program lines, with `Out of DATA` detection and `RESTORE [linenum]`.
+    - **Console Utilities**:
+      - `LOCATE row, col`: 1-based cursor positioning (`1..25`, `1..80`) via `os_set_cursor()`.
+      - `SWAP var1, var2`: Type-safe variable value exchange for integer and string scalar variables.
 
 ## Revision 1.0.2 (2026-11-21)
 

@@ -4,6 +4,7 @@
 // hobbyOS Native BASIC Interpreter (GW-BASIC Compatible)
 // Phase 1: Interactive REPL, Line Storage, Tokenizer, Lister & Basic Commands
 // Phase 2: Variables (%, $), Expressions & Math Parser, Control Flow (LET, INPUT, IF/THEN/ELSE, GOTO, GOSUB/RETURN)
+// Phase 3: Loops (FOR/NEXT, WHILE/WEND), Arrays (DIM, 1D/2D), Data (DATA/READ/RESTORE), Screen (LOCATE, SWAP)
 
 #include "hobbyos.h"
 #include "basic_tokens.h"
@@ -17,7 +18,12 @@
 #define BASIC_MAX_VARNAME   16
 #define BASIC_MAX_STR_LEN   128
 #define BASIC_NUM_TEMP_STRS 8
+
 #define BASIC_MAX_GOSUB     32
+#define BASIC_MAX_FOR_NEST  16
+#define BASIC_MAX_WHILE_NEST 16
+#define BASIC_MAX_ARRAYS    32
+#define BASIC_STR_ELEM_LEN  32
 
 #define BASIC_TYPE_INT      1
 #define BASIC_TYPE_STR      2
@@ -46,45 +52,90 @@ typedef struct {
     char    sval[BASIC_MAX_STR_LEN + 1];
 } basic_var_t;
 
+/* Array descriptor structure */
+typedef struct {
+    char     name[BASIC_MAX_VARNAME];
+    uint8_t  type;      /* BASIC_TYPE_INT or BASIC_TYPE_STR */
+    uint8_t  num_dims;  /* 1 or 2 */
+    uint16_t dim1;      /* e.g. 11 for 0..10 */
+    uint16_t dim2;      /* e.g. 1 for 1D, or dim2 for 2D */
+    uint16_t data_off;  /* Offset in s_basic_seg */
+} basic_array_t;
+
 /* Call stack frame for GOSUB / RETURN */
 typedef struct {
     uint16_t line_off;
     uint16_t stmt_pos;
 } basic_gosub_frame_t;
 
+/* Loop stack frame for FOR / NEXT */
+typedef struct {
+    char     var_name[BASIC_MAX_VARNAME];
+    int16_t  end_val;
+    int16_t  step_val;
+    uint16_t line_off;
+    uint16_t stmt_pos;
+} basic_for_frame_t;
+
+/* Loop stack frame for WHILE / WEND */
+typedef struct {
+    uint16_t while_line_off;
+    uint16_t while_stmt_pos;
+} basic_while_frame_t;
+
 /* --------------------------------------------------------------------------
  * Global Interpreter State
  * -------------------------------------------------------------------------- */
 
 /* Program storage in allocated segment */
-static uint16_t s_basic_seg     = 0;
-static uint16_t s_prog_head     = 0;    /* Offset of first line (0 = empty) */
-static uint16_t s_prog_tail     = 0;    /* End of allocated program memory */
-static int      s_running       = 0;
-static uint16_t s_cur_line_off  = 0;
-static uint16_t s_cur_line_num  = 0;
-static uint16_t s_pc_line       = 0;
-static uint16_t s_pc_stmt       = 0;
-static int      s_jumped        = 0;
+static uint16_t s_basic_seg         = 0;
+static uint16_t s_prog_head         = 0;    /* Offset of first line (0 = empty) */
+static uint16_t s_prog_tail         = 0;    /* End of allocated program memory */
+static int      s_running           = 0;
+static uint16_t s_cur_line_off      = 0;
+static uint16_t s_cur_line_num      = 0;
+static uint16_t s_pc_line           = 0;
+static uint16_t s_pc_stmt           = 0;
+static int      s_jumped            = 0;
 
 /* Variable table */
 static basic_var_t s_vars[BASIC_MAX_VARS];
-static uint16_t    s_num_vars   = 0;
+static uint16_t    s_num_vars       = 0;
+
+/* Array table and heap in s_basic_seg */
+static basic_array_t s_arrays[BASIC_MAX_ARRAYS];
+static uint16_t      s_num_arrays   = 0;
+static uint16_t      s_array_heap_start = 0;
+static uint16_t      s_array_heap_free  = 0;
 
 /* Temporary string pool (in DS) */
 static char     s_temp_strs[BASIC_NUM_TEMP_STRS][BASIC_MAX_STR_LEN + 1];
-static uint8_t  s_temp_str_idx  = 0;
+static uint8_t  s_temp_str_idx      = 0;
 
 /* GOSUB stack */
 static basic_gosub_frame_t s_gosub_stack[BASIC_MAX_GOSUB];
-static uint16_t            s_gosub_sp   = 0;
+static uint16_t            s_gosub_sp       = 0;
+
+/* FOR stack */
+static basic_for_frame_t s_for_stack[BASIC_MAX_FOR_NEST];
+static uint16_t          s_for_sp           = 0;
+
+/* WHILE stack */
+static basic_while_frame_t s_while_stack[BASIC_MAX_WHILE_NEST];
+static uint16_t            s_while_sp       = 0;
+
+/* DATA read cursor */
+static uint16_t s_data_line_off     = 0;
+static uint16_t s_data_stmt_pos     = 0;
 
 /* Random number seed */
-static uint16_t s_rnd_seed      = 0x1234;
+static uint16_t s_rnd_seed          = 0x1234;
 
 /* Forward declarations */
 static int basic_eval_expr(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val);
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos);
+static int basic_skip_to_next(const uint8_t __far *tok, uint16_t *pos, const char *var_name);
+static int basic_skip_to_wend(const uint8_t __far *tok, uint16_t *pos);
 
 /* --------------------------------------------------------------------------
  * Helper String & Math Functions
@@ -317,6 +368,132 @@ static int basic_parse_var_name(const uint8_t __far *tok, uint16_t *pos, char *o
 }
 
 /* --------------------------------------------------------------------------
+ * Array Storage & Indexing (Stored in s_basic_seg)
+ * -------------------------------------------------------------------------- */
+
+static basic_array_t *basic_find_array(const char *name) {
+    uint16_t i;
+    for (i = 0; i < s_num_arrays; i++) {
+        if (basic_stricmp(s_arrays[i].name, name) == 0) {
+            return &s_arrays[i];
+        }
+    }
+    return 0;
+}
+
+static basic_array_t *basic_create_default_array(const char *name, uint8_t num_dims) {
+    uint16_t dim1 = 11; /* 0..10 */
+    uint16_t dim2 = (num_dims == 2) ? 11 : 1;
+    uint16_t total_elems = (num_dims == 1) ? dim1 : (dim1 * dim2);
+    uint16_t len = basic_strlen(name);
+    uint8_t type = (len > 0 && name[len - 1] == '$') ? BASIC_TYPE_STR : BASIC_TYPE_INT;
+    uint16_t elem_size = (type == BASIC_TYPE_STR) ? BASIC_STR_ELEM_LEN : 2;
+    uint16_t bytes = total_elems * elem_size;
+    basic_array_t *arr;
+    uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+    uint16_t b;
+
+    if (s_num_arrays >= BASIC_MAX_ARRAYS) {
+        os_puts("Out of array space\n");
+        return 0;
+    }
+    if ((uint32_t)s_array_heap_free + bytes >= 65000L) {
+        os_puts("Out of memory in array alloc\n");
+        return 0;
+    }
+
+    arr = &s_arrays[s_num_arrays++];
+    basic_strncpy(arr->name, name, BASIC_MAX_VARNAME - 1);
+    arr->name[BASIC_MAX_VARNAME - 1] = '\0';
+    arr->type = type;
+    arr->num_dims = num_dims;
+    arr->dim1 = dim1;
+    arr->dim2 = dim2;
+    arr->data_off = s_array_heap_free;
+    s_array_heap_free += bytes;
+
+    for (b = 0; b < bytes; b++) {
+        mem[arr->data_off + b] = 0;
+    }
+    return arr;
+}
+
+static int basic_read_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, basic_val_t *out_val) {
+    uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+    uint16_t linear_idx;
+    uint16_t off;
+
+    if (i1 < 0 || (uint16_t)i1 >= arr->dim1) {
+        os_puts("Subscript out of range\n");
+        return -1;
+    }
+    if (arr->num_dims == 2 && (i2 < 0 || (uint16_t)i2 >= arr->dim2)) {
+        os_puts("Subscript out of range\n");
+        return -1;
+    }
+
+    linear_idx = (arr->num_dims == 1) ? (uint16_t)i1 : ((uint16_t)i1 * arr->dim2 + (uint16_t)i2);
+
+    if (arr->type == BASIC_TYPE_INT) {
+        off = arr->data_off + linear_idx * 2;
+        out_val->type = BASIC_TYPE_INT;
+        out_val->ival = (int16_t)((uint16_t)mem[off] | ((uint16_t)mem[off + 1] << 8));
+        out_val->sval = 0;
+    } else {
+        char *str = basic_alloc_temp_str();
+        uint16_t k;
+        off = arr->data_off + linear_idx * BASIC_STR_ELEM_LEN;
+        for (k = 0; k < BASIC_STR_ELEM_LEN - 1 && mem[off + k] != 0; k++) {
+            str[k] = (char)mem[off + k];
+        }
+        str[k] = '\0';
+        out_val->type = BASIC_TYPE_STR;
+        out_val->sval = str;
+        out_val->ival = 0;
+    }
+    return 0;
+}
+
+static int basic_write_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, const basic_val_t *val) {
+    uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+    uint16_t linear_idx;
+    uint16_t off;
+
+    if (i1 < 0 || (uint16_t)i1 >= arr->dim1) {
+        os_puts("Subscript out of range\n");
+        return -1;
+    }
+    if (arr->num_dims == 2 && (i2 < 0 || (uint16_t)i2 >= arr->dim2)) {
+        os_puts("Subscript out of range\n");
+        return -1;
+    }
+
+    linear_idx = (arr->num_dims == 1) ? (uint16_t)i1 : ((uint16_t)i1 * arr->dim2 + (uint16_t)i2);
+
+    if (arr->type == BASIC_TYPE_INT) {
+        if (val->type != BASIC_TYPE_INT) {
+            os_puts("Type mismatch\n");
+            return -1;
+        }
+        off = arr->data_off + linear_idx * 2;
+        mem[off] = (uint8_t)(val->ival & 0xFF);
+        mem[off + 1] = (uint8_t)(val->ival >> 8);
+    } else {
+        uint16_t k;
+        if (val->type != BASIC_TYPE_STR) {
+            os_puts("Type mismatch\n");
+            return -1;
+        }
+        off = arr->data_off + linear_idx * BASIC_STR_ELEM_LEN;
+        for (k = 0; k < BASIC_STR_ELEM_LEN - 1 && val->sval && val->sval[k] != 0; k++) {
+            mem[off + k] = (uint8_t)val->sval[k];
+        }
+        mem[off + k] = 0;
+    }
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
  * Tokenizer
  * -------------------------------------------------------------------------- */
 
@@ -377,17 +554,15 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
                 const char *kw = g_basic_keywords[k].kw;
 
                 if (basic_strnicmp(&in[ip], kw, klen) == 0) {
-                    /* Word boundary check: if keyword ends in letter/digit, next char must not be alpha/digit */
                     char last_kw_char = kw[klen - 1];
                     char next_in_char = in[ip + klen];
 
                     if (basic_is_alpha(last_kw_char) || basic_is_digit(last_kw_char)) {
                         if (basic_is_alpha(next_in_char) || basic_is_digit(next_in_char) || next_in_char == '.') {
-                            continue; /* Partial match inside identifier (e.g. PRINTER vs PRINT) */
+                            continue;
                         }
                     }
 
-                    /* Match confirmed! Emit token */
                     tok = g_basic_keywords[k].tok;
                     if (tok > 0xFF) {
                         out[op++] = (uint8_t)(tok >> 8);
@@ -399,7 +574,6 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
                     ip += klen;
                     matched = 1;
 
-                    /* If keyword was REM, remainder of line is comment text */
                     if (tok == TOK_REM) {
                         while (in[ip] != '\0' && op + 1 < max_out) {
                             out[op++] = (uint8_t)in[ip++];
@@ -412,7 +586,6 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
             if (matched) continue;
         }
 
-        /* Normal character (variable name, operator, punctuation, number) */
         out[op++] = (uint8_t)basic_toupper(c);
         ip++;
     }
@@ -434,7 +607,6 @@ static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
         uint8_t b = tok_data[p++];
 
         if (b == 0xFD || b == 0xFE || b == 0xFF) {
-            /* 2-byte token */
             uint8_t b2 = tok_data[p++];
             uint16_t tok = ((uint16_t)b << 8) | b2;
             const char *name = basic_token_to_name(tok);
@@ -445,7 +617,6 @@ static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
                 }
             }
         } else if (b >= 0x81) {
-            /* 1-byte keyword token */
             const char *name = basic_token_to_name((uint16_t)b);
             if (name) {
                 os_puts(name);
@@ -454,7 +625,6 @@ static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
                 }
             }
         } else {
-            /* Literal ASCII */
             os_putc((char)b);
         }
     }
@@ -470,6 +640,13 @@ static void basic_new(void) {
     s_prog_tail = 4;
     basic_clear_vars();
     s_gosub_sp = 0;
+    s_for_sp = 0;
+    s_while_sp = 0;
+    s_num_arrays = 0;
+    s_array_heap_start = 16;
+    s_array_heap_free  = 16;
+    s_data_line_off = 0;
+    s_data_stmt_pos = 0;
     if (s_basic_seg) {
         uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
         mem[0] = 0; mem[1] = 0; mem[2] = 0; mem[3] = 0;
@@ -726,7 +903,6 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             return 0;
         }
 
-        /* Functions requiring arguments: '(' expr ')' */
         while (tok[p] == ' ' || tok[p] == '\t') p++;
         if (tok[p] != '(') {
             os_puts("Syntax error (expected '(')\n");
@@ -938,34 +1114,71 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         }
     }
 
-    /* Variable lookup */
+    /* Variable or Array lookup */
     if (basic_is_alpha((char)tok[p])) {
         char var_name[BASIC_MAX_VARNAME];
-        basic_var_t *var;
         if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
             os_puts("Syntax error\n");
             return -1;
         }
-        var = basic_find_var(var_name);
-        if (var) {
-            out_val->type = var->type;
-            out_val->ival = var->ival;
-            out_val->sval = var->sval;
-        } else {
-            uint16_t len = basic_strlen(var_name);
-            if (len > 0 && var_name[len - 1] == '$') {
-                char *str = basic_alloc_temp_str();
-                out_val->type = BASIC_TYPE_STR;
-                out_val->sval = str;
-                out_val->ival = 0;
-            } else {
-                out_val->type = BASIC_TYPE_INT;
-                out_val->ival = 0;
-                out_val->sval = 0;
+
+        /* Check if array access */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == '(') {
+            basic_val_t i1_val, i2_val;
+            basic_array_t *arr;
+            uint8_t num_dims = 1;
+            p++;
+            if (basic_eval_expr(tok, &p, &i1_val) != 0) return -1;
+            i2_val.ival = 0;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ',') {
+                p++;
+                num_dims = 2;
+                if (basic_eval_expr(tok, &p, &i2_val) != 0) return -1;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
             }
+            if (tok[p] != ')') {
+                os_puts("Syntax error in array subscript (expected ')')\n");
+                return -1;
+            }
+            p++;
+
+            arr = basic_find_array(var_name);
+            if (!arr) {
+                arr = basic_create_default_array(var_name, num_dims);
+                if (!arr) return -1;
+            }
+            if (basic_read_array_elem(arr, i1_val.ival, i2_val.ival, out_val) != 0) {
+                return -1;
+            }
+            *pos = p;
+            return 0;
         }
-        *pos = p;
-        return 0;
+
+        /* Scalar variable lookup */
+        {
+            basic_var_t *var = basic_find_var(var_name);
+            if (var) {
+                out_val->type = var->type;
+                out_val->ival = var->ival;
+                out_val->sval = var->sval;
+            } else {
+                uint16_t len = basic_strlen(var_name);
+                if (len > 0 && var_name[len - 1] == '$') {
+                    char *str = basic_alloc_temp_str();
+                    out_val->type = BASIC_TYPE_STR;
+                    out_val->sval = str;
+                    out_val->ival = 0;
+                } else {
+                    out_val->type = BASIC_TYPE_INT;
+                    out_val->ival = 0;
+                    out_val->sval = 0;
+                }
+            }
+            *pos = p;
+            return 0;
+        }
     }
 
     os_puts("Syntax error in expression\n");
@@ -1163,7 +1376,7 @@ static int basic_eval_expr(const uint8_t __far *tok, uint16_t *pos, basic_val_t 
 }
 
 /* --------------------------------------------------------------------------
- * Statement Execution (Phase 1 & Phase 2)
+ * Statement Execution (Phase 1, Phase 2 & Phase 3)
  * -------------------------------------------------------------------------- */
 
 static int basic_skip_to_else(const uint8_t __far *tok, uint16_t *pos) {
@@ -1218,7 +1431,6 @@ static int basic_skip_to_else(const uint8_t __far *tok, uint16_t *pos) {
 
 static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
     char var_name[BASIC_MAX_VARNAME];
-    basic_var_t *var;
     basic_val_t val;
     uint16_t p = *pos;
 
@@ -1228,6 +1440,50 @@ static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
         return -1;
     }
 
+    /* Check if assignment to array element: var(i [, j]) = expr */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == '(') {
+        basic_val_t i1_val, i2_val;
+        basic_array_t *arr;
+        uint8_t num_dims = 1;
+        p++;
+        if (basic_eval_expr(tok, &p, &i1_val) != 0) return -1;
+        i2_val.ival = 0;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            num_dims = 2;
+            if (basic_eval_expr(tok, &p, &i2_val) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+        }
+        if (tok[p] != ')') {
+            os_puts("Syntax error in array subscript (expected ')')\n");
+            return -1;
+        }
+        p++;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != TOK_EQ && tok[p] != '=') {
+            os_puts("Syntax error (expected '=')\n");
+            return -1;
+        }
+        p++;
+
+        if (basic_eval_expr(tok, &p, &val) != 0) return -1;
+
+        arr = basic_find_array(var_name);
+        if (!arr) {
+            arr = basic_create_default_array(var_name, num_dims);
+            if (!arr) return -1;
+        }
+        if (basic_write_array_elem(arr, i1_val.ival, i2_val.ival, &val) != 0) {
+            return -1;
+        }
+        *pos = p;
+        return 0;
+    }
+
+    /* Scalar variable assignment */
     while (tok[p] == ' ' || tok[p] == '\t') p++;
     if (tok[p] != TOK_EQ && tok[p] != '=') {
         os_puts("Syntax error (expected '=')\n");
@@ -1239,22 +1495,622 @@ static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
         return -1;
     }
 
+    {
+        basic_var_t *var = basic_get_or_create_var(var_name);
+        if (!var) return -1;
+
+        if (var->type == BASIC_TYPE_STR) {
+            if (val.type != BASIC_TYPE_STR) {
+                os_puts("Type mismatch\n");
+                return -1;
+            }
+            basic_strncpy(var->sval, val.sval ? val.sval : "", sizeof(var->sval) - 1);
+            var->sval[sizeof(var->sval) - 1] = '\0';
+        } else {
+            if (val.type != BASIC_TYPE_INT) {
+                os_puts("Type mismatch\n");
+                return -1;
+            }
+            var->ival = val.ival;
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_dim(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_DIM */
+
+    for (;;) {
+        char var_name[BASIC_MAX_VARNAME];
+        basic_val_t d1_val, d2_val;
+        uint16_t dim1, dim2;
+        uint8_t num_dims;
+        uint8_t type;
+        uint16_t total_elems, elem_size, bytes;
+        basic_array_t *arr;
+        uint16_t len, i;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+            os_puts("Syntax error in DIM\n");
+            return -1;
+        }
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') {
+            os_puts("Syntax error in DIM (expected '(')\n");
+            return -1;
+        }
+        p++;
+
+        if (basic_eval_expr(tok, &p, &d1_val) != 0) return -1;
+        dim1 = (uint16_t)(d1_val.ival + 1);
+        num_dims = 1;
+        dim2 = 1;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            if (basic_eval_expr(tok, &p, &d2_val) != 0) return -1;
+            dim2 = (uint16_t)(d2_val.ival + 1);
+            num_dims = 2;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+        }
+
+        if (tok[p] != ')') {
+            os_puts("Syntax error in DIM (expected ')')\n");
+            return -1;
+        }
+        p++;
+
+        for (i = 0; i < s_num_arrays; i++) {
+            if (basic_stricmp(s_arrays[i].name, var_name) == 0) {
+                os_puts("Duplicate definition\n");
+                return -1;
+            }
+        }
+
+        if (s_num_arrays >= BASIC_MAX_ARRAYS) {
+            os_puts("Out of array space\n");
+            return -1;
+        }
+
+        len = basic_strlen(var_name);
+        type = (len > 0 && var_name[len - 1] == '$') ? BASIC_TYPE_STR : BASIC_TYPE_INT;
+
+        total_elems = (num_dims == 1) ? dim1 : (dim1 * dim2);
+        elem_size = (type == BASIC_TYPE_STR) ? BASIC_STR_ELEM_LEN : 2;
+        bytes = total_elems * elem_size;
+
+        if ((uint32_t)s_array_heap_free + bytes >= 65000L) {
+            os_puts("Out of memory in DIM\n");
+            return -1;
+        }
+
+        arr = &s_arrays[s_num_arrays++];
+        basic_strncpy(arr->name, var_name, BASIC_MAX_VARNAME - 1);
+        arr->name[BASIC_MAX_VARNAME - 1] = '\0';
+        arr->type = type;
+        arr->num_dims = num_dims;
+        arr->dim1 = dim1;
+        arr->dim2 = dim2;
+        arr->data_off = s_array_heap_free;
+        s_array_heap_free += bytes;
+
+        {
+            uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+            uint16_t b;
+            for (b = 0; b < bytes; b++) {
+                mem[arr->data_off + b] = 0;
+            }
+        }
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            continue;
+        }
+        break;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_skip_to_next(const uint8_t __far *tok, uint16_t *pos, const char *var_name) {
+    uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+    uint16_t cur_line = s_cur_line_off;
+    uint16_t p = *pos;
+    int nesting = 0;
+
+    (void)var_name;
+
+    for (;;) {
+        while (mem[cur_line + p] != 0x00) {
+            uint8_t b = mem[cur_line + p];
+            if (b == '"') {
+                p++;
+                while (mem[cur_line + p] != 0x00 && mem[cur_line + p] != '"') p++;
+                if (mem[cur_line + p] == '"') p++;
+                continue;
+            }
+            if (b == TOK_FOR) {
+                nesting++;
+                p++;
+                continue;
+            }
+            if (b == TOK_NEXT) {
+                if (nesting > 0) {
+                    nesting--;
+                    p++;
+                    continue;
+                }
+                p++;
+                while (mem[cur_line + p] == ' ' || mem[cur_line + p] == '\t') p++;
+                if (basic_is_alpha((char)mem[cur_line + p])) {
+                    char dummy[BASIC_MAX_VARNAME];
+                    basic_parse_var_name(&mem[cur_line], &p, dummy, sizeof(dummy));
+                }
+                s_pc_line = cur_line;
+                s_pc_stmt = p;
+                s_jumped = 1;
+                *pos = p;
+                return 0;
+            }
+            p++;
+        }
+
+        cur_line = (uint16_t)mem[cur_line] | ((uint16_t)mem[cur_line + 1] << 8);
+        if (cur_line == 0) {
+            os_puts("FOR without NEXT\n");
+            return -1;
+        }
+        p = 4;
+    }
+}
+
+static int basic_exec_for(const uint8_t __far *tok, uint16_t *pos) {
+    char var_name[BASIC_MAX_VARNAME];
+    basic_val_t start_val, end_val, step_val;
+    basic_var_t *var;
+    int16_t step = 1;
+    uint16_t p = *pos;
+    int slot = -1;
+    uint16_t i;
+
+    p++; /* skip TOK_FOR */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+        os_puts("Syntax error in FOR variable\n");
+        return -1;
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != TOK_EQ && tok[p] != '=') {
+        os_puts("Syntax error in FOR (expected '=')\n");
+        return -1;
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &start_val) != 0) return -1;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != TOK_TO) {
+        os_puts("Syntax error in FOR (expected TO)\n");
+        return -1;
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &end_val) != 0) return -1;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == TOK_STEP) {
+        p++;
+        if (basic_eval_expr(tok, &p, &step_val) != 0) return -1;
+        step = step_val.ival;
+    }
+
     var = basic_get_or_create_var(var_name);
     if (!var) return -1;
+    var->ival = start_val.ival;
 
-    if (var->type == BASIC_TYPE_STR) {
-        if (val.type != BASIC_TYPE_STR) {
-            os_puts("Type mismatch\n");
+    for (i = 0; i < s_for_sp; i++) {
+        if (basic_stricmp(s_for_stack[i].var_name, var_name) == 0) {
+            slot = (int)i;
+            break;
+        }
+    }
+    if (slot == -1) {
+        if (s_for_sp >= BASIC_MAX_FOR_NEST) {
+            os_puts("FOR stack overflow\n");
             return -1;
         }
-        basic_strncpy(var->sval, val.sval ? val.sval : "", sizeof(var->sval) - 1);
-        var->sval[sizeof(var->sval) - 1] = '\0';
+        slot = (int)s_for_sp++;
+    }
+
+    basic_strcpy(s_for_stack[slot].var_name, var_name);
+    s_for_stack[slot].end_val  = end_val.ival;
+    s_for_stack[slot].step_val = step;
+    s_for_stack[slot].line_off = s_cur_line_off;
+    s_for_stack[slot].stmt_pos = p;
+
+    if ((step > 0 && var->ival > end_val.ival) || (step < 0 && var->ival < end_val.ival)) {
+        return basic_skip_to_next(tok, &p, var_name);
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_next(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_NEXT */
+
+    for (;;) {
+        char var_name[BASIC_MAX_VARNAME];
+        int has_var = 0;
+        int slot = -1;
+        basic_var_t *var;
+        int done = 0;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (basic_is_alpha((char)tok[p])) {
+            basic_parse_var_name(tok, &p, var_name, sizeof(var_name));
+            has_var = 1;
+        }
+
+        if (s_for_sp == 0) {
+            os_puts("NEXT without FOR\n");
+            return -1;
+        }
+
+        if (has_var) {
+            int i;
+            for (i = (int)s_for_sp - 1; i >= 0; i--) {
+                if (basic_stricmp(s_for_stack[i].var_name, var_name) == 0) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == -1) {
+                os_puts("NEXT without FOR\n");
+                return -1;
+            }
+        } else {
+            slot = (int)s_for_sp - 1;
+        }
+
+        var = basic_find_var(s_for_stack[slot].var_name);
+        if (!var) return -1;
+
+        var->ival += s_for_stack[slot].step_val;
+
+        if (s_for_stack[slot].step_val > 0) {
+            if (var->ival > s_for_stack[slot].end_val) done = 1;
+        } else {
+            if (var->ival < s_for_stack[slot].end_val) done = 1;
+        }
+
+        if (!done) {
+            s_pc_line = s_for_stack[slot].line_off;
+            s_pc_stmt = s_for_stack[slot].stmt_pos;
+            s_jumped = 1;
+            *pos = p;
+            return 0;
+        }
+
+        s_for_sp = (uint16_t)slot;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            continue;
+        }
+        break;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_skip_to_wend(const uint8_t __far *tok, uint16_t *pos) {
+    uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+    uint16_t cur_line = s_cur_line_off;
+    uint16_t p = *pos;
+    int nesting = 0;
+
+    for (;;) {
+        while (mem[cur_line + p] != 0x00) {
+            uint8_t b = mem[cur_line + p];
+            if (b == '"') {
+                p++;
+                while (mem[cur_line + p] != 0x00 && mem[cur_line + p] != '"') p++;
+                if (mem[cur_line + p] == '"') p++;
+                continue;
+            }
+            if (b == TOK_WHILE) {
+                nesting++;
+                p++;
+                continue;
+            }
+            if (b == TOK_WEND) {
+                if (nesting > 0) {
+                    nesting--;
+                    p++;
+                    continue;
+                }
+                p++;
+                s_pc_line = cur_line;
+                s_pc_stmt = p;
+                s_jumped = 1;
+                *pos = p;
+                return 0;
+            }
+            p++;
+        }
+
+        cur_line = (uint16_t)mem[cur_line] | ((uint16_t)mem[cur_line + 1] << 8);
+        if (cur_line == 0) {
+            os_puts("WHILE without WEND\n");
+            return -1;
+        }
+        p = 4;
+    }
+}
+
+static int basic_exec_while(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t while_stmt_pos = *pos;
+    uint16_t p = *pos;
+    uint16_t expr_line = s_cur_line_off;
+    basic_val_t cond;
+
+    p++; /* skip TOK_WHILE */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &cond) != 0) return -1;
+
+    if (cond.ival != 0) {
+        if (s_while_sp == 0 || s_while_stack[s_while_sp - 1].while_line_off != expr_line ||
+            s_while_stack[s_while_sp - 1].while_stmt_pos != while_stmt_pos) {
+            if (s_while_sp >= BASIC_MAX_WHILE_NEST) {
+                os_puts("WHILE stack overflow\n");
+                return -1;
+            }
+            s_while_stack[s_while_sp].while_line_off = expr_line;
+            s_while_stack[s_while_sp].while_stmt_pos = while_stmt_pos;
+            s_while_sp++;
+        }
+        *pos = p;
+        return 0;
     } else {
-        if (val.type != BASIC_TYPE_INT) {
-            os_puts("Type mismatch\n");
+        if (s_while_sp > 0 && s_while_stack[s_while_sp - 1].while_line_off == expr_line &&
+            s_while_stack[s_while_sp - 1].while_stmt_pos == while_stmt_pos) {
+            s_while_sp--;
+        }
+        return basic_skip_to_wend(tok, &p);
+    }
+}
+
+static int basic_exec_wend(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_WEND */
+
+    if (s_while_sp == 0) {
+        os_puts("WEND without WHILE\n");
+        return -1;
+    }
+
+    s_pc_line = s_while_stack[s_while_sp - 1].while_line_off;
+    s_pc_stmt = s_while_stack[s_while_sp - 1].while_stmt_pos;
+    s_jumped = 1;
+    *pos = p;
+    return 0;
+}
+
+static int basic_read_next_data_item(char *out_buf, uint16_t max_len) {
+    uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+
+    for (;;) {
+        if (s_data_line_off == 0) {
+            os_puts("Out of DATA\n");
             return -1;
         }
-        var->ival = val.ival;
+
+        if (s_data_stmt_pos == 0) {
+            uint16_t p = 4;
+            int found = 0;
+            while (mem[s_data_line_off + p] != 0x00) {
+                if (mem[s_data_line_off + p] == TOK_DATA) {
+                    s_data_stmt_pos = p + 1;
+                    found = 1;
+                    break;
+                }
+                p++;
+            }
+            if (!found) {
+                s_data_line_off = (uint16_t)mem[s_data_line_off] | ((uint16_t)mem[s_data_line_off + 1] << 8);
+                s_data_stmt_pos = 0;
+                continue;
+            }
+        }
+
+        {
+            uint16_t p = s_data_stmt_pos;
+            uint16_t bp = 0;
+
+            while (mem[s_data_line_off + p] == ' ' || mem[s_data_line_off + p] == '\t') p++;
+
+            if (mem[s_data_line_off + p] == 0x00 || mem[s_data_line_off + p] == ':') {
+                s_data_line_off = (uint16_t)mem[s_data_line_off] | ((uint16_t)mem[s_data_line_off + 1] << 8);
+                s_data_stmt_pos = 0;
+                continue;
+            }
+
+            if (mem[s_data_line_off + p] == '"') {
+                p++;
+                while (mem[s_data_line_off + p] != 0x00 && mem[s_data_line_off + p] != '"') {
+                    if (bp + 1 < max_len) out_buf[bp++] = (char)mem[s_data_line_off + p];
+                    p++;
+                }
+                if (mem[s_data_line_off + p] == '"') p++;
+            } else {
+                while (mem[s_data_line_off + p] != 0x00 &&
+                       mem[s_data_line_off + p] != ':' &&
+                       mem[s_data_line_off + p] != ',') {
+                    if (bp + 1 < max_len) out_buf[bp++] = (char)mem[s_data_line_off + p];
+                    p++;
+                }
+                while (bp > 0 && (out_buf[bp - 1] == ' ' || out_buf[bp - 1] == '\t')) bp--;
+            }
+            out_buf[bp] = '\0';
+
+            while (mem[s_data_line_off + p] == ' ' || mem[s_data_line_off + p] == '\t') p++;
+            if (mem[s_data_line_off + p] == ',') {
+                p++;
+            }
+            s_data_stmt_pos = p;
+            return 0;
+        }
+    }
+}
+
+static int basic_exec_read(const uint8_t __far *tok, uint16_t *pos) {
+    char data_str[BASIC_MAX_STR_LEN + 1];
+    uint16_t p = *pos;
+    p++; /* skip TOK_READ */
+
+    for (;;) {
+        char var_name[BASIC_MAX_VARNAME];
+        basic_var_t *var;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+            os_puts("Syntax error in READ\n");
+            return -1;
+        }
+
+        if (basic_read_next_data_item(data_str, sizeof(data_str)) != 0) {
+            return -1;
+        }
+
+        var = basic_get_or_create_var(var_name);
+        if (!var) return -1;
+
+        if (var->type == BASIC_TYPE_STR) {
+            basic_strncpy(var->sval, data_str, sizeof(var->sval) - 1);
+            var->sval[sizeof(var->sval) - 1] = '\0';
+        } else {
+            var->ival = basic_atoi(data_str);
+        }
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            continue;
+        }
+        break;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_restore(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_RESTORE */
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_is_digit((char)tok[p])) {
+        uint16_t target_line = basic_parse_uint_far(tok, &p);
+        uint16_t off = basic_find_line(target_line);
+        if (off == 0) {
+            os_puts("Undefined line number ");
+            basic_print_uint(target_line);
+            os_putc('\n');
+            return -1;
+        }
+        s_data_line_off = off;
+    } else {
+        s_data_line_off = s_prog_head;
+    }
+    s_data_stmt_pos = 0;
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_locate(const uint8_t __far *tok, uint16_t *pos) {
+    basic_val_t r_val, c_val;
+    uint8_t row, col;
+    uint16_t p = *pos;
+    p++; /* skip TOK_LOCATE */
+
+    if (basic_eval_expr(tok, &p, &r_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        if (basic_eval_expr(tok, &p, &c_val) != 0) return -1;
+    } else {
+        c_val.ival = 1;
+    }
+
+    row = (r_val.ival > 0) ? (uint8_t)(r_val.ival - 1) : 0;
+    col = (c_val.ival > 0) ? (uint8_t)(c_val.ival - 1) : 0;
+    if (row > 24) row = 24;
+    if (col > 79) col = 79;
+    os_set_cursor(row, col);
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_swap(const uint8_t __far *tok, uint16_t *pos) {
+    char v1_name[BASIC_MAX_VARNAME];
+    char v2_name[BASIC_MAX_VARNAME];
+    basic_var_t *v1, *v2;
+    uint16_t p = *pos;
+    p++; /* skip TOK_SWAP */
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (!basic_parse_var_name(tok, &p, v1_name, sizeof(v1_name))) {
+        os_puts("Syntax error in SWAP\n");
+        return -1;
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in SWAP (expected ',')\n");
+        return -1;
+    }
+    p++;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (!basic_parse_var_name(tok, &p, v2_name, sizeof(v2_name))) {
+        os_puts("Syntax error in SWAP\n");
+        return -1;
+    }
+
+    v1 = basic_get_or_create_var(v1_name);
+    v2 = basic_get_or_create_var(v2_name);
+    if (!v1 || !v2) return -1;
+
+    if (v1->type != v2->type) {
+        os_puts("Type mismatch in SWAP\n");
+        return -1;
+    }
+
+    if (v1->type == BASIC_TYPE_INT) {
+        int16_t tmp = v1->ival;
+        v1->ival = v2->ival;
+        v2->ival = tmp;
+    } else {
+        char tmp_str[BASIC_MAX_STR_LEN + 1];
+        basic_strcpy(tmp_str, v1->sval);
+        basic_strcpy(v1->sval, v2->sval);
+        basic_strcpy(v2->sval, tmp_str);
     }
 
     *pos = p;
@@ -1510,7 +2366,6 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return 0;
     }
 
-    /* Finished THEN branch, encountered ELSE: skip to end of line */
     if (tok[p] == TOK_ELSE) {
         while (tok[p] != 0x00) p++;
         *pos = p;
@@ -1585,6 +2440,67 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return basic_exec_if(tok, pos);
     }
 
+    /* FOR statement */
+    if (tok[p] == TOK_FOR) {
+        *pos = p;
+        return basic_exec_for(tok, pos);
+    }
+
+    /* NEXT statement */
+    if (tok[p] == TOK_NEXT) {
+        *pos = p;
+        return basic_exec_next(tok, pos);
+    }
+
+    /* WHILE statement */
+    if (tok[p] == TOK_WHILE) {
+        *pos = p;
+        return basic_exec_while(tok, pos);
+    }
+
+    /* WEND statement */
+    if (tok[p] == TOK_WEND) {
+        *pos = p;
+        return basic_exec_wend(tok, pos);
+    }
+
+    /* DIM statement */
+    if (tok[p] == TOK_DIM) {
+        *pos = p;
+        return basic_exec_dim(tok, pos);
+    }
+
+    /* DATA statement (skip during execution) */
+    if (tok[p] == TOK_DATA) {
+        while (tok[p] != 0x00 && tok[p] != ':') p++;
+        *pos = p;
+        return 0;
+    }
+
+    /* READ statement */
+    if (tok[p] == TOK_READ) {
+        *pos = p;
+        return basic_exec_read(tok, pos);
+    }
+
+    /* RESTORE statement */
+    if (tok[p] == TOK_RESTORE) {
+        *pos = p;
+        return basic_exec_restore(tok, pos);
+    }
+
+    /* LOCATE statement */
+    if (tok[p] == TOK_LOCATE) {
+        *pos = p;
+        return basic_exec_locate(tok, pos);
+    }
+
+    /* SWAP statement */
+    if (tok[p] == TOK_SWAP) {
+        *pos = p;
+        return basic_exec_swap(tok, pos);
+    }
+
     /* GOTO statement */
     if (tok[p] == TOK_GOTO) {
         *pos = p;
@@ -1616,6 +2532,8 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == TOK_CLEAR) {
         p++;
         basic_clear_vars();
+        s_num_arrays = 0;
+        s_array_heap_free = s_array_heap_start;
         *pos = p;
         return 0;
     }
@@ -1635,13 +2553,12 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return 0;
     }
 
-    /* Implicit LET (variable assignment starting with letter) */
+    /* Implicit LET (variable or array assignment starting with letter) */
     if (basic_is_alpha((char)tok[p])) {
         *pos = p;
         return basic_exec_let(tok, pos);
     }
 
-    /* Unknown / Unimplemented statement */
     os_puts("Syntax error\n");
     s_running = 0;
     return -1;
@@ -1671,6 +2588,13 @@ static void basic_cmd_run(void) {
 
     basic_clear_vars();
     s_gosub_sp = 0;
+    s_for_sp = 0;
+    s_while_sp = 0;
+    s_num_arrays = 0;
+    s_array_heap_start = (s_prog_tail + 15) & ~15;
+    s_array_heap_free  = s_array_heap_start;
+    s_data_line_off = s_prog_head;
+    s_data_stmt_pos = 0;
     s_running = 1;
     s_pc_line = s_prog_head;
     s_pc_stmt = 4;
@@ -1736,7 +2660,6 @@ static uint16_t basic_read_line(char *buf, uint16_t max_len) {
         char     c   = (char)u;
 
         if (c == 0x03) {
-            /* Ctrl+C */
             os_puts("^C\n");
             buf[0] = '\0';
             return 0;
@@ -1762,7 +2685,6 @@ static void basic_process_input(char *line) {
     uint16_t p = 0;
     uint8_t tok_buf[BASIC_MAX_LINE_LEN];
 
-    /* Trim leading whitespace */
     while (line[p] == ' ' || line[p] == '\t') p++;
     if (line[p] == '\0') return;
 
@@ -1798,24 +2720,24 @@ static void basic_process_input(char *line) {
 
             while (tok_buf[lp] == ' ' || tok_buf[lp] == '\t') lp++;
             if (basic_is_digit((char)tok_buf[lp])) {
-                start = basic_parse_uint((const char *)&tok_buf[lp], &lp);
+                start = basic_parse_uint((const char *)tok_buf, &lp);
                 end = start;
                 while (tok_buf[lp] == ' ' || tok_buf[lp] == '\t') lp++;
-                if (tok_buf[lp] == '-') {
+                if (tok_buf[lp] == TOK_MINUS || tok_buf[lp] == '-' || tok_buf[lp] == ',') {
                     lp++;
                     end = 65535;
                     while (tok_buf[lp] == ' ' || tok_buf[lp] == '\t') lp++;
                     if (basic_is_digit((char)tok_buf[lp])) {
-                        end = basic_parse_uint((const char *)&tok_buf[lp], &lp);
+                        end = basic_parse_uint((const char *)tok_buf, &lp);
                     }
                 }
-            } else if (tok_buf[lp] == '-') {
+            } else if (tok_buf[lp] == TOK_MINUS || tok_buf[lp] == '-' || tok_buf[lp] == ',') {
                 lp++;
                 start = 0;
                 end = 65535;
                 while (tok_buf[lp] == ' ' || tok_buf[lp] == '\t') lp++;
                 if (basic_is_digit((char)tok_buf[lp])) {
-                    end = basic_parse_uint((const char *)&tok_buf[lp], &lp);
+                    end = basic_parse_uint((const char *)tok_buf, &lp);
                 }
             }
 
