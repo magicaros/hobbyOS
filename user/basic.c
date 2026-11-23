@@ -151,6 +151,22 @@ static basic_file_t s_files[BASIC_MAX_FILES];
 /* Random number seed */
 static uint16_t s_rnd_seed          = 0x1234;
 
+/* Graphics and Sound state (Phase 5) */
+static uint8_t  s_screen_mode       = 0;    /* 0 = text 80x25, 1 = CGA 320x200, 2 = CGA 640x200 */
+static uint8_t  s_text_fg           = 7;
+static uint8_t  s_text_bg           = 0;
+static uint8_t  s_text_attr         = 0x07;
+static uint8_t  s_cga_bg            = 0;
+static uint8_t  s_cga_palette       = 1;
+static int16_t  s_last_x            = 0;
+static int16_t  s_last_y            = 0;
+static uint8_t  s_gfx_row           = 0;
+static uint8_t  s_gfx_col           = 0;
+static uint8_t  s_play_octave       = 4;
+static uint8_t  s_play_length       = 4;
+static uint8_t  s_play_tempo        = 120;
+static uint8_t  s_play_style        = 0;    /* 0 = normal (7/8), 1 = legato (8/8), 2 = staccato (6/8) */
+
 /* Forward declarations */
 static int basic_eval_expr(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val);
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos);
@@ -1050,6 +1066,63 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         } else {
             str[0] = '\0';
         }
+        out_val->type = BASIC_TYPE_STR;
+        out_val->sval = str;
+        out_val->ival = 0;
+        *pos = p;
+        return 0;
+    }
+
+    /* Built-in function: INPUT$(n [, [#]f]) */
+    if (tok[p] == TOK_INPUT && tok[p + 1] == '$') {
+        basic_val_t n_val;
+        int16_t n;
+        uint8_t fnum = 0;
+        char *str = basic_alloc_temp_str();
+        int idx = 0;
+
+        p += 2; /* skip TOK_INPUT and '$' */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') {
+            os_puts("Syntax error in INPUT$ (expected '(')\n");
+            return -1;
+        }
+        p++;
+
+        if (basic_eval_expr(tok, &p, &n_val) != 0) return -1;
+        n = n_val.ival;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            basic_val_t f_val;
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '#') p++;
+            if (basic_eval_expr(tok, &p, &f_val) != 0) return -1;
+            fnum = (uint8_t)f_val.ival;
+        }
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+
+        if (n < 0 || n > BASIC_MAX_STR_LEN) {
+            os_puts("Illegal function call in INPUT$\n");
+            return -1;
+        }
+
+        if (fnum == 0) {
+            while (idx < n) {
+                uint16_t key = os_getc();
+                str[idx++] = (char)(key & 0xFF);
+            }
+        } else {
+            while (idx < n) {
+                int ch = basic_file_getc(fnum);
+                if (ch < 0) break;
+                str[idx++] = (char)ch;
+            }
+        }
+        str[idx] = '\0';
+
         out_val->type = BASIC_TYPE_STR;
         out_val->sval = str;
         out_val->ival = 0;
@@ -2796,7 +2869,11 @@ static int basic_exec_locate(const uint8_t __far *tok, uint16_t *pos) {
     col = (c_val.ival > 0) ? (uint8_t)(c_val.ival - 1) : 0;
     if (row > 24) row = 24;
     if (col > 79) col = 79;
-    os_set_cursor(row, col);
+    s_gfx_row = row;
+    s_gfx_col = col;
+    if (s_screen_mode == 0) {
+        os_set_cursor(row, col);
+    }
 
     *pos = p;
     return 0;
@@ -3179,6 +3256,754 @@ static int basic_exec_input(const uint8_t __far *tok, uint16_t *pos) {
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Hardware Graphics & Sound Statements (Phase 5)
+ * -------------------------------------------------------------------------- */
+
+static void basic_delay_ms(uint16_t ms) {
+    volatile uint16_t __far *bda_ticks = (volatile uint16_t __far *)MK_FP(0x0040, 0x006C);
+    uint16_t ticks = (ms + 27) / 55;
+    uint16_t start = *bda_ticks;
+    if (ticks == 0) ticks = 1;
+    while ((uint16_t)(*bda_ticks - start) < ticks);
+}
+
+static void basic_gfx_print_str(const char *str, uint8_t color) {
+    uint16_t max_cols = (s_screen_mode == 2) ? 80 : 40;
+    while (*str) {
+        char c = *str++;
+        if (c == '\r') {
+            s_gfx_col = 0;
+            continue;
+        }
+        if (c == '\n') {
+            s_gfx_col = 0;
+            s_gfx_row++;
+            if (s_gfx_row >= 25) s_gfx_row = 0;
+            continue;
+        }
+        if (s_gfx_col >= max_cols) {
+            s_gfx_col = 0;
+            s_gfx_row++;
+            if (s_gfx_row >= 25) s_gfx_row = 0;
+        }
+        {
+            char single[2];
+            single[0] = c;
+            single[1] = '\0';
+            os_gfx_text((uint16_t)s_gfx_col * 8, (uint16_t)s_gfx_row * 8, (const char __far *)FP_HERE(single), color);
+        }
+        s_gfx_col++;
+    }
+}
+
+static void basic_term_putc(char c) {
+    if (s_screen_mode == 0) {
+        os_putc(c);
+    } else {
+        char s[2];
+        s[0] = c;
+        s[1] = '\0';
+        basic_gfx_print_str(s, (s_screen_mode == 1) ? 3 : 1);
+    }
+}
+
+static void basic_term_puts(const char *s) {
+    if (s_screen_mode == 0) {
+        os_puts(s);
+    } else {
+        basic_gfx_print_str(s, (s_screen_mode == 1) ? 3 : 1);
+    }
+}
+
+static int basic_exec_screen(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_SCREEN */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] != 0x00 && tok[p] != ':') {
+        basic_val_t m_val;
+        int16_t m;
+        if (basic_eval_expr(tok, &p, &m_val) != 0) return -1;
+        m = m_val.ival;
+        if (m == 0) {
+            os_gfx_set_mode(0x03);
+            s_screen_mode = 0;
+            s_last_x = 0;
+            s_last_y = 0;
+            s_gfx_row = 0;
+            s_gfx_col = 0;
+        } else if (m == 1) {
+            os_gfx_set_mode(0x04);
+            s_screen_mode = 1;
+            s_last_x = 160;
+            s_last_y = 100;
+            s_gfx_row = 0;
+            s_gfx_col = 0;
+        } else if (m == 2) {
+            os_gfx_set_mode(0x06);
+            s_screen_mode = 2;
+            s_last_x = 320;
+            s_last_y = 100;
+            s_gfx_row = 0;
+            s_gfx_col = 0;
+        } else {
+            os_puts("Illegal function call in SCREEN\n");
+            return -1;
+        }
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        while (tok[p] == ',') {
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
+                basic_val_t dummy;
+                if (basic_eval_expr(tok, &p, &dummy) != 0) return -1;
+            }
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_color(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_COLOR */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (s_screen_mode == 0) {
+        /* Text mode: COLOR [fg] [, [bg] [, [border]]] */
+        if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
+            basic_val_t fg_val;
+            if (basic_eval_expr(tok, &p, &fg_val) != 0) return -1;
+            s_text_fg = (uint8_t)(fg_val.ival & 0x1F);
+        }
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
+                basic_val_t bg_val;
+                if (basic_eval_expr(tok, &p, &bg_val) != 0) return -1;
+                s_text_bg = (uint8_t)(bg_val.ival & 0x07);
+            }
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ',') {
+                p++;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
+                    basic_val_t border_val;
+                    if (basic_eval_expr(tok, &p, &border_val) != 0) return -1;
+                }
+            }
+        }
+        s_text_attr = (uint8_t)((s_text_bg << 4) | (s_text_fg & 0x0F));
+    } else if (s_screen_mode == 1) {
+        /* CGA 320x200 mode: COLOR [bg] [, [palette]] */
+        if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
+            basic_val_t bg_val;
+            if (basic_eval_expr(tok, &p, &bg_val) != 0) return -1;
+            s_cga_bg = (uint8_t)(bg_val.ival & 0x0F);
+        }
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
+                basic_val_t pal_val;
+                if (basic_eval_expr(tok, &p, &pal_val) != 0) return -1;
+                s_cga_palette = (uint8_t)(pal_val.ival & 0x01);
+            }
+        }
+        os_gfx_set_palette(s_cga_palette, 1, s_cga_bg);
+    } else {
+        /* Screen mode 2: foreground color */
+        if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
+            basic_val_t fg_val;
+            if (basic_eval_expr(tok, &p, &fg_val) != 0) return -1;
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_pset(const uint8_t __far *tok, uint16_t *pos, int is_preset) {
+    uint16_t p = *pos;
+    basic_val_t x_val, y_val;
+    int16_t x, y;
+    uint8_t color;
+
+    p++; /* skip TOK_PSET / TOK_PRESET */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] != '(') {
+        os_puts("Syntax error in PSET (expected '(')\n");
+        return -1;
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &x_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in PSET (expected ',')\n");
+        return -1;
+    }
+    p++;
+    if (basic_eval_expr(tok, &p, &y_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ')') {
+        os_puts("Syntax error in PSET (expected ')')\n");
+        return -1;
+    }
+    p++;
+
+    x = x_val.ival;
+    y = y_val.ival;
+
+    if (is_preset) {
+        color = 0;
+    } else {
+        color = (s_screen_mode == 1) ? 3 : 1;
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        basic_val_t c_val;
+        p++;
+        if (basic_eval_expr(tok, &p, &c_val) != 0) return -1;
+        color = (uint8_t)c_val.ival;
+    }
+
+    s_last_x = x;
+    s_last_y = y;
+
+    if (x >= 0 && y >= 0) {
+        uint16_t max_x = (s_screen_mode == 2) ? 640 : 320;
+        if ((uint16_t)x < max_x && (uint16_t)y < 200) {
+            os_gfx_putpixel((uint16_t)x, (uint16_t)y, color);
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_line_gfx(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    int16_t x1, y1, x2, y2;
+    uint8_t color;
+    int is_box = 0;
+    int is_filled = 0;
+
+    p++; /* skip TOK_LINE */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == '(') {
+        basic_val_t x1_val, y1_val;
+        p++;
+        if (basic_eval_expr(tok, &p, &x1_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',') {
+            os_puts("Syntax error in LINE (expected ',')\n");
+            return -1;
+        }
+        p++;
+        if (basic_eval_expr(tok, &p, &y1_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ')') {
+            os_puts("Syntax error in LINE (expected ')')\n");
+            return -1;
+        }
+        p++;
+        x1 = x1_val.ival;
+        y1 = y1_val.ival;
+    } else {
+        x1 = s_last_x;
+        y1 = s_last_y;
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != '-' && tok[p] != TOK_MINUS) {
+        os_puts("Syntax error in LINE (expected '-')\n");
+        return -1;
+    }
+    p++;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] != '(') {
+        os_puts("Syntax error in LINE (expected '(')\n");
+        return -1;
+    }
+    p++;
+    {
+        basic_val_t x2_val, y2_val;
+        if (basic_eval_expr(tok, &p, &x2_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',') {
+            os_puts("Syntax error in LINE (expected ',')\n");
+            return -1;
+        }
+        p++;
+        if (basic_eval_expr(tok, &p, &y2_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ')') {
+            os_puts("Syntax error in LINE (expected ')')\n");
+            return -1;
+        }
+        p++;
+        x2 = x2_val.ival;
+        y2 = y2_val.ival;
+    }
+
+    color = (s_screen_mode == 1) ? 3 : 1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
+            basic_val_t c_val;
+            if (basic_eval_expr(tok, &p, &c_val) != 0) return -1;
+            color = (uint8_t)c_val.ival;
+        }
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == 'B' || tok[p] == 'b') {
+                is_box = 1;
+                p++;
+                if (tok[p] == 'F' || tok[p] == 'f') {
+                    is_filled = 1;
+                    p++;
+                }
+            }
+        }
+    }
+
+    s_last_x = x2;
+    s_last_y = y2;
+
+    if (is_box) {
+        int16_t min_x = (x1 < x2) ? x1 : x2;
+        int16_t max_x = (x1 > x2) ? x1 : x2;
+        int16_t min_y = (y1 < y2) ? y1 : y2;
+        int16_t max_y = (y1 > y2) ? y1 : y2;
+        uint16_t w, h;
+        if (min_x < 0) min_x = 0;
+        if (min_y < 0) min_y = 0;
+        w = (uint16_t)(max_x - min_x + 1);
+        h = (uint16_t)(max_y - min_y + 1);
+        os_gfx_rect((uint16_t)min_x, (uint16_t)min_y, w, h, color, (uint8_t)is_filled);
+    } else {
+        os_gfx_line(x1, y1, x2, y2, color);
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static void basic_draw_circle(int16_t xc, int16_t yc, int16_t r, uint8_t color) {
+    int16_t x = 0;
+    int16_t y = r;
+    int16_t d = 1 - r;
+    uint16_t max_x = (s_screen_mode == 2) ? 640 : 320;
+
+    while (x <= y) {
+        if (xc + x >= 0 && (uint16_t)(xc + x) < max_x && yc + y >= 0 && (uint16_t)(yc + y) < 200)
+            os_gfx_putpixel((uint16_t)(xc + x), (uint16_t)(yc + y), color);
+        if (xc - x >= 0 && (uint16_t)(xc - x) < max_x && yc + y >= 0 && (uint16_t)(yc + y) < 200)
+            os_gfx_putpixel((uint16_t)(xc - x), (uint16_t)(yc + y), color);
+        if (xc + x >= 0 && (uint16_t)(xc + x) < max_x && yc - y >= 0 && (uint16_t)(yc - y) < 200)
+            os_gfx_putpixel((uint16_t)(xc + x), (uint16_t)(yc - y), color);
+        if (xc - x >= 0 && (uint16_t)(xc - x) < max_x && yc - y >= 0 && (uint16_t)(yc - y) < 200)
+            os_gfx_putpixel((uint16_t)(xc - x), (uint16_t)(yc - y), color);
+
+        if (xc + y >= 0 && (uint16_t)(xc + y) < max_x && yc + x >= 0 && (uint16_t)(yc + x) < 200)
+            os_gfx_putpixel((uint16_t)(xc + y), (uint16_t)(yc + x), color);
+        if (xc - y >= 0 && (uint16_t)(xc - y) < max_x && yc + x >= 0 && (uint16_t)(yc + x) < 200)
+            os_gfx_putpixel((uint16_t)(xc - y), (uint16_t)(yc + x), color);
+        if (xc + y >= 0 && (uint16_t)(xc + y) < max_x && yc - x >= 0 && (uint16_t)(yc - x) < 200)
+            os_gfx_putpixel((uint16_t)(xc + y), (uint16_t)(yc - x), color);
+        if (xc - y >= 0 && (uint16_t)(xc - y) < max_x && yc - x >= 0 && (uint16_t)(yc - x) < 200)
+            os_gfx_putpixel((uint16_t)(xc - y), (uint16_t)(yc - x), color);
+
+        if (d < 0) {
+            d += 2 * x + 3;
+        } else {
+            d += 2 * (x - y) + 5;
+            y--;
+        }
+        x++;
+    }
+}
+
+static int basic_exec_circle(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t xc_val, yc_val, r_val;
+    int16_t xc, yc, r;
+    uint8_t color;
+
+    p += 2; /* skip 2-byte token TOK_CIRCLE (0xFE, 0x91) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] != '(') {
+        os_puts("Syntax error in CIRCLE (expected '(')\n");
+        return -1;
+    }
+    p++;
+    if (basic_eval_expr(tok, &p, &xc_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in CIRCLE (expected ',')\n");
+        return -1;
+    }
+    p++;
+    if (basic_eval_expr(tok, &p, &yc_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ')') {
+        os_puts("Syntax error in CIRCLE (expected ')')\n");
+        return -1;
+    }
+    p++;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in CIRCLE (expected ',')\n");
+        return -1;
+    }
+    p++;
+    if (basic_eval_expr(tok, &p, &r_val) != 0) return -1;
+
+    xc = xc_val.ival;
+    yc = yc_val.ival;
+    r = r_val.ival;
+    color = (s_screen_mode == 1) ? 3 : 1;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        basic_val_t c_val;
+        p++;
+        if (basic_eval_expr(tok, &p, &c_val) != 0) return -1;
+        color = (uint8_t)c_val.ival;
+    }
+
+    s_last_x = xc;
+    s_last_y = yc;
+
+    if (r > 0) {
+        basic_draw_circle(xc, yc, r, color);
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static uint16_t basic_opl_calc_fnum(uint16_t freq, uint8_t shift);
+#pragma aux basic_opl_calc_fnum = \
+    "xor dx, dx" \
+    "cmp cl, 16" \
+    "jae shift_hi" \
+    "mov ch, 16" \
+    "sub ch, cl" \
+    "mov dx, ax" \
+    "xchg cl, ch" \
+    "shr dx, cl" \
+    "xchg cl, ch" \
+    "shl ax, cl" \
+    "jmp do_div" \
+    "shift_hi:" \
+    "sub cl, 16" \
+    "shl ax, cl" \
+    "mov dx, ax" \
+    "xor ax, ax" \
+    "do_div:" \
+    "mov bx, 49716" \
+    "div bx" \
+    parm [ax] [cl] value [ax] modify [bx dx ch];
+
+static void basic_sound_init_opl(void) {
+    /* Waveform control enable */
+    os_sound_opl_write(0x01, 0x20);
+    os_sound_opl_write(0x08, 0x00);
+    os_sound_opl_write(0xBD, 0x00);
+
+    /* Channel 0 Modulator (Op 0) */
+    os_sound_opl_write(0x20, 0x21); /* Multiplier=1, Sustain */
+    os_sound_opl_write(0x40, 0x00); /* Attenuation 0 */
+    os_sound_opl_write(0x60, 0xF2); /* Attack 15, Decay 2 */
+    os_sound_opl_write(0x80, 0x0F); /* Fast release */
+    os_sound_opl_write(0xE0, 0x00); /* Sine wave */
+
+    /* Channel 0 Carrier (Op 3) */
+    os_sound_opl_write(0x23, 0x21); /* Multiplier=1, Sustain */
+    os_sound_opl_write(0x43, 0x3F); /* Start with carrier muted */
+    os_sound_opl_write(0x63, 0xF2); /* Attack 15, Decay 2 */
+    os_sound_opl_write(0x83, 0x0F); /* Fast release */
+    os_sound_opl_write(0xE3, 0x00); /* Sine wave */
+
+    /* Channel 0 Feedback & Output: Center stereo (bits 4-5 = 0x30) + FM mode */
+    os_sound_opl_write(0xC0, 0x30);
+}
+
+static void basic_freq_to_opl(uint16_t freq, uint16_t *out_fnum, uint8_t *out_blk) {
+    uint8_t blk;
+    uint8_t shift;
+    uint16_t fnum;
+
+    if (freq <= 48) blk = 0;
+    else if (freq <= 97) blk = 1;
+    else if (freq <= 194) blk = 2;
+    else if (freq <= 388) blk = 3;
+    else if (freq <= 776) blk = 4;
+    else if (freq <= 1553) blk = 5;
+    else if (freq <= 3106) blk = 6;
+    else blk = 7;
+
+    shift = (uint8_t)(20 - blk);
+    fnum = basic_opl_calc_fnum(freq, shift);
+    if (fnum > 1023) fnum = 1023;
+
+    *out_fnum = fnum;
+    *out_blk = blk;
+}
+
+static void basic_sound_tone(uint16_t freq, uint16_t dur_ms) {
+    if (freq < 19) {
+        os_sound_opl_write(0xB0, 0x00);
+        os_sound_opl_write(0x43, 0x3F);
+        os_sound_stop();
+        return;
+    }
+
+    /* Drive hobbyOS Unified Sound Subsystem (OPL FM / PC Speaker fallback) on Channel 0 */
+    {
+        uint16_t fnum;
+        uint8_t blk;
+        basic_freq_to_opl(freq, &fnum, &blk);
+        os_sound_opl_write(0x43, 0x00); /* Unmute Carrier */
+        os_sound_opl_write(0xA0, (uint8_t)(fnum & 0xFF));
+        os_sound_opl_write(0xB0, (uint8_t)(0x20 | (blk << 2) | ((fnum >> 8) & 0x03)));
+    }
+
+    /* If duration specified, wait and mute */
+    if (dur_ms > 0) {
+        basic_delay_ms(dur_ms);
+        os_sound_opl_write(0xB0, 0x00);
+        os_sound_opl_write(0x43, 0x3F);
+        os_sound_stop();
+    }
+}
+
+static int basic_exec_beep(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_BEEP */
+    basic_sound_tone(800, 150);
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_sound(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t freq_val, dur_val;
+    uint16_t freq, dur_ms;
+
+    p++; /* skip TOK_SOUND */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &freq_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in SOUND (expected ',')\n");
+        return -1;
+    }
+    p++;
+    if (basic_eval_expr(tok, &p, &dur_val) != 0) return -1;
+
+    if (freq_val.ival < 37 || dur_val.ival < 0) {
+        os_puts("Illegal function call in SOUND\n");
+        return -1;
+    }
+
+    freq = (uint16_t)freq_val.ival;
+    if (dur_val.ival > 1100) {
+        dur_ms = 60000;
+    } else {
+        dur_ms = (uint16_t)dur_val.ival * 55;
+    }
+
+    basic_sound_tone(freq, dur_ms);
+
+    *pos = p;
+    return 0;
+}
+
+static const uint16_t c_octave4_freqs[12] = {
+    262, /* 0: C  */
+    277, /* 1: C# */
+    294, /* 2: D  */
+    311, /* 3: D# */
+    330, /* 4: E  */
+    349, /* 5: F  */
+    370, /* 6: F# */
+    392, /* 7: G  */
+    415, /* 8: G# */
+    440, /* 9: A  */
+    466, /* 10: A# */
+    494  /* 11: B */
+};
+
+static int basic_exec_play(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t mml_val;
+    const char *s;
+
+    p += 2; /* skip 2-byte token TOK_PLAY (0xFE, 0x93) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &mml_val) != 0) return -1;
+    if (mml_val.type != BASIC_TYPE_STR || !mml_val.sval) {
+        os_puts("Type mismatch in PLAY\n");
+        return -1;
+    }
+
+    s = mml_val.sval;
+    while (*s != '\0') {
+        char ch = *s++;
+        if (ch == ' ' || ch == '\t') continue;
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - ('a' - 'A'));
+
+        if (ch == 'O') {
+            if (*s >= '0' && *s <= '6') {
+                s_play_octave = (uint8_t)(*s++ - '0');
+            }
+        } else if (ch == '<') {
+            if (s_play_octave > 0) s_play_octave--;
+        } else if (ch == '>') {
+            if (s_play_octave < 6) s_play_octave++;
+        } else if (ch == 'L') {
+            uint16_t len = 0;
+            while (*s >= '0' && *s <= '9') {
+                len = len * 10 + (*s++ - '0');
+            }
+            if (len >= 1 && len <= 64) s_play_length = (uint8_t)len;
+        } else if (ch == 'T') {
+            uint16_t tempo = 0;
+            while (*s >= '0' && *s <= '9') {
+                tempo = tempo * 10 + (*s++ - '0');
+            }
+            if (tempo >= 32 && tempo <= 255) s_play_tempo = (uint8_t)tempo;
+        } else if (ch == 'P') {
+            uint16_t pause_len = s_play_length;
+            uint16_t pause_ms;
+            uint16_t quarter_ms, whole_ms;
+            if (*s >= '0' && *s <= '9') {
+                pause_len = 0;
+                while (*s >= '0' && *s <= '9') {
+                    pause_len = pause_len * 10 + (*s++ - '0');
+                }
+            }
+            if (pause_len < 1 || pause_len > 64) pause_len = 4;
+            quarter_ms = (uint16_t)(60000U / (uint16_t)s_play_tempo);
+            whole_ms = quarter_ms * 4;
+            pause_ms = whole_ms / pause_len;
+            while (*s == '.') {
+                s++;
+                pause_ms += pause_ms / 2;
+            }
+            basic_sound_tone(0, 0);
+            basic_delay_ms(pause_ms);
+        } else if (ch == 'M') {
+            char m2 = *s;
+            if (m2 >= 'a' && m2 <= 'z') m2 = (char)(m2 - ('a' - 'A'));
+            if (m2 == 'N') { s_play_style = 0; s++; }
+            else if (m2 == 'L') { s_play_style = 1; s++; }
+            else if (m2 == 'S') { s_play_style = 2; s++; }
+            else if (m2 == 'F' || m2 == 'B') { s++; }
+        } else if (ch >= 'A' && ch <= 'G') {
+            int semitone;
+            int octave = (int)s_play_octave;
+            uint16_t note_len = s_play_length;
+            uint16_t quarter_ms, whole_ms, dur_ms;
+            uint16_t sound_dur, pause_dur;
+            uint16_t freq;
+
+            switch (ch) {
+            case 'C': semitone = 0; break;
+            case 'D': semitone = 2; break;
+            case 'E': semitone = 4; break;
+            case 'F': semitone = 5; break;
+            case 'G': semitone = 7; break;
+            case 'A': semitone = 9; break;
+            case 'B': semitone = 11; break;
+            default:  semitone = 0; break;
+            }
+
+            if (*s == '#' || *s == '+') {
+                semitone++;
+                s++;
+            } else if (*s == '-') {
+                semitone--;
+                s++;
+            }
+
+            if (semitone < 0) {
+                semitone += 12;
+                if (octave > 0) octave--;
+            } else if (semitone >= 12) {
+                semitone -= 12;
+                if (octave < 6) octave++;
+            }
+
+            if (*s >= '0' && *s <= '9') {
+                note_len = 0;
+                while (*s >= '0' && *s <= '9') {
+                    note_len = note_len * 10 + (*s++ - '0');
+                }
+            }
+            if (note_len < 1 || note_len > 64) note_len = s_play_length;
+
+            quarter_ms = (uint16_t)(60000U / (uint16_t)s_play_tempo);
+            whole_ms = quarter_ms * 4;
+            dur_ms = whole_ms / note_len;
+
+            while (*s == '.') {
+                s++;
+                dur_ms += dur_ms / 2;
+            }
+
+            if (s_play_style == 1) {
+                sound_dur = dur_ms;
+                pause_dur = 0;
+            } else if (s_play_style == 2) {
+                sound_dur = (dur_ms * 3) / 4;
+                pause_dur = dur_ms - sound_dur;
+            } else {
+                sound_dur = (dur_ms * 7) / 8;
+                pause_dur = dur_ms - sound_dur;
+            }
+
+            freq = c_octave4_freqs[semitone];
+            if (octave < 4) {
+                freq >>= (4 - octave);
+            } else if (octave > 4) {
+                freq <<= (octave - 4);
+            }
+
+            basic_sound_tone(freq, sound_dur);
+            if (pause_dur > 0) {
+                basic_sound_tone(0, 0);
+                basic_delay_ms(pause_dur);
+            }
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     uint16_t p = *pos;
 
@@ -3268,14 +4093,14 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                 newline = 0;
                 p++;
             } else if (tok[p] == ',') {
-                uint16_t cur_cursor = os_get_cursor();
-                uint8_t col = (uint8_t)(cur_cursor & 0xFF);
+                uint8_t col = (s_screen_mode == 0) ? (uint8_t)(os_get_cursor() & 0xFF) : s_gfx_col;
+                uint8_t max_cols = (s_screen_mode == 1) ? 40 : 80;
                 uint8_t next_tab = (uint8_t)(((col / 14) + 1) * 14);
-                if (next_tab >= 80) {
-                    os_putc('\n');
+                if (next_tab >= max_cols) {
+                    basic_term_putc('\n');
                 } else {
                     while (col < next_tab) {
-                        os_putc(' ');
+                        basic_term_putc(' ');
                         col++;
                     }
                 }
@@ -3287,18 +4112,32 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                     return -1;
                 }
                 if (val.type == BASIC_TYPE_STR) {
-                    os_puts(val.sval ? val.sval : "");
+                    basic_term_puts(val.sval ? val.sval : "");
                 } else {
-                    if (val.ival >= 0) os_putc(' ');
-                    basic_print_int(val.ival);
-                    os_putc(' ');
+                    if (val.ival >= 0) basic_term_putc(' ');
+                    {
+                        char nbuf[8];
+                        int16_t v = val.ival;
+                        int np = 0;
+                        if (v < 0) { basic_term_putc('-'); v = -v; }
+                        if (v == 0) {
+                            basic_term_putc('0');
+                        } else {
+                            while (v > 0) {
+                                nbuf[np++] = (char)('0' + (v % 10));
+                                v /= 10;
+                            }
+                            while (np > 0) basic_term_putc(nbuf[--np]);
+                        }
+                    }
+                    basic_term_putc(' ');
                 }
                 newline = 1;
             }
         }
 
         if (newline) {
-            os_putc('\n');
+            basic_term_putc('\n');
         }
         *pos = p;
         return 0;
@@ -3310,7 +4149,7 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return basic_exec_write_file(tok, pos);
     }
 
-    /* LINE INPUT statement */
+    /* LINE statement (LINE (x1,y1)-(x2,y2) or LINE INPUT) */
     if (tok[p] == TOK_LINE) {
         uint16_t save_p = p;
         p++;
@@ -3320,6 +4159,69 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
             return basic_exec_line_input(tok, pos);
         }
         p = save_p;
+        *pos = p;
+        return basic_exec_line_gfx(tok, pos);
+    }
+
+    /* SCREEN statement */
+    if (tok[p] == TOK_SCREEN) {
+        *pos = p;
+        return basic_exec_screen(tok, pos);
+    }
+
+    /* COLOR statement */
+    if (tok[p] == TOK_COLOR) {
+        *pos = p;
+        return basic_exec_color(tok, pos);
+    }
+
+    /* PSET statement */
+    if (tok[p] == TOK_PSET) {
+        *pos = p;
+        return basic_exec_pset(tok, pos, 0);
+    }
+
+    /* PRESET statement */
+    if (tok[p] == TOK_PRESET) {
+        *pos = p;
+        return basic_exec_pset(tok, pos, 1);
+    }
+
+    /* CIRCLE statement (2-byte token 0xFE, 0x91) */
+    if (tok[p] == (uint8_t)(TOK_CIRCLE >> 8) && tok[p + 1] == (uint8_t)(TOK_CIRCLE & 0xFF)) {
+        *pos = p;
+        return basic_exec_circle(tok, pos);
+    }
+
+    /* BEEP statement */
+    if (tok[p] == TOK_BEEP) {
+        *pos = p;
+        return basic_exec_beep(tok, pos);
+    }
+
+    /* SOUND statement */
+    if (tok[p] == TOK_SOUND) {
+        *pos = p;
+        return basic_exec_sound(tok, pos);
+    }
+
+    /* PLAY statement (2-byte token 0xFE, 0x93) */
+    if (tok[p] == (uint8_t)(TOK_PLAY >> 8) && tok[p + 1] == (uint8_t)(TOK_PLAY & 0xFF)) {
+        *pos = p;
+        return basic_exec_play(tok, pos);
+    }
+
+    /* SYSTEM statement in program (2-byte token 0xFE, 0x83) */
+    if (tok[p] == (uint8_t)(TOK_SYSTEM >> 8) && tok[p + 1] == (uint8_t)(TOK_SYSTEM & 0xFF)) {
+        basic_sound_tone(0, 0);
+        if (s_screen_mode != 0) {
+            os_gfx_set_mode(0x03);
+            s_screen_mode = 0;
+        }
+        basic_close_all_files();
+        s_running = 0;
+        os_exit(0);
+        return 0;
     }
 
     /* LET statement */
@@ -3466,8 +4368,14 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     /* CLS statement */
     if (tok[p] == TOK_CLS) {
         p++;
-        os_cls(0x07);
-        os_set_cursor(0, 0);
+        if (s_screen_mode == 0) {
+            os_cls(s_text_attr ? s_text_attr : 0x07);
+            os_set_cursor(0, 0);
+        } else {
+            os_gfx_clear(0);
+            s_gfx_row = 0;
+            s_gfx_col = 0;
+        }
         *pos = p;
         return 0;
     }
@@ -3540,6 +4448,10 @@ static void basic_cmd_run(void) {
     s_array_heap_free  = s_array_heap_start;
     s_data_line_off = s_prog_head;
     s_data_stmt_pos = 0;
+    s_last_x = 0;
+    s_last_y = 0;
+    s_gfx_row = 0;
+    s_gfx_col = 0;
     s_running = 1;
     s_pc_line = s_prog_head;
     s_pc_stmt = 4;
@@ -3552,6 +4464,11 @@ static void basic_cmd_run(void) {
         s_cur_line_num = num;
 
         if (os_kbhit() && (os_getc() & 0xFF) == 0x03) {
+            basic_sound_tone(0, 0);
+            if (s_screen_mode != 0) {
+                os_gfx_set_mode(0x03);
+                s_screen_mode = 0;
+            }
             os_puts("\nBreak in ");
             basic_print_uint(num);
             os_putc('\n');
@@ -3564,6 +4481,10 @@ static void basic_cmd_run(void) {
         while (mem[s_cur_line_off + s_pc_stmt] != 0x00 && s_running && !s_jumped) {
             uint16_t pos = s_pc_stmt;
             if (basic_exec_statement(&mem[s_cur_line_off], &pos) != 0) {
+                if (s_screen_mode != 0) {
+                    os_gfx_set_mode(0x03);
+                    s_screen_mode = 0;
+                }
                 os_puts(" in ");
                 basic_print_uint(num);
                 os_putc('\n');
@@ -3605,6 +4526,11 @@ static uint16_t basic_read_line(char *buf, uint16_t max_len) {
         char     c   = (char)u;
 
         if (c == 0x03) {
+            basic_sound_tone(0, 0);
+            if (s_screen_mode != 0) {
+                os_gfx_set_mode(0x03);
+                s_screen_mode = 0;
+            }
             os_puts("^C\n");
             buf[0] = '\0';
             return 0;
@@ -3698,6 +4624,11 @@ static void basic_process_input(char *line) {
         }
 
         if (tok_buf[0] == (uint8_t)(TOK_SYSTEM >> 8) && tok_buf[1] == (uint8_t)(TOK_SYSTEM & 0xFF)) {
+            basic_sound_tone(0, 0);
+            if (s_screen_mode != 0) {
+                os_gfx_set_mode(0x03);
+                s_screen_mode = 0;
+            }
             basic_close_all_files();
             s_running = 0;
             os_exit(0);
@@ -3728,6 +4659,8 @@ int app_main(void) {
     }
 
     basic_new();
+    basic_sound_init_opl();
+    basic_sound_tone(0, 0);
 
     os_puts("hobbyOS BASIC Version 1.0 (GW-BASIC Compatible)\n");
     os_puts("61440 Bytes free\n");
@@ -3742,6 +4675,11 @@ int app_main(void) {
         }
     }
 
+    basic_sound_tone(0, 0);
+    if (s_screen_mode != 0) {
+        os_gfx_set_mode(0x03);
+        s_screen_mode = 0;
+    }
     basic_close_all_files();
     os_mem_free(s_basic_seg);
     return 0;

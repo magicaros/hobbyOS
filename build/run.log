@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/23 16:02:55
+# 86Box v7.0 logfile, created 2026/11/23 18:00:36
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -66,6 +66,9 @@ Line 2 appended via SYS_FILE_APPEND
   - MUSIC/ <DIR>
   - BOOT.SH (92 bytes)
   - KEYMAPS/ <DIR>
+  - TEST1.BAS (113 bytes)
+  - TEST2.BAS (225 bytes)
+  - TEST3.BAS (113 bytes)
   - DOCS/ <DIR>
 [EXEC] /BIN/HELLO.BIN exited with code 0
 Keyboard layout set to FR (/KEYMAPS/FR.MAP)

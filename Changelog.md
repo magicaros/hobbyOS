@@ -47,6 +47,28 @@
       - `INPUT #n, var...`: Parses comma-delimited sequential fields from file channel #n into numeric and string variables.
       - `LINE INPUT #n, var$`: Reads an entire line from file channel #n into a string variable.
       - `EOF(n)`: Built-in boolean function returning `-1` (TRUE) when channel #n has reached end-of-file, or `0` (FALSE) otherwise.
+  - **Phase 5: Hardware Graphics & Sound (SCREEN, COLOR, PSET, PRESET, LINE, CIRCLE, BEEP, SOUND, PLAY)**:
+    - **Screen Modes (`SCREEN`)**:
+      - `SCREEN 0`: Text mode (80x25 text via `os_gfx_set_mode(0x03)`).
+      - `SCREEN 1`: 320x200 4-color CGA graphics (`os_gfx_set_mode(0x04)`).
+      - `SCREEN 2`: 640x200 2-color high-resolution CGA graphics (`os_gfx_set_mode(0x06)`).
+      - Automatic text mode restoration on program exit, error, Ctrl+C break, or `SYSTEM`.
+    - **Color & Palette Selection (`COLOR`)**:
+      - Text mode (`SCREEN 0`): `COLOR [fg] [, [bg] [, [border]]]`.
+      - CGA mode (`SCREEN 1`): `COLOR [background] [, [palette]]` supporting Palette 0 (green/red/brown) and Palette 1 (cyan/magenta/white) via `os_gfx_set_palette()`.
+      - Screen mode 2: Foreground color selection.
+    - **Graphics Primitives**:
+      - `CLS`: Clears text screen buffer in Mode 0; clears graphics framebuffer in Modes 1 and 2 (`os_gfx_clear(0)`).
+      - `PSET (x, y) [, color]` / `PRESET (x, y) [, color]`: Plots pixel with automatic clipping, defaulting to foreground or background color, and updates graphics coordinate history.
+      - `LINE [[(x1, y1)] - (x2, y2)] [, [color] [, [B|BF]]]`: Plots standard line, box outline (`B`), or filled solid box (`BF`) via `os_gfx_line()` and `os_gfx_rect()`, supporting continuation from previous endpoint when `(x1, y1)` is omitted.
+      - `CIRCLE (x, y), r [, color]`: Midpoint integer circle algorithm plotting with `os_gfx_putpixel()`.
+      - Graphics Text `PRINT`: Dual-mode text renderer allowing `PRINT` and `LOCATE` statements to output seamlessly on graphics screens via 8x8 BIOS ROM font (`os_gfx_text`).
+      - `INPUT$(n [, [#]f])`: Reads `n` raw characters from the keyboard without screen echo, or from file channel `#f`.
+    - **Sound & Music Subsystem**:
+      - Unified Sound Architecture: Tone synthesis is driven exclusively through the hobbyOS Unified Sound Subsystem (`os_sound_opl_write`), routing to the Yamaha YMF262 (OPL3) / YM3812 (OPL2) FM hardware when present, and automatically engaging the kernel's real-time AdLib-to-PC-Speaker emulation engine when no sound card is detected. Features immediate release rate envelopes (`0x0F`), carrier total attenuation muting (`0x43 = 0x3F`), and clean channel shutdown (`os_sound_stop()`) to eliminate residual carrier bleeding or background oscillation.
+      - `BEEP`: Standard 800 Hz alert chime for ~150 ms.
+      - `SOUND freq, duration`: Emits tone at `freq` Hz (37..32767) for `duration` clock ticks (~18.2 ticks/second) using pure 16-bit timing math.
+      - `PLAY "MML..."`: Music Macro Language interpreter supporting note names (`A`..`G`, `#`/`+`/`-`), octaves (`O0`..`O6`, `>`, `<`), note lengths (`L1`..`L64`), tempos (`T32`..`T255`), articulation styles (`MN` normal, `ML` legato, `MS` staccato), and rests (`P1`..`P64`).
 
 ## Revision 1.0.2 (2026-11-21)
 
