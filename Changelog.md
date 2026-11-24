@@ -111,6 +111,24 @@
     - **Expression Grammar Precedence Correction**: Corrected operator precedence order in `basic_eval_expr` by placing relational comparisons (`eval_rel`: `=`, `<>`, `<`, `>`, `<=`, `>=`) at Level 4 between additive arithmetic (`eval_add`) and logical NOT (`eval_not`), AND (`eval_and`), and OR/XOR (`eval_or`), ensuring relational expressions like `R1 = R3 AND R2 = R4` correctly evaluate as `(R1 = R3) AND (R2 = R4)` rather than improperly binding logical `AND` before relational equality.
     - **Far Token Case-Insensitive String Matcher (`basic_strnicmp_far`)**: Implemented segmented far pointer comparison to avoid DS truncation when matching keywords and tokens in `s_basic_seg`.
     - **Target System Verification Suite (`/BASIC/SYS.BAS`, `/SYS.BAS`)**: Comprehensive hardware verification test suite validating BDA video mode read (Mode 3), ROM BIOS machine ID (`0xFE` IBM PC/XT), CGA VRAM poke and restore, live CGA status port `&H3DA` and OPL status `&H388` reads, real-time `TIMER` benchmarking, and PRNG repeatability. Verified 100% passed on target Book8088 emulator.
+  - **Phase 8: String Utilities & Formatting (`STRING$`, `SPACE$`, `INSTR`, `HEX$`, `OCT$`, `MID$=`, `PRINT USING`)**:
+    - **String Generation Functions**:
+      - `STRING$(n, char_code_or_str)` (`TOK_STRING` `0x00D6`): Repeats a character $n$ times ($0 \le n \le 128$), accepting either an ASCII integer code or the first character of a string expression.
+      - `SPACE$(n)` (`TOK_SPACE` `0xFF98`): Generates a string containing $n$ space characters.
+    - **Base Conversion Functions**:
+      - `HEX$(n)` (`TOK_HEX` `0xFF9A`): Converts integer $n$ into an uppercase hexadecimal string representation without leading zeros.
+      - `OCT$(n)` (`TOK_OCT` `0xFF99`): Converts integer $n$ into an octal string representation without leading zeros.
+    - **Substring Search Function (`INSTR`)**:
+      - `INSTR([start,] str1, str2)` (`TOK_INSTR` `0x00D8`): Searches for substring `str2` in `str1` starting at 1-based index `start` (defaults to 1), returning 1-based offset where found, or 0 if not found.
+    - **In-Place String Mutation Statement (`MID$=`)**:
+      - `MID$(var$, start [, len]) = expr$`: Replaces characters in-place within a string variable or string array element without altering the target's total allocated length, stopping at replacement length, string boundary, or target end. Supports `LET MID$(...) = ...`.
+    - **Formatted Output Engine (`PRINT USING`, `PRINT #n, USING`)**:
+      - Full implementation of GW-BASIC formatted output supporting console (`PRINT USING`) and file channels (`PRINT #n, USING`).
+      - String templates: `!` (first character only), `&` (variable length full string), `\   \` (fixed width $2 + n$ with space padding).
+      - Numeric templates: `#` (digit position), `.` (decimal point with half-to-even rounding), `+` (leading/trailing forced sign), `-` (trailing negative sign), `$$` (floating dollar sign), `**` (asterisk fill), `**$` (combined asterisk fill and floating dollar sign), `,` (thousands separator every 3 digits before decimal), and `%` (field overflow indicator).
+      - Literal escaping: Underline `_` escapes the following character as a literal text character; format string automatically wraps across multiple arguments and handles trailing format literals.
+      - Freestanding arithmetic: Formatter operates using 16-bit integer and soft-float scaling without invoking Watcom runtime library division helpers (`__U4D`/`__I4D`).
+    - **Target String Verification Suite (`/BASIC/STR.BAS`, `/STR.BAS`)**: Comprehensive test suite covering all 6 functional areas (STRING$, SPACE$, HEX$, OCT$, INSTR, MID$=, PRINT USING, and PRINT # USING). Verified 100% passed on target Book8088 emulator.
 
 ## Revision 1.0.2 (2026-11-21)
 

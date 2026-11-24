@@ -193,6 +193,7 @@ static uint8_t  s_play_style        = 0;    /* 0 = normal (7/8), 1 = legato (8/8
 /* Forward declarations */
 static int basic_eval_expr(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val);
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_mid_stmt(const uint8_t __far *tok, uint16_t *pos);
 static int basic_skip_to_next(const uint8_t __far *tok, uint16_t *pos, const char *var_name);
 static int basic_skip_to_wend(const uint8_t __far *tok, uint16_t *pos);
 static void basic_close_all_files(void);
@@ -1264,6 +1265,132 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         return 0;
     }
 
+    /* Built-in function: STRING$(n, char_code_or_str) */
+    if (tok[p] == TOK_STRING) {
+        basic_val_t n_arg, c_arg;
+        char *str = basic_alloc_temp_str();
+        int16_t n;
+        char ch = ' ';
+        int i;
+        p++; /* skip TOK_STRING */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') {
+            os_puts("Syntax error in STRING$ (expected '(')\n");
+            return -1;
+        }
+        p++;
+        if (basic_eval_expr(tok, &p, &n_arg) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',') {
+            os_puts("Syntax error in STRING$ (expected ',')\n");
+            return -1;
+        }
+        p++;
+        if (basic_eval_expr(tok, &p, &c_arg) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+
+        n = val_to_int(&n_arg);
+        if (n < 0) n = 0;
+        if (n > BASIC_MAX_STR_LEN) n = BASIC_MAX_STR_LEN;
+
+        if (c_arg.type == BASIC_TYPE_STR) {
+            ch = (c_arg.sval && c_arg.sval[0]) ? c_arg.sval[0] : ' ';
+        } else {
+            ch = (char)(val_to_int(&c_arg) & 0xFF);
+        }
+
+        for (i = 0; i < n; i++) str[i] = ch;
+        str[n] = '\0';
+        out_val->type = BASIC_TYPE_STR;
+        out_val->sval = str;
+        out_val->ival = 0;
+        out_val->fval = 0;
+        *pos = p;
+        return 0;
+    }
+
+    /* Built-in function: INSTR([start,] str1, str2) */
+    if (tok[p] == TOK_INSTR) {
+        basic_val_t a1, a2, a3;
+        int16_t start = 1;
+        const char *s1 = "";
+        const char *s2 = "";
+        uint16_t l1, l2;
+        int res = 0;
+        uint16_t i, j;
+
+        p++; /* skip TOK_INSTR */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') {
+            os_puts("Syntax error in INSTR (expected '(')\n");
+            return -1;
+        }
+        p++;
+
+        if (basic_eval_expr(tok, &p, &a1) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',') {
+            os_puts("Syntax error in INSTR (expected ',')\n");
+            return -1;
+        }
+        p++;
+
+        if (a1.type == BASIC_TYPE_STR) {
+            /* INSTR(str1, str2) */
+            s1 = a1.sval ? a1.sval : "";
+            if (basic_eval_expr(tok, &p, &a2) != 0) return -1;
+            s2 = a2.sval ? a2.sval : "";
+        } else {
+            /* INSTR(start, str1, str2) */
+            start = val_to_int(&a1);
+            if (basic_eval_expr(tok, &p, &a2) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] != ',') {
+                os_puts("Syntax error in INSTR (expected ',')\n");
+                return -1;
+            }
+            p++;
+            s1 = a2.sval ? a2.sval : "";
+            if (basic_eval_expr(tok, &p, &a3) != 0) return -1;
+            s2 = a3.sval ? a3.sval : "";
+        }
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+
+        l1 = basic_strlen(s1);
+        l2 = basic_strlen(s2);
+
+        if (l2 == 0) {
+            res = (start > 0 && (uint16_t)start <= l1 + 1) ? start : 1;
+        } else if (start <= 0 || (uint16_t)start > l1 || l2 > l1) {
+            res = 0;
+        } else {
+            uint16_t s_idx = (uint16_t)(start - 1);
+            for (i = s_idx; i + l2 <= l1; i++) {
+                int match = 1;
+                for (j = 0; j < l2; j++) {
+                    if (s1[i + j] != s2[j]) {
+                        match = 0;
+                        break;
+                    }
+                }
+                if (match) {
+                    res = (int)(i + 1);
+                    break;
+                }
+            }
+        }
+
+        out_val->type = BASIC_TYPE_INT;
+        out_val->ival = (int16_t)res;
+        out_val->fval = 0;
+        out_val->sval = 0;
+        *pos = p;
+        return 0;
+    }
+
     /* Built-in 2-byte functions with 0xFE prefix (Phase 7) */
     if (tok[p] == 0xFE) {
         uint8_t fn = tok[p + 1];
@@ -1379,6 +1506,90 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
                 out_val->ival = -1;
             }
             out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* SPACE$(N) */
+        if (fn == (uint8_t)(TOK_SPACE & 0xFF)) {
+            basic_val_t arg;
+            char *str = basic_alloc_temp_str();
+            int16_t n;
+            int i;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            n = val_to_int(&arg);
+            if (n < 0) n = 0;
+            if (n > BASIC_MAX_STR_LEN) n = BASIC_MAX_STR_LEN;
+            for (i = 0; i < n; i++) str[i] = ' ';
+            str[n] = '\0';
+            out_val->type = BASIC_TYPE_STR;
+            out_val->sval = str;
+            out_val->ival = 0;
+            out_val->fval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* HEX$(N) */
+        if (fn == (uint8_t)(TOK_HEX & 0xFF)) {
+            basic_val_t arg;
+            char *str = basic_alloc_temp_str();
+            uint16_t v;
+            int sp = 0;
+            char tmp[5];
+            int tp = 0;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            v = (uint16_t)val_to_int(&arg);
+            if (v == 0) {
+                str[sp++] = '0';
+            } else {
+                while (v > 0) {
+                    uint8_t d = (uint8_t)(v & 0x0F);
+                    tmp[tp++] = (d < 10) ? (char)('0' + d) : (char)('A' + d - 10);
+                    v >>= 4;
+                }
+                while (tp > 0) str[sp++] = tmp[--tp];
+            }
+            str[sp] = '\0';
+            out_val->type = BASIC_TYPE_STR;
+            out_val->sval = str;
+            out_val->ival = 0;
+            out_val->fval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* OCT$(N) */
+        if (fn == (uint8_t)(TOK_OCT & 0xFF)) {
+            basic_val_t arg;
+            char *str = basic_alloc_temp_str();
+            uint16_t v;
+            int sp = 0;
+            char tmp[7];
+            int tp = 0;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            v = (uint16_t)val_to_int(&arg);
+            if (v == 0) {
+                str[sp++] = '0';
+            } else {
+                while (v > 0) {
+                    uint8_t d = (uint8_t)(v & 0x07);
+                    tmp[tp++] = (char)('0' + d);
+                    v >>= 3;
+                }
+                while (tp > 0) str[sp++] = tmp[--tp];
+            }
+            str[sp] = '\0';
+            out_val->type = BASIC_TYPE_STR;
+            out_val->sval = str;
+            out_val->ival = 0;
+            out_val->fval = 0;
             *pos = p;
             return 0;
         }
@@ -2819,6 +3030,10 @@ static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
     uint16_t p = *pos;
 
     while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == 0xFF && tok[p + 1] == (uint8_t)(TOK_MID & 0xFF)) {
+        *pos = p;
+        return basic_exec_mid_stmt(tok, pos);
+    }
     if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
         os_puts("Syntax error in variable name\n");
         return -1;
@@ -4719,6 +4934,530 @@ static int basic_exec_randomize(const uint8_t __far *tok, uint16_t *pos) {
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Phase 8: String Utilities & Formatting Helpers (MID$=, PRINT USING)
+ * -------------------------------------------------------------------------- */
+
+static void basic_out_char(uint8_t fnum, char c) {
+    if (fnum == 0) {
+        basic_term_putc(c);
+    } else {
+        basic_file_write_data(fnum, &c, 1);
+    }
+}
+
+static void basic_out_str(uint8_t fnum, const char *s) {
+    if (!s) return;
+    if (fnum == 0) {
+        basic_term_puts(s);
+    } else {
+        basic_file_write_data(fnum, s, basic_strlen(s));
+    }
+}
+
+static const basic_float_t s_pow10_table[6] = {
+    0x3F800000UL, /* 10^0 = 1.0 */
+    0x41200000UL, /* 10^1 = 10.0 */
+    0x42C80000UL, /* 10^2 = 100.0 */
+    0x447A0000UL, /* 10^3 = 1000.0 */
+    0x461C4000UL, /* 10^4 = 10000.0 */
+    0x47C35000UL  /* 10^5 = 100000.0 */
+};
+
+static void basic_print_using_num(uint8_t fnum, const basic_val_t *arg,
+                                  int num_digits_int, int num_digits_frac,
+                                  int has_dot, int leading_sign, int trailing_sign,
+                                  int star_fill, int dollar_sign, int thousands_comma) {
+    basic_float_t f;
+    int is_neg = 0;
+    uint32_t scaled;
+    char frac_digits[8];
+    char int_digits[16];
+    char int_buf[32];
+    int fp_idx = 0;
+    int ip_idx = 0;
+    int ib_len = 0;
+    int comma_cnt = 0;
+    int k;
+    int pad;
+    int target_int_width;
+    char sign_char = 0;
+
+    if (num_digits_frac > 5) num_digits_frac = 5;
+
+    f = val_to_float(arg);
+    if ((f & 0x80000000UL) != 0 && f != 0) {
+        is_neg = 1;
+        f &= 0x7FFFFFFFUL;
+    }
+
+    /* Scale by 10^num_digits_frac and round */
+    if (num_digits_frac > 0) {
+        f = basic_float_mul(f, s_pow10_table[num_digits_frac]);
+    }
+    f = basic_float_add(f, 0x3F000000UL); /* + 0.5 */
+    scaled = soft_to_uint32(f);
+
+    /* Extract fractional digits (least significant first) */
+    for (k = 0; k < num_digits_frac; k++) {
+        uint16_t d = u32_div10(&scaled);
+        frac_digits[fp_idx++] = (char)('0' + d);
+    }
+
+    /* Extract integer digits (least significant first) */
+    if (scaled == 0) {
+        int_digits[ip_idx++] = '0';
+    } else {
+        while (scaled > 0) {
+            uint16_t d = u32_div10(&scaled);
+            int_digits[ip_idx++] = (char)('0' + d);
+        }
+    }
+
+    /* Check field overflow */
+    if (ip_idx > num_digits_int) {
+        basic_out_char(fnum, '%');
+        if (arg->type == BASIC_TYPE_FLOAT) {
+            char fbuf[24];
+            basic_format_float(arg->fval, fbuf, sizeof(fbuf));
+            basic_out_str(fnum, fbuf);
+        } else if (arg->type == BASIC_TYPE_UINT) {
+            char nbuf[16];
+            uint16_t uv = (uint16_t)arg->ival;
+            int np = 0;
+            if (uv == 0) nbuf[np++] = '0';
+            else {
+                char tmp[8]; int tp = 0;
+                while (uv > 0) { tmp[tp++] = (char)('0' + (uv % 10)); uv /= 10; }
+                while (tp > 0) nbuf[np++] = tmp[--tp];
+            }
+            nbuf[np] = '\0';
+            basic_out_str(fnum, nbuf);
+        } else {
+            char nbuf[16];
+            int16_t v = arg->ival;
+            int np = 0;
+            if (v < 0) { nbuf[np++] = '-'; v = -v; }
+            if (v == 0) nbuf[np++] = '0';
+            else {
+                char tmp[8]; int tp = 0;
+                while (v > 0) { tmp[tp++] = (char)('0' + (v % 10)); v /= 10; }
+                while (tp > 0) nbuf[np++] = tmp[--tp];
+            }
+            nbuf[np] = '\0';
+            basic_out_str(fnum, nbuf);
+        }
+        return;
+    }
+
+    /* Build formatted integer string with commas if requested */
+    for (k = 0; k < ip_idx; k++) {
+        if (thousands_comma && k > 0 && (k % 3) == 0) {
+            int_buf[ib_len++] = ',';
+            comma_cnt++;
+        }
+        int_buf[ib_len++] = int_digits[k];
+    }
+    /* Reverse int_buf */
+    for (k = 0; k < ib_len / 2; k++) {
+        char tmp = int_buf[k];
+        int_buf[k] = int_buf[ib_len - 1 - k];
+        int_buf[ib_len - 1 - k] = tmp;
+    }
+    int_buf[ib_len] = '\0';
+
+    target_int_width = num_digits_int;
+    if (thousands_comma) target_int_width += comma_cnt;
+
+    pad = target_int_width - ib_len;
+
+    if (leading_sign) {
+        sign_char = is_neg ? '-' : '+';
+    } else if (is_neg && !trailing_sign) {
+        sign_char = '-';
+    }
+
+    if (sign_char != 0 && pad > 0) pad--;
+    if (dollar_sign && pad > 0) pad--;
+
+    /* Emit padding and prefix */
+    if (star_fill) {
+        while (pad-- > 0) basic_out_char(fnum, '*');
+        if (dollar_sign) basic_out_char(fnum, '$');
+        if (sign_char) basic_out_char(fnum, sign_char);
+    } else {
+        while (pad-- > 0) basic_out_char(fnum, ' ');
+        if (sign_char) basic_out_char(fnum, sign_char);
+        if (dollar_sign) basic_out_char(fnum, '$');
+    }
+
+    /* Emit integer part */
+    basic_out_str(fnum, int_buf);
+
+    /* Emit fractional part */
+    if (has_dot) {
+        basic_out_char(fnum, '.');
+        for (k = num_digits_frac - 1; k >= 0; k--) {
+            basic_out_char(fnum, frac_digits[k]);
+        }
+    }
+
+    /* Emit trailing sign */
+    if (trailing_sign == 1) {
+        basic_out_char(fnum, is_neg ? '-' : '+');
+    } else if (trailing_sign == -1) {
+        basic_out_char(fnum, is_neg ? '-' : ' ');
+    }
+}
+
+static int basic_exec_print_using(uint8_t fnum, const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t fmt_val;
+    const char *fmt;
+    uint16_t fmt_len;
+    uint16_t fp = 0;
+    int newline = 1;
+
+    p++; /* skip TOK_USING */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &fmt_val) != 0) return -1;
+    if (fmt_val.type != BASIC_TYPE_STR || !fmt_val.sval) {
+        os_puts("Type mismatch in USING\n");
+        return -1;
+    }
+    fmt = fmt_val.sval;
+    fmt_len = basic_strlen(fmt);
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ';') p++;
+
+    while (tok[p] != 0x00 && tok[p] != ':') {
+        basic_val_t arg;
+        int is_string = 0;
+        int str_type = 0;
+        int str_width = 0;
+        int num_digits_int = 0;
+        int num_digits_frac = 0;
+        int has_dot = 0;
+        int leading_sign = 0;
+        int trailing_sign = 0;
+        int star_fill = 0;
+        int dollar_sign = 0;
+        int thousands_comma = 0;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == 0x00 || tok[p] == ':' || tok[p] == TOK_ELSE) break;
+
+        if (tok[p] == ';') {
+            newline = 0;
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == 0x00 || tok[p] == ':' || tok[p] == TOK_ELSE) break;
+            newline = 1;
+        } else if (tok[p] == ',') {
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == 0x00 || tok[p] == ':' || tok[p] == TOK_ELSE) break;
+            newline = 1;
+        }
+
+        if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+
+        /* Scan format string for next field specifier */
+        for (;;) {
+            if (fp >= fmt_len) fp = 0;
+
+            if (fmt[fp] == '_') {
+                fp++;
+                if (fp < fmt_len) basic_out_char(fnum, fmt[fp++]);
+                continue;
+            }
+
+            /* String field: '!' */
+            if (fmt[fp] == '!') {
+                is_string = 1;
+                str_type = '!';
+                str_width = 1;
+                fp++;
+                break;
+            }
+
+            /* String field: '&' */
+            if (fmt[fp] == '&') {
+                is_string = 1;
+                str_type = '&';
+                fp++;
+                break;
+            }
+
+            /* String field: '\ ... \' */
+            if (fmt[fp] == '\\') {
+                uint16_t sp_cnt = 0;
+                uint16_t next_p = fp + 1;
+                while (next_p < fmt_len && fmt[next_p] == ' ') {
+                    sp_cnt++;
+                    next_p++;
+                }
+                if (next_p < fmt_len && fmt[next_p] == '\\') {
+                    is_string = 1;
+                    str_type = '\\';
+                    str_width = 2 + (int)sp_cnt;
+                    fp = next_p + 1;
+                    break;
+                }
+            }
+
+            /* Numeric field starter: '+', '-', '#', '.', '*', '$' */
+            if (fmt[fp] == '#' || fmt[fp] == '.' ||
+                fmt[fp] == '+' ||
+                (fmt[fp] == '*' && fp + 1 < fmt_len && fmt[fp + 1] == '*') ||
+                (fmt[fp] == '$' && fp + 1 < fmt_len && fmt[fp + 1] == '$')) {
+
+                is_string = 0;
+
+                /* Check prefix */
+                if (fmt[fp] == '+') {
+                    leading_sign = 1;
+                    fp++;
+                }
+
+                if (fp + 2 < fmt_len && fmt[fp] == '*' && fmt[fp + 1] == '*' && fmt[fp + 2] == '$') {
+                    star_fill = 1;
+                    dollar_sign = 1;
+                    num_digits_int += 2;
+                    fp += 3;
+                } else if (fp + 1 < fmt_len && fmt[fp] == '*' && fmt[fp + 1] == '*') {
+                    star_fill = 1;
+                    num_digits_int += 2;
+                    fp += 2;
+                } else if (fp + 1 < fmt_len && fmt[fp] == '$' && fmt[fp + 1] == '$') {
+                    dollar_sign = 1;
+                    num_digits_int += 1;
+                    fp += 2;
+                }
+
+                /* Scan '#' and ',' before decimal */
+                while (fp < fmt_len && (fmt[fp] == '#' || fmt[fp] == ',')) {
+                    if (fmt[fp] == '#') num_digits_int++;
+                    else thousands_comma = 1;
+                    fp++;
+                }
+
+                /* Scan decimal point and fractional '#' */
+                if (fp < fmt_len && fmt[fp] == '.') {
+                    has_dot = 1;
+                    fp++;
+                    while (fp < fmt_len && fmt[fp] == '#') {
+                        num_digits_frac++;
+                        fp++;
+                    }
+                }
+
+                /* Scan trailing sign '+' or '-' */
+                if (fp < fmt_len && fmt[fp] == '+') {
+                    trailing_sign = 1;
+                    fp++;
+                } else if (fp < fmt_len && fmt[fp] == '-') {
+                    trailing_sign = -1;
+                    fp++;
+                }
+
+                break;
+            }
+
+            /* Literal character in format string */
+            basic_out_char(fnum, fmt[fp++]);
+        }
+
+        /* Format the argument */
+        if (is_string) {
+            if (arg.type != BASIC_TYPE_STR) {
+                os_puts("Type mismatch in PRINT USING\n");
+                return -1;
+            }
+            if (str_type == '!') {
+                const char *s = arg.sval ? arg.sval : "";
+                basic_out_char(fnum, s[0] ? s[0] : ' ');
+            } else if (str_type == '&') {
+                basic_out_str(fnum, arg.sval ? arg.sval : "");
+            } else if (str_type == '\\') {
+                const char *s = arg.sval ? arg.sval : "";
+                int slen = (int)basic_strlen(s);
+                int out_len = (slen < str_width) ? slen : str_width;
+                int pad_spaces = str_width - out_len;
+                int k;
+                for (k = 0; k < out_len; k++) basic_out_char(fnum, s[k]);
+                while (pad_spaces-- > 0) basic_out_char(fnum, ' ');
+            }
+        } else {
+            if (arg.type == BASIC_TYPE_STR) {
+                os_puts("Type mismatch in PRINT USING\n");
+                return -1;
+            }
+            basic_print_using_num(fnum, &arg, num_digits_int, num_digits_frac,
+                                  has_dot, leading_sign, trailing_sign,
+                                  star_fill, dollar_sign, thousands_comma);
+        }
+    }
+
+    /* Print any trailing literal characters up to next field or end of format */
+    while (fp < fmt_len) {
+        if (fmt[fp] == '_' && fp + 1 < fmt_len) {
+            fp++;
+            basic_out_char(fnum, fmt[fp++]);
+            continue;
+        }
+        if (fmt[fp] == '!' || fmt[fp] == '&' || fmt[fp] == '\\' ||
+            fmt[fp] == '#' || fmt[fp] == '+' || fmt[fp] == '*' || fmt[fp] == '$') {
+            break;
+        }
+        basic_out_char(fnum, fmt[fp++]);
+    }
+
+    if (newline) {
+        basic_out_str(fnum, (fnum == 0) ? "\n" : "\r\n");
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_mid_stmt(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    char var_name[BASIC_MAX_VARNAME];
+    int is_array = 0;
+    basic_val_t i1_val, i2_val;
+    uint8_t num_dims = 1;
+    basic_val_t start_val, len_val, expr_val;
+    int16_t start, repl_len = 255;
+    basic_var_t *var = 0;
+    basic_array_t *arr = 0;
+    char str_buf[BASIC_MAX_STR_LEN + 1];
+    char *dst = 0;
+    const char *src = 0;
+    uint16_t dst_len, src_len, copy_len, i;
+
+    p += 2; /* skip 0xFF, TOK_MID */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != '(') {
+        os_puts("Syntax error in MID$ statement (expected '(')\n");
+        return -1;
+    }
+    p++;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+        os_puts("Syntax error in MID$ variable\n");
+        return -1;
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == '(') {
+        /* Array element MID$(A$(i), ...) */
+        is_array = 1;
+        p++;
+        if (basic_eval_expr(tok, &p, &i1_val) != 0) return -1;
+        i2_val.ival = 0;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            num_dims = 2;
+            if (basic_eval_expr(tok, &p, &i2_val) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+        }
+        if (tok[p] != ')') {
+            os_puts("Syntax error in array subscript\n");
+            return -1;
+        }
+        p++;
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in MID$ (expected ',')\n");
+        return -1;
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &start_val) != 0) return -1;
+    start = val_to_int(&start_val);
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        if (basic_eval_expr(tok, &p, &len_val) != 0) return -1;
+        repl_len = val_to_int(&len_val);
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+    }
+
+    if (tok[p] != ')') {
+        os_puts("Syntax error in MID$ (expected ')')\n");
+        return -1;
+    }
+    p++;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != TOK_EQ && tok[p] != '=') {
+        os_puts("Syntax error in MID$ (expected '=')\n");
+        return -1;
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &expr_val) != 0) return -1;
+    if (expr_val.type != BASIC_TYPE_STR) {
+        os_puts("Type mismatch in MID$\n");
+        return -1;
+    }
+
+    src = expr_val.sval ? expr_val.sval : "";
+    src_len = basic_strlen(src);
+
+    if (is_array) {
+        basic_val_t cur_val;
+        arr = basic_find_array(var_name);
+        if (!arr || arr->type != BASIC_TYPE_STR) {
+            os_puts("Type mismatch or array not found\n");
+            return -1;
+        }
+        if (basic_read_array_elem(arr, i1_val.ival, i2_val.ival, &cur_val) != 0) return -1;
+        basic_strncpy(str_buf, cur_val.sval ? cur_val.sval : "", sizeof(str_buf) - 1);
+        str_buf[sizeof(str_buf) - 1] = '\0';
+        dst = str_buf;
+    } else {
+        var = basic_find_var(var_name);
+        if (!var || var->type != BASIC_TYPE_STR) {
+            os_puts("Variable not found or type mismatch\n");
+            return -1;
+        }
+        dst = var->sval;
+    }
+
+    dst_len = basic_strlen(dst);
+    if (start > 0 && (uint16_t)start <= dst_len && repl_len > 0) {
+        copy_len = (uint16_t)repl_len;
+        if (copy_len > src_len) copy_len = src_len;
+        if ((uint16_t)(start - 1) + copy_len > dst_len) {
+            copy_len = dst_len - (uint16_t)(start - 1);
+        }
+        for (i = 0; i < copy_len; i++) {
+            dst[(start - 1) + i] = src[i];
+        }
+    }
+
+    if (is_array) {
+        basic_val_t write_val;
+        write_val.type = BASIC_TYPE_STR;
+        write_val.sval = str_buf;
+        write_val.ival = 0;
+        write_val.fval = 0;
+        if (basic_write_array_elem(arr, i1_val.ival, i2_val.ival, &write_val) != 0) return -1;
+    }
+
+    *pos = p;
+    return 0;
+}
+
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     uint16_t p = *pos;
 
@@ -4734,6 +5473,12 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         while (tok[p] != 0x00) p++;
         *pos = p;
         return 0;
+    }
+
+    /* MID$(var$, start [, len]) = expr$ statement */
+    if (tok[p] == 0xFF && tok[p + 1] == (uint8_t)(TOK_MID & 0xFF)) {
+        *pos = p;
+        return basic_exec_mid_stmt(tok, pos);
     }
 
     /* PRINT statement (Console and File PRINT #n) */
@@ -4756,6 +5501,12 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                 return -1;
             }
             p++;
+
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == TOK_USING) {
+                *pos = p;
+                return basic_exec_print_using(fnum, tok, pos);
+            }
 
             while (tok[p] != 0x00 && tok[p] != ':') {
                 basic_val_t val;
@@ -4819,6 +5570,12 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         }
 
         /* Console PRINT */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == TOK_USING) {
+            *pos = p;
+            return basic_exec_print_using(0, tok, pos);
+        }
+
         while (tok[p] != 0x00 && tok[p] != ':') {
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == 0x00 || tok[p] == ':' || tok[p] == TOK_ELSE) break;
