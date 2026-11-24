@@ -145,6 +145,43 @@
       - `ON <expr> GOTO <line1>, <line2>, ...`: Jumps to the $n$-th line number in the list based on 1-based integer expression value; falls through if index is out of list bounds.
       - `ON <expr> GOSUB <line1>, <line2>, ...`: Calls the $n$-th line number subroutine in the list, pushing return line and statement position to the GOSUB call stack.
     - **Target Error Handling Verification Suite (`/BASIC/ERR.BAS`, `/ERR.BAS`)**: Comprehensive verification test suite covering 6 test sections: division by zero trap with `ERR`/`ERL` verification and `RESUME NEXT`; statement retry via `RESUME 0` repairing divisor; custom error code generation with `ERROR 55` and `RESUME <line>`; multi-branch computed `ON...GOTO`; multi-branch computed `ON...GOSUB`; and multi-statement line recovery via `RESUME NEXT`. Verified 100% passed on target Book8088 emulator.
+  - **Phase 10: Event Trapping (`ON TIMER(n) GOSUB`, `TIMER ON/OFF/STOP`, `ON KEY(n) GOSUB`, `KEY(n) ON/OFF/STOP`, `KEY ON/OFF`, `KEY LIST`, `KEY n, "string"`, `RETURN <linenum>`)**:
+    - **Timer Event Trapping Engine**:
+      - `ON TIMER(n) GOSUB <linenum>`: Configures a recurring timer trap handler triggered every $n$ seconds ($1 \le n \le 86400$).
+      - `TIMER ON`: Enables timer event polling at statement boundaries.
+      - `TIMER STOP`: Suspends event handling while latching and preserving pending timer ticks so they fire immediately upon the next `TIMER ON`.
+      - `TIMER OFF`: Completely disables timer trapping and discards any pending timer ticks.
+    - **Keyboard Event Trapping & Softkeys**:
+      - `ON KEY(n) GOSUB <linenum>`: Configures key event trapping for function keys 1..10 (F1..F10) and cursor keys 11..14 (Up, Left, Right, Down).
+      - `KEY(n) ON`, `KEY(n) STOP`, `KEY(n) OFF`: Controls trapping state per key trap index with event queuing and latching.
+      - `KEY ON`: Displays 10 function key softkey prompts on screen line 24.
+      - `KEY OFF`: Clears and blanks line 24 prompt row.
+      - `KEY LIST`: Prints current definitions of all 10 function keys to the console.
+      - `KEY n, "string"`: Customizes function key macro string (keys 1..10, up to 15 characters).
+    - **Event Polling & Non-Local Return**:
+      - `basic_poll_events()`: Evaluates timer ticks and keyboard FIFO traps at statement boundaries, simulating an asynchronous `GOSUB` to the handler while preserving execution state.
+      - `RETURN [linenum]`: Extended `RETURN` to accept an optional target line number (`RETURN <linenum>`), popping the GOSUB return stack and transferring control directly to the target line.
+    - **Tokenizer & Parser Refinements**:
+      - Fixed keyword tokenization boundary checks (`basic_tokenize`) to ensure keywords are not matched when preceded by an alphanumeric identifier character (resolving collision with variables like `TWAIT` vs `WAIT`).
+      - Extended variable identifier parser (`basic_parse_var_name`) to support underscores (`_`) in variable names.
+    - **Memory Layout & 64 KB Segment Confinement**:
+      - Adjusted BSS symbol tables and runtime arrays (`BASIC_MAX_VARS = 48`, `BASIC_MAX_STR_LEN = 64`, `BASIC_NUM_TEMP_STRS = 6`, `BASIC_MAX_ARRAYS = 16`, `BASIC_MAX_GOSUB = 16`, `BASIC_MAX_FOR_NEST = 8`, `BASIC_MAX_WHILE_NEST = 8`) to keep total executable footprint at 62,008 bytes (`0xF238`), ensuring full flat 64 KB segment safety with 3.5 KB stack headroom below `0xFEFE`.
+    - **Target Event Trapping Verification Suite (`/BASIC/EVENT.BAS`, `/EVENT.BAS`)**: Comprehensive verification suite covering softkey management (`KEY ON/OFF`, `KEY 1, "..."`), key trap syntax & validation (`ON KEY(1) GOSUB`, `KEY(0)` out of bounds error trapping), `RETURN <linenum>` redirection, recurring `TIMER ON` event delivery, `TIMER STOP` event buffering and pending firing upon `TIMER ON`, and `TIMER OFF` deactivation. Verified 100% passed on target Book8088 emulator.
+- **MS-DOS 16-bit MZ Executable Support & Medium Model Toolchain (`kernel/syscall.c`, `kernel/entry.asm`, `user/crt0_mz.asm`, `Makefile`)**:
+  - **MS-DOS Relocatable MZ Header & Image Loader (`exec_program` in `kernel/syscall.c`)**:
+    - Implemented a standard MS-DOS 16-bit MZ executable loader (`0x5A4D` / `0x4D5A`) into the kernel `SYS_EXEC` subsystem, eliminating the 64 KB single-segment memory limitation for user-space applications.
+    - Autodetects binary format on file load: routes MZ files to the relocatable multi-segment loader and transparently falls back to the flat raw binary loader for legacy single-segment `.BIN` files.
+    - Dynamically computes required memory from header (`e_cparhdr`, `e_cp`, `e_cblp`) and allocates contiguous paragraphs via conventional MCB allocator, assigning 16 paragraphs for the 256-byte Program Segment Prefix (PSP) and a full 64 KB segment for `DGROUP`.
+    - Implemented file relocation table fixup engine (`e_crlc`, `e_lfarlc`) applying segment base fixups (`*patch += load_seg`) across arbitrary segment/offset pairs.
+    - Populates standard DOS PSP data structures: `CD 20` termination opcode at `PSP:0x0000`, top-of-memory segment at `PSP:0x0002`, and formatted command-line argument string at `PSP:0x0080`.
+  - **Low-Level Context Switching (`proc_exec_mz` in `kernel/entry.asm`)**:
+    - Implemented `proc_exec_mz(cs, ip, ss, sp, ds_es)` executing real-mode user applications with decoupled `CS`, `IP`, `SS`, `SP`, and `DS/ES` segments via atomic `retf` transfer.
+  - **Medium Model User-Space C Runtime (`user/crt0_mz.asm`)**:
+    - Created freestanding Open Watcom C Medium Model (`-mm`) startup runtime: initializes `DS = SS = DGROUP`, sets up a dedicated 4096-byte stack, bridges command-line arguments from `PSP:0x0080` to `USER_ARGS_OFFSET` (`0xFF00`), and executes `call far _app_main`.
+  - **Binary Resolution & Build System (`Makefile`, `kernel/syscall.c`)**:
+    - Extended PATH and direct binary resolution (`resolve_exec_target` in `kernel/syscall.c`) to auto-probe `.EXE` binaries in addition to `.BIN`.
+    - Added Open Watcom `-mm` Medium Model compilation rules (`CFLAGS_MM`) and `wlink format dos` executable linking.
+    - Migrated `/BIN/BASIC.EXE` to Medium Model DOS executable format, removing the 64 KB ceiling for all future BASIC enhancements. Fully verified in 86Box emulation on target Book8088.
 
 ## Revision 1.0.2 (2026-11-21)
 

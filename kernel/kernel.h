@@ -73,6 +73,7 @@ extern int      a20_enable(void);
 extern void     a20_disable(void);
 extern void     xms_install_vector(void);
 extern int      proc_exec_far(uint16_t user_seg, uint16_t user_sp);
+extern int      proc_exec_mz(uint16_t cs, uint16_t ip, uint16_t ss, uint16_t sp, uint16_t ds_es);
 extern void     proc_exit_usermode(uint8_t code);
 extern uint16_t get_usermode_active(void);
 extern uint16_t ctrl_c_abort_pending;

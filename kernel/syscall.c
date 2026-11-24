@@ -42,9 +42,31 @@ int path_set(const char __far *new_path) {
     return 0;
 }
 
+typedef struct {
+    uint16_t e_magic;         /* 0x00: 0x5A4D ("MZ") or 0x4D5A ("ZM") */
+    uint16_t e_cblp;          /* 0x02: Bytes on last page of file */
+    uint16_t e_cp;            /* 0x04: Pages in file (512-byte blocks) */
+    uint16_t e_crlc;          /* 0x06: Relocations count */
+    uint16_t e_cparhdr;       /* 0x08: Header size in paragraphs */
+    uint16_t e_minalloc;      /* 0x0A: Minimum extra paragraphs */
+    uint16_t e_maxalloc;      /* 0x0C: Maximum extra paragraphs */
+    uint16_t e_ss;            /* 0x0E: Initial SS relative to load segment */
+    uint16_t e_sp;            /* 0x10: Initial SP */
+    uint16_t e_csum;          /* 0x12: Checksum */
+    uint16_t e_ip;            /* 0x14: Initial IP */
+    uint16_t e_cs;            /* 0x16: Initial CS relative to load segment */
+    uint16_t e_lfarlc;        /* 0x18: Offset of relocation table */
+    uint16_t e_ovno;          /* 0x1A: Overlay number */
+} mz_header_t;
+
+typedef struct {
+    uint16_t offset;
+    uint16_t segment;
+} mz_reloc_t;
+
 static int try_path_candidate(const char *dir, uint16_t dir_len,
                               const char __far *cmd, uint16_t cmd_len,
-                              int add_bin,
+                              const char *ext,
                               char out_buf[48], const char __far **out_target) {
     uint16_t pos = 0;
     uint16_t i;
@@ -59,15 +81,14 @@ static int try_path_candidate(const char *dir, uint16_t dir_len,
         }
     }
 
-    for (i = 0; i < cmd_len && pos < 42; i++) {
+    for (i = 0; i < cmd_len && pos < 40; i++) {
         out_buf[pos++] = cmd[i];
     }
 
-    if (add_bin && pos <= 43) {
-        out_buf[pos++] = '.';
-        out_buf[pos++] = 'B';
-        out_buf[pos++] = 'I';
-        out_buf[pos++] = 'N';
+    if (ext) {
+        while (*ext != '\0' && pos < 47) {
+            out_buf[pos++] = *ext++;
+        }
     }
     out_buf[pos] = '\0';
 
@@ -104,7 +125,7 @@ static int resolve_exec_target(const char __far *input, char out_buf[48], const 
         return -1;
     }
 
-    /* 2. If path has a directory component and no extension, try appending .BIN */
+    /* 2. If path has a directory component and no extension, try appending .BIN then .EXE */
     if (has_slash && !has_dot && len <= 24) {
         for (i = 0; i < len; i++) {
             out_buf[i] = input[i];
@@ -115,6 +136,12 @@ static int resolve_exec_target(const char __far *input, char out_buf[48], const 
         out_buf[len + 3] = 'N';
         out_buf[len + 4] = '\0';
         *out_target = (const char __far *)MK_FP(KERNEL_SEG, out_buf);
+        if (fat16_file_size(*out_target) > 0) {
+            return 0;
+        }
+        out_buf[len + 1] = 'E';
+        out_buf[len + 2] = 'X';
+        out_buf[len + 3] = 'E';
         if (fat16_file_size(*out_target) > 0) {
             return 0;
         }
@@ -139,9 +166,12 @@ static int resolve_exec_target(const char __far *input, char out_buf[48], const 
             if (try_path_candidate(kernel_path + d_start, d_len, input, len, 0, out_buf, out_target) == 0) {
                 return 0;
             }
-            /* Try <dir>/<cmd>.BIN if no extension */
+            /* Try <dir>/<cmd>.BIN and <dir>/<cmd>.EXE if no extension */
             if (!has_dot) {
-                if (try_path_candidate(kernel_path + d_start, d_len, input, len, 1, out_buf, out_target) == 0) {
+                if (try_path_candidate(kernel_path + d_start, d_len, input, len, ".BIN", out_buf, out_target) == 0) {
+                    return 0;
+                }
+                if (try_path_candidate(kernel_path + d_start, d_len, input, len, ".EXE", out_buf, out_target) == 0) {
                     return 0;
                 }
             }
@@ -159,9 +189,190 @@ int exec_program(const char __far *filename, const char __far *args) {
     char __far *arg_dst;
     uint16_t i = 0;
     int rc;
+    mz_header_t mz_hdr;
+    int is_mz = 0;
+    int32_t hdr_read;
 
     if (resolve_exec_target(filename, resolved_buf, &target_name) != 0) {
         return -1;
+    }
+
+    /* Probe for MS-DOS MZ Executable header */
+    hdr_read = fat16_read_file_offset(target_name, MK_FP(KERNEL_SEG, &mz_hdr), sizeof(mz_hdr), 0);
+    if (hdr_read == (int32_t)sizeof(mz_hdr)) {
+        if (mz_hdr.e_magic == 0x5A4D || mz_hdr.e_magic == 0x4D5A) {
+            is_mz = 1;
+        }
+    }
+
+    if (is_mz) {
+        uint32_t total_file_bytes;
+        uint32_t header_bytes = (uint32_t)mz_hdr.e_cparhdr * 16L;
+        uint32_t image_bytes;
+        uint16_t image_paras;
+        uint16_t alloc_paras;
+        uint16_t base_seg;
+        uint16_t psp_seg;
+        uint16_t load_seg;
+        uint16_t dgroup_seg;
+
+        if (mz_hdr.e_cblp == 0) {
+            total_file_bytes = (uint32_t)mz_hdr.e_cp * 512L;
+        } else {
+            total_file_bytes = (uint32_t)(mz_hdr.e_cp - 1) * 512L + (uint32_t)mz_hdr.e_cblp;
+        }
+        if (total_file_bytes <= header_bytes) {
+            return -1;
+        }
+        image_bytes = total_file_bytes - header_bytes;
+        image_paras = (uint16_t)((image_bytes + 15L) >> 4);
+
+        /* 16 paragraphs for PSP (256 bytes) + image paragraphs + full 64 KB (4096 paras) for DGROUP */
+        {
+            uint16_t dgroup_para = mz_hdr.e_ss;
+            uint16_t code_paras = (dgroup_para > image_paras) ? dgroup_para : image_paras;
+            alloc_paras = 16 + code_paras + 4096;
+        }
+
+        base_seg = mem_alloc(alloc_paras, 0);
+        if (base_seg == 0) {
+            con_puts("Out of memory for executable\n");
+            return -1;
+        }
+
+        psp_seg = base_seg;
+        load_seg = base_seg + 16;
+        dgroup_seg = load_seg + mz_hdr.e_ss;
+
+        /* Setup PSP at psp_seg:0x0000 */
+        {
+            uint8_t __far *psp = (uint8_t __far *)MK_FP(psp_seg, 0);
+            uint16_t k;
+            for (k = 0; k < 256; k++) psp[k] = 0;
+
+            /* CD 20 (int 0x20 exit) */
+            psp[0] = 0xCD;
+            psp[1] = 0x20;
+
+            /* Top of memory segment at offset 0x0002 */
+            psp[2] = (uint8_t)((base_seg + alloc_paras) & 0xFF);
+            psp[3] = (uint8_t)((base_seg + alloc_paras) >> 8);
+
+            /* Command-line args at psp_seg:0x0080 */
+            if (args) {
+                uint8_t alen = 0;
+                while (args[alen] != '\0' && alen < 126) {
+                    psp[0x81 + alen] = (uint8_t)args[alen];
+                    alen++;
+                }
+                psp[0x80] = alen;
+                psp[0x81 + alen] = 0x0D;
+                psp[0x82 + alen] = 0x00;
+            } else {
+                psp[0x80] = 0;
+                psp[0x81] = 0x0D;
+            }
+        }
+
+        /* Also copy args to dgroup_seg:USER_ARGS_OFFSET for os_get_args() */
+        {
+            char __far *dgroup_args = (char __far *)MK_FP(dgroup_seg, USER_ARGS_OFFSET);
+            uint16_t ai = 0;
+            if (args) {
+                while (args[ai] != '\0' && ai < 254) {
+                    dgroup_args[ai] = args[ai];
+                    ai++;
+                }
+            }
+            dgroup_args[ai] = '\0';
+        }
+
+        /* Read image_bytes from file offset header_bytes into load_seg:0x0000 */
+        {
+            uint32_t file_pos = header_bytes;
+            uint16_t cur_seg = load_seg;
+            uint16_t cur_off = 0;
+            uint32_t remaining = image_bytes;
+
+            while (remaining > 0) {
+                uint16_t chunk = (remaining > 32768L) ? 32768 : (uint16_t)remaining;
+                int32_t rd = fat16_read_file_offset(target_name, MK_FP(cur_seg, cur_off), chunk, file_pos);
+                if (rd <= 0) {
+                    mem_free_by_owner(base_seg);
+                    return -1;
+                }
+                file_pos += (uint32_t)rd;
+                remaining -= (uint32_t)rd;
+                cur_off += (uint16_t)rd;
+                if (cur_off >= 0x8000) {
+                    cur_seg += (cur_off >> 4);
+                    cur_off &= 0x000F;
+                }
+            }
+        }
+
+        /* Relocation Table Fixups */
+        if (mz_hdr.e_crlc > 0) {
+            uint16_t rel_left = mz_hdr.e_crlc;
+            uint32_t rel_file_off = (uint32_t)mz_hdr.e_lfarlc;
+
+            while (rel_left > 0) {
+                mz_reloc_t r_buf[32];
+                uint16_t count = (rel_left > 32) ? 32 : rel_left;
+                uint16_t r_bytes = count * sizeof(mz_reloc_t);
+                int32_t rd = fat16_read_file_offset(target_name, MK_FP(KERNEL_SEG, r_buf), r_bytes, rel_file_off);
+                uint16_t r;
+                if (rd != (int32_t)r_bytes) {
+                    mem_free_by_owner(base_seg);
+                    return -1;
+                }
+                for (r = 0; r < count; r++) {
+                    uint16_t patch_seg = load_seg + r_buf[r].segment;
+                    uint16_t patch_off = r_buf[r].offset;
+                    uint16_t __far *patch = (uint16_t __far *)MK_FP(patch_seg, patch_off);
+                    *patch += load_seg;
+                }
+                rel_file_off += (uint32_t)r_bytes;
+                rel_left -= count;
+            }
+        }
+
+        /* Transfer control to MZ executable */
+        {
+            uint8_t saved_ems_slots[EMS_NUM_SLOTS];
+            uint8_t saved_break_mode = kbd_get_break_mode();
+            uint16_t target_cs = load_seg + mz_hdr.e_cs;
+            uint16_t target_ip = mz_hdr.e_ip;
+            uint16_t target_ss = load_seg + mz_hdr.e_ss;
+            uint16_t target_sp = mz_hdr.e_sp;
+            uint16_t target_ds_es = psp_seg;
+
+            kbd_set_break_mode(BREAK_MODE_NORMAL);
+            ctrl_c_abort_pending = 0;
+            ems_save_slots(saved_ems_slots);
+
+            rc = proc_exec_mz(target_cs, target_ip, target_ss, target_sp, target_ds_es);
+
+            kbd_set_break_mode(saved_break_mode);
+            ctrl_c_abort_pending = 0;
+            kbd_set_break_mode(BREAK_MODE_NORMAL);
+
+            if (gfx_get_mode() != OS_MODE_TEXT_80x25 && gfx_get_mode() != 0x07) {
+                gfx_set_mode(OS_MODE_TEXT_80x25);
+            } else {
+                con_set_cursor_visible(1);
+            }
+
+            redir_stdout_flush();
+            sound_stop();
+
+            ems_free_by_owner(base_seg);
+            ems_restore_slots(saved_ems_slots);
+            xms_free_by_owner(base_seg);
+            mem_free_by_owner(base_seg);
+        }
+
+        return rc;
     }
 
     /* Allocate a 64 KB segment (4096 paragraphs) from the MCB allocator */

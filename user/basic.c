@@ -16,15 +16,15 @@
 #define BASIC_MAX_LINE_LEN  256
 #define BASIC_PROMPT        "Ok\n"
 
-#define BASIC_MAX_VARS      96
+#define BASIC_MAX_VARS      48
 #define BASIC_MAX_VARNAME   16
-#define BASIC_MAX_STR_LEN   128
-#define BASIC_NUM_TEMP_STRS 8
+#define BASIC_MAX_STR_LEN   64
+#define BASIC_NUM_TEMP_STRS 6
 
-#define BASIC_MAX_GOSUB     32
-#define BASIC_MAX_FOR_NEST  16
-#define BASIC_MAX_WHILE_NEST 16
-#define BASIC_MAX_ARRAYS    32
+#define BASIC_MAX_GOSUB     16
+#define BASIC_MAX_FOR_NEST  8
+#define BASIC_MAX_WHILE_NEST 8
+#define BASIC_MAX_ARRAYS    16
 #define BASIC_STR_ELEM_LEN  32
 
 #define BASIC_MAX_FILES     4
@@ -134,6 +134,32 @@ static uint16_t s_cur_stmt_pos      = 0;
 static uint16_t s_cur_next_line     = 0;
 static uint16_t s_cur_next_stmt     = 0;
 
+/* Event trapping state (Phase 10) */
+typedef struct {
+    uint16_t line;       /* Target line to GOSUB */
+    uint8_t  state;      /* 0 = OFF, 1 = ON, 2 = STOP */
+    uint8_t  pending;    /* 1 if event occurred while STOP/busy */
+    uint8_t  in_handler; /* 1 if currently in handler */
+} basic_event_trap_t;
+
+static uint16_t           s_timer_interval    = 0;
+static uint16_t           s_timer_line        = 0;
+static uint8_t            s_timer_state       = 0;  /* 0 = OFF, 1 = ON, 2 = STOP */
+static uint8_t            s_timer_pending     = 0;
+static uint8_t            s_timer_in_handler  = 0;
+static uint32_t           s_timer_target_tick = 0;
+
+#define BASIC_MAX_TRAP_KEYS 15
+static basic_event_trap_t s_key_trap[BASIC_MAX_TRAP_KEYS];
+static char               s_fkey_strings[11][16];
+static uint8_t            s_key_visible       = 0;
+
+#define BASIC_KEY_FIFO_SIZE 64
+static uint8_t            s_key_fifo[BASIC_KEY_FIFO_SIZE];
+static uint8_t            s_key_fifo_head     = 0;
+static uint8_t            s_key_fifo_count    = 0;
+static uint8_t            s_break_pending     = 0;
+
 /* Variable table */
 static basic_var_t s_vars[BASIC_MAX_VARS];
 static uint16_t    s_num_vars       = 0;
@@ -216,6 +242,15 @@ static void basic_close_all_files(void);
 static void basic_cmd_run(void);
 static int basic_insert_line(uint16_t line_num, const uint8_t *tok_data, uint16_t tok_len);
 static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out);
+static int basic_exec_key(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_timer(const uint8_t __far *tok, uint16_t *pos);
+static void basic_poll_events(void);
+static void basic_poll_keyboard(void);
+static uint16_t basic_getc(void);
+static int basic_kbhit(void);
+static void basic_init_fkeys(void);
+static void basic_display_softkeys(void);
+static void basic_clear_softkeys(void);
 
 /* --------------------------------------------------------------------------
  * Helper String & Math Functions
@@ -487,7 +522,7 @@ static int basic_parse_var_name(const uint8_t __far *tok, uint16_t *pos, char *o
     while (tok[p] == ' ' || tok[p] == '\t') p++;
     if (!basic_is_alpha((char)tok[p])) return 0;
 
-    while (basic_is_alpha((char)tok[p]) || basic_is_digit((char)tok[p]) || tok[p] == '.') {
+    while (basic_is_alpha((char)tok[p]) || basic_is_digit((char)tok[p]) || tok[p] == '.' || tok[p] == '_') {
         if (np + 2 < max_len) {
             out_name[np++] = basic_toupper((char)tok[p]);
         }
@@ -780,11 +815,18 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
                 const char *kw = g_basic_keywords[k].kw;
 
                 if (basic_strnicmp(&in[ip], kw, klen) == 0) {
+                    char first_kw_char = kw[0];
                     char last_kw_char = kw[klen - 1];
                     char next_in_char = in[ip + klen];
 
+                    if (basic_is_alpha(first_kw_char) || basic_is_digit(first_kw_char)) {
+                        if (ip > 0 && (basic_is_alpha(in[ip - 1]) || basic_is_digit(in[ip - 1]) || in[ip - 1] == '.' || in[ip - 1] == '_')) {
+                            continue;
+                        }
+                    }
+
                     if (basic_is_alpha(last_kw_char) || basic_is_digit(last_kw_char)) {
-                        if (basic_is_alpha(next_in_char) || basic_is_digit(next_in_char) || next_in_char == '.') {
+                        if (basic_is_alpha(next_in_char) || basic_is_digit(next_in_char) || next_in_char == '.' || next_in_char == '_') {
                             continue;
                         }
                     }
@@ -881,6 +923,215 @@ static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
 }
 
 /* --------------------------------------------------------------------------
+ * Phase 10: Event Trapping & Function Key Helpers
+ * -------------------------------------------------------------------------- */
+
+static void basic_init_fkeys(void) {
+    int i, j;
+    static const char * const s_defs[11] = {
+        "",
+        "LIST ",
+        "RUN\r",
+        "LOAD\"",
+        "SAVE\"",
+        "CONT\r",
+        ",\"LPT1:\"",
+        "TRON\r",
+        "TROFF\r",
+        "KEY ",
+        "SCREEN 0,0,0\r"
+    };
+    for (i = 1; i <= 10; i++) {
+        for (j = 0; j < 15 && s_defs[i][j] != '\0'; j++) {
+            s_fkey_strings[i][j] = s_defs[i][j];
+        }
+        s_fkey_strings[i][j] = '\0';
+    }
+    s_key_visible = 0;
+}
+
+static void basic_display_softkeys(void) {
+    uint16_t cur;
+    uint8_t row, col;
+    int k;
+    if (s_screen_mode != 0) return;
+    cur = os_get_cursor();
+    row = (uint8_t)(cur >> 8);
+    col = (uint8_t)(cur & 0xFF);
+    os_set_cursor(24, 0);
+    for (k = 1; k <= 10; k++) {
+        int l;
+        basic_print_uint((uint16_t)k);
+        for (l = 0; l < 5 && s_fkey_strings[k][l] != '\0'; l++) {
+            char c = s_fkey_strings[k][l];
+            if (c == '\r' || c == '\n') c = ' ';
+            os_putc(c);
+        }
+        while (l < 5) {
+            os_putc(' ');
+            l++;
+        }
+        if (k < 10) os_putc(' ');
+    }
+    os_set_cursor(row, col);
+}
+
+static void basic_clear_softkeys(void) {
+    uint16_t cur;
+    uint8_t row, col;
+    int i;
+    if (s_screen_mode != 0) return;
+    cur = os_get_cursor();
+    row = (uint8_t)(cur >> 8);
+    col = (uint8_t)(cur & 0xFF);
+    os_set_cursor(24, 0);
+    for (i = 0; i < 79; i++) {
+        os_putc(' ');
+    }
+    os_set_cursor(row, col);
+}
+
+static uint8_t scan_to_trap_key(uint8_t sc) {
+    if (sc >= 0x3B && sc <= 0x44) return (uint8_t)(sc - 0x3B + 1); /* F1..F10 -> 1..10 */
+    if (sc == 0x48) return 11; /* Up */
+    if (sc == 0x4B) return 12; /* Left */
+    if (sc == 0x4D) return 13; /* Right */
+    if (sc == 0x50) return 14; /* Down */
+    return 0;
+}
+
+static void basic_process_key(uint16_t key) {
+    uint8_t sc = (uint8_t)(key >> 8);
+    uint8_t ascii = (uint8_t)(key & 0xFF);
+    uint8_t tk = scan_to_trap_key(sc);
+
+    if (tk >= 1 && tk <= 14 && s_key_trap[tk].line != 0 && s_key_trap[tk].state != 0) {
+        if (s_key_trap[tk].state == 1) { /* ON */
+            s_key_trap[tk].pending = 1;
+        } else if (s_key_trap[tk].state == 2) { /* STOP */
+            s_key_trap[tk].pending = 1;
+        }
+        return;
+    }
+
+    if (tk >= 1 && tk <= 10 && s_fkey_strings[tk][0] != '\0') {
+        const char *p = s_fkey_strings[tk];
+        while (*p && s_key_fifo_count < BASIC_KEY_FIFO_SIZE) {
+            s_key_fifo[(s_key_fifo_head + s_key_fifo_count) % BASIC_KEY_FIFO_SIZE] = (uint8_t)*p++;
+            s_key_fifo_count++;
+        }
+        return;
+    }
+
+    if (ascii != 0 && s_key_fifo_count < BASIC_KEY_FIFO_SIZE) {
+        s_key_fifo[(s_key_fifo_head + s_key_fifo_count) % BASIC_KEY_FIFO_SIZE] = ascii;
+        s_key_fifo_count++;
+    }
+}
+
+static void basic_poll_keyboard(void) {
+    while (os_kbhit()) {
+        uint16_t key = os_getc();
+        if ((key & 0xFF) == 0x03) {
+            s_break_pending = 1;
+            break;
+        }
+        basic_process_key(key);
+    }
+}
+
+static int basic_kbhit(void) {
+    basic_poll_keyboard();
+    return (s_key_fifo_count > 0) || s_break_pending;
+}
+
+static uint16_t basic_getc(void) {
+    while (!basic_kbhit()) {
+        if (s_running) basic_poll_events();
+    }
+    if (s_key_fifo_count > 0) {
+        uint8_t ch = s_key_fifo[s_key_fifo_head];
+        s_key_fifo_head = (s_key_fifo_head + 1) % BASIC_KEY_FIFO_SIZE;
+        s_key_fifo_count--;
+        return (uint16_t)ch;
+    }
+    if (s_break_pending) {
+        s_break_pending = 0;
+        return 0x03;
+    }
+    return 0;
+}
+
+static void basic_poll_events(void) {
+    uint32_t now;
+
+    if (!s_running || s_in_error_handler || s_jumped) return;
+
+    now = *((const uint32_t __far *)MK_FP(0x0040, 0x006C));
+
+    /* 1. Timer event checking */
+    if (s_timer_interval > 0) {
+        int triggered = 0;
+        if (now >= s_timer_target_tick) {
+            triggered = 1;
+        } else if (s_timer_target_tick > 1573040UL && now < 2000UL) {
+            triggered = 1;
+        }
+
+        if (triggered) {
+            uint32_t dt = mul16(s_timer_interval, 18) + (uint32_t)(s_timer_interval / 5);
+            s_timer_target_tick = now + dt;
+
+            if (s_timer_state == 1) { /* ON */
+                if (!s_timer_in_handler) {
+                    s_timer_pending = 1;
+                }
+            } else if (s_timer_state == 2) { /* STOP */
+                s_timer_pending = 1;
+            }
+        }
+
+        if (s_timer_state == 1 && s_timer_pending && !s_timer_in_handler) {
+            uint16_t target_off = basic_find_line(s_timer_line);
+            if (target_off != 0 && s_gosub_sp < BASIC_MAX_GOSUB) {
+                s_timer_pending = 0;
+                s_timer_in_handler = 1;
+                s_gosub_stack[s_gosub_sp].line_off = s_cur_line_off;
+                s_gosub_stack[s_gosub_sp].stmt_pos = s_pc_stmt;
+                s_gosub_sp++;
+                s_pc_line = target_off;
+                s_pc_stmt = 4;
+                s_jumped = 1;
+                return;
+            }
+        }
+    }
+
+    /* 2. Keyboard event checking */
+    basic_poll_keyboard();
+
+    {
+        int k;
+        for (k = 1; k <= 14; k++) {
+            if (s_key_trap[k].state == 1 && s_key_trap[k].pending && !s_key_trap[k].in_handler) {
+                uint16_t target_off = basic_find_line(s_key_trap[k].line);
+                if (target_off != 0 && s_gosub_sp < BASIC_MAX_GOSUB) {
+                    s_key_trap[k].pending = 0;
+                    s_key_trap[k].in_handler = 1;
+                    s_gosub_stack[s_gosub_sp].line_off = s_cur_line_off;
+                    s_gosub_stack[s_gosub_sp].stmt_pos = s_pc_stmt;
+                    s_gosub_sp++;
+                    s_pc_line = target_off;
+                    s_pc_stmt = 4;
+                    s_jumped = 1;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/* --------------------------------------------------------------------------
  * Program Memory Storage (Linked list of tokenized lines)
  * -------------------------------------------------------------------------- */
 
@@ -903,6 +1154,24 @@ static void basic_new(void) {
     s_erl = 0;
     s_in_error_handler = 0;
     s_err_reported = 0;
+    s_timer_state = 0;
+    s_timer_pending = 0;
+    s_timer_in_handler = 0;
+    s_timer_interval = 0;
+    s_timer_line = 0;
+    {
+        int k;
+        for (k = 1; k <= 14; k++) {
+            s_key_trap[k].line = 0;
+            s_key_trap[k].state = 0;
+            s_key_trap[k].pending = 0;
+            s_key_trap[k].in_handler = 0;
+        }
+    }
+    s_key_fifo_head = 0;
+    s_key_fifo_count = 0;
+    s_break_pending = 0;
+    basic_init_fkeys();
     if (s_basic_seg) {
         uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
         mem[0] = 0; mem[1] = 0; mem[2] = 0; mem[3] = 0;
@@ -1302,9 +1571,12 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
     if (tok[p] == TOK_INKEY) {
         char *str = basic_alloc_temp_str();
         p++;
-        if (os_kbhit()) {
-            uint16_t k = os_getc();
-            str[0] = (char)(k & 0xFF);
+        basic_poll_keyboard();
+        if (s_key_fifo_count > 0) {
+            uint8_t ch = s_key_fifo[s_key_fifo_head];
+            s_key_fifo_head = (s_key_fifo_head + 1) % BASIC_KEY_FIFO_SIZE;
+            s_key_fifo_count--;
+            str[0] = (char)ch;
             str[1] = '\0';
         } else {
             str[0] = '\0';
@@ -1354,7 +1626,7 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
 
         if (fnum == 0) {
             while (idx < n) {
-                uint16_t key = os_getc();
+                uint16_t key = basic_getc();
                 str[idx++] = (char)(key & 0xFF);
             }
         } else {
@@ -3920,6 +4192,35 @@ static int basic_exec_return(const uint8_t __far *tok, uint16_t *pos) {
     s_pc_stmt = s_gosub_stack[s_gosub_sp].stmt_pos;
     s_jumped = 1;
 
+    /* Clear event in_handler flags */
+    if (s_timer_in_handler) {
+        s_timer_in_handler = 0;
+    }
+    {
+        int k;
+        for (k = 1; k <= 14; k++) {
+            if (s_key_trap[k].in_handler) {
+                s_key_trap[k].in_handler = 0;
+            }
+        }
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != TOK_ELSE) {
+        /* Optional RETURN <linenum> */
+        basic_val_t ret_line_val;
+        if (basic_eval_expr(tok, &p, &ret_line_val) == 0) {
+            uint16_t ret_line = (uint16_t)val_to_int(&ret_line_val);
+            if (ret_line != 0) {
+                uint16_t ret_off = basic_find_line(ret_line);
+                if (ret_off) {
+                    s_pc_line = ret_off;
+                    s_pc_stmt = 4;
+                }
+            }
+        }
+    }
+
     *pos = p;
     return 0;
 }
@@ -5584,6 +5885,67 @@ static int basic_exec_on(const uint8_t __far *tok, uint16_t *pos) {
         return 0;
     }
 
+    /* ON TIMER(interval) GOSUB <linenum> */
+    if (tok[p] == 0xFE && tok[p + 1] == (uint8_t)(TOK_TIMER & 0xFF)) {
+        basic_val_t int_val;
+        int16_t interval;
+        p += 2;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') return basic_error(2, "Syntax error in ON TIMER\n");
+        p++;
+        if (basic_eval_expr(tok, &p, &int_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+        interval = val_to_int(&int_val);
+        if (interval < 1) return basic_error(5, "Illegal function call\n");
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != TOK_GOSUB) return basic_error(2, "Syntax error in ON TIMER\n");
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+        {
+            basic_val_t line_val;
+            if (basic_eval_expr(tok, &p, &line_val) != 0) return -1;
+            s_timer_line = (uint16_t)val_to_int(&line_val);
+            s_timer_interval = (uint16_t)interval;
+            s_timer_pending = 0;
+            s_timer_in_handler = 0;
+        }
+        *pos = p;
+        return 0;
+    }
+
+    /* ON KEY(n) GOSUB <linenum> */
+    if (tok[p] == TOK_KEY) {
+        basic_val_t key_val;
+        int16_t key_num;
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') return basic_error(2, "Syntax error in ON KEY\n");
+        p++;
+        if (basic_eval_expr(tok, &p, &key_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+        key_num = val_to_int(&key_val);
+        if (key_num < 1 || key_num > 14) return basic_error(5, "Illegal function call\n");
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != TOK_GOSUB) return basic_error(2, "Syntax error in ON KEY\n");
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+        {
+            basic_val_t line_val;
+            if (basic_eval_expr(tok, &p, &line_val) != 0) return -1;
+            s_key_trap[key_num].line = (uint16_t)val_to_int(&line_val);
+            s_key_trap[key_num].pending = 0;
+            s_key_trap[key_num].in_handler = 0;
+        }
+        *pos = p;
+        return 0;
+    }
+
     /* Computed ON <expr> GOTO/GOSUB <line1>, <line2>, ... */
     {
         basic_val_t expr_val;
@@ -5638,6 +6000,155 @@ static int basic_exec_on(const uint8_t __far *tok, uint16_t *pos) {
             s_pc_line = target_off;
             s_pc_stmt = 4;
             s_jumped = 1;
+        }
+
+        *pos = p;
+        return 0;
+    }
+}
+
+/* --------------------------------------------------------------------------
+ * Phase 10: TIMER and KEY Statements
+ * -------------------------------------------------------------------------- */
+
+static int basic_exec_timer(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p += 2; /* skip 0xFE, TOK_TIMER */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == TOK_ON) {
+        p++;
+        s_timer_state = 1;
+        if (s_timer_interval > 0) {
+            uint32_t now = *((const uint32_t __far *)MK_FP(0x0040, 0x006C));
+            uint32_t dt = mul16(s_timer_interval, 18) + (uint32_t)(s_timer_interval / 5);
+            s_timer_target_tick = now + dt;
+        }
+        *pos = p;
+        return 0;
+    }
+    if (tok[p] == TOK_OFF) {
+        p++;
+        s_timer_state = 0;
+        s_timer_pending = 0;
+        *pos = p;
+        return 0;
+    }
+    if (tok[p] == TOK_STOP) {
+        p++;
+        s_timer_state = 2;
+        *pos = p;
+        return 0;
+    }
+
+    return basic_error(2, "Syntax error in TIMER\n");
+}
+
+static int basic_exec_key(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_KEY */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    /* KEY(n) ON / OFF / STOP */
+    if (tok[p] == '(') {
+        basic_val_t key_val;
+        int16_t k;
+        p++;
+        if (basic_eval_expr(tok, &p, &key_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+        k = val_to_int(&key_val);
+        if (k < 1 || k > 14) {
+            return basic_error(5, "Illegal function call\n");
+        }
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == TOK_ON) {
+            p++;
+            s_key_trap[k].state = 1;
+            *pos = p;
+            return 0;
+        }
+        if (tok[p] == TOK_OFF) {
+            p++;
+            s_key_trap[k].state = 0;
+            s_key_trap[k].pending = 0;
+            *pos = p;
+            return 0;
+        }
+        if (tok[p] == TOK_STOP) {
+            p++;
+            s_key_trap[k].state = 2;
+            *pos = p;
+            return 0;
+        }
+        return basic_error(2, "Syntax error in KEY\n");
+    }
+
+    /* KEY ON */
+    if (tok[p] == TOK_ON) {
+        p++;
+        s_key_visible = 1;
+        basic_display_softkeys();
+        *pos = p;
+        return 0;
+    }
+
+    /* KEY OFF */
+    if (tok[p] == TOK_OFF) {
+        p++;
+        s_key_visible = 0;
+        basic_clear_softkeys();
+        *pos = p;
+        return 0;
+    }
+
+    /* KEY LIST */
+    if (tok[p] == TOK_LIST) {
+        int i;
+        p++;
+        for (i = 1; i <= 10; i++) {
+            os_puts("F");
+            basic_print_uint((uint16_t)i);
+            os_puts(" ");
+            os_puts(s_fkey_strings[i]);
+            os_putc('\n');
+        }
+        *pos = p;
+        return 0;
+    }
+
+    /* KEY n, "string" */
+    {
+        basic_val_t num_val;
+        basic_val_t str_val;
+        int16_t k;
+        int i;
+
+        if (basic_eval_expr(tok, &p, &num_val) != 0) return -1;
+        k = val_to_int(&num_val);
+        if (k < 1 || k > 10) {
+            return basic_error(5, "Illegal function call\n");
+        }
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',') {
+            return basic_error(2, "Syntax error in KEY (expected ',')\n");
+        }
+        p++;
+
+        if (basic_eval_expr(tok, &p, &str_val) != 0) return -1;
+        if (str_val.type != BASIC_TYPE_STR) {
+            return basic_error(13, "Type mismatch\n");
+        }
+
+        for (i = 0; i < 15 && str_val.sval && str_val.sval[i] != '\0'; i++) {
+            s_fkey_strings[k][i] = str_val.sval[i];
+        }
+        s_fkey_strings[k][i] = '\0';
+
+        if (s_key_visible) {
+            basic_display_softkeys();
         }
 
         *pos = p;
@@ -5757,6 +6268,18 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == TOK_ERROR) {
         *pos = p;
         return basic_exec_error_stmt(tok, pos);
+    }
+
+    /* KEY statement (KEY ON/OFF, KEY LIST, KEY n, "str", KEY(n) ON/OFF/STOP) */
+    if (tok[p] == TOK_KEY) {
+        *pos = p;
+        return basic_exec_key(tok, pos);
+    }
+
+    /* TIMER statement (TIMER ON/OFF/STOP) */
+    if (tok[p] == 0xFE && tok[p + 1] == (uint8_t)(TOK_TIMER & 0xFF)) {
+        *pos = p;
+        return basic_exec_timer(tok, pos);
     }
 
     /* MID$(var$, start [, len]) = expr$ statement */
@@ -6194,6 +6717,9 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         if (s_screen_mode == 0) {
             os_cls(s_text_attr ? s_text_attr : 0x07);
             os_set_cursor(0, 0);
+            if (s_key_visible) {
+                basic_display_softkeys();
+            }
         } else {
             os_gfx_clear(0);
             s_gfx_row = 0;
@@ -6310,6 +6836,24 @@ static void basic_cmd_run(void) {
     s_erl = 0;
     s_in_error_handler = 0;
     s_err_reported = 0;
+    s_timer_state = 0;
+    s_timer_pending = 0;
+    s_timer_in_handler = 0;
+    s_timer_interval = 0;
+    s_timer_line = 0;
+    {
+        int k;
+        for (k = 1; k <= 14; k++) {
+            s_key_trap[k].line = 0;
+            s_key_trap[k].state = 0;
+            s_key_trap[k].pending = 0;
+            s_key_trap[k].in_handler = 0;
+        }
+    }
+    s_key_fifo_head = 0;
+    s_key_fifo_count = 0;
+    s_break_pending = 0;
+    basic_init_fkeys();
     s_err_reported = 0;
     s_running = 1;
     s_pc_line = s_prog_head;
@@ -6322,7 +6866,8 @@ static void basic_cmd_run(void) {
         s_cur_line_off = s_pc_line;
         s_cur_line_num = num;
 
-        if (os_kbhit() && (os_getc() & 0xFF) == 0x03) {
+        if (s_break_pending) {
+            s_break_pending = 0;
             basic_sound_tone(0, 0);
             if (s_screen_mode != 0) {
                 os_gfx_set_mode(0x03);
@@ -6342,6 +6887,13 @@ static void basic_cmd_run(void) {
             s_cur_stmt_pos = s_pc_stmt;
             basic_scan_stmt_boundary(&mem[s_cur_line_off], s_pc_stmt, next_line,
                                      &s_cur_next_line, &s_cur_next_stmt);
+
+            /* Poll events at statement boundary */
+            basic_poll_events();
+            if (s_jumped) {
+                /* Event triggered GOSUB */
+                break;
+            }
 
             if (basic_exec_statement(&mem[s_cur_line_off], &pos) != 0) {
                 if (s_jumped) {
@@ -6393,7 +6945,7 @@ static void basic_cmd_run(void) {
 static uint16_t basic_read_line(char *buf, uint16_t max_len) {
     uint16_t len = 0;
     for (;;) {
-        uint16_t key = os_getc();
+        uint16_t key = basic_getc();
         uint8_t  u   = (uint8_t)(key & 0xFF);
         char     c   = (char)u;
 
@@ -6554,11 +7106,13 @@ int app_main(void) {
 
     {
         const char *args = os_get_args();
+        int has_file_arg = 0;
         if (args) {
             while (*args == ' ' || *args == '\t') args++;
             if (*args != '\0') {
                 char cmd[80];
                 int cp = 0;
+                has_file_arg = 1;
                 cmd[cp++] = 'L'; cmd[cp++] = 'O'; cmd[cp++] = 'A'; cmd[cp++] = 'D'; cmd[cp++] = ' ';
                 cmd[cp++] = '"';
                 while (*args != '\0' && *args != ' ' && *args != '\t' && cp < 60) {
@@ -6570,6 +7124,17 @@ int app_main(void) {
                 cmd[cp] = '\0';
                 basic_process_input(cmd);
             }
+        }
+        if (has_file_arg) {
+            basic_sound_tone(0, 0);
+            if (s_screen_mode != 0) {
+                os_gfx_set_mode(0x03);
+                s_screen_mode = 0;
+            }
+            basic_close_all_files();
+            os_mem_free(s_basic_seg);
+            os_exit(0);
+            return 0;
         }
     }
 

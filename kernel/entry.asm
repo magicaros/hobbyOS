@@ -1269,6 +1269,38 @@ _proc_exec_far:
     push ax                 ; IP = 0x0000
     retf
 
+; int proc_exec_mz(uint16_t cs, uint16_t ip, uint16_t ss, uint16_t sp, uint16_t ds_es)
+global _proc_exec_mz
+_proc_exec_mz:
+    push bp
+    mov bp, sp
+    push si
+    push di
+    push ds
+    push es
+    push word [_kernel_saved_sp]
+    push word [_usermode_active]
+
+    mov ax, [bp+4]          ; target CS
+    mov bx, [bp+6]          ; target IP
+    mov cx, [bp+8]          ; target SS
+    mov dx, [bp+10]         ; target SP
+    mov si, [bp+12]         ; target DS/ES
+
+    cli
+    mov [_kernel_saved_sp], sp
+    inc word [_usermode_active]
+
+    mov ds, si
+    mov es, si
+    mov ss, cx
+    mov sp, dx
+    sti
+
+    push ax                 ; CS
+    push bx                 ; IP
+    retf
+
 ; void proc_exit_usermode(uint8_t code)
 global _proc_exit_usermode
 _proc_exit_usermode:
