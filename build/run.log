@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/24 18:56:29
+# 86Box v7.0 logfile, created 2026/11/25 00:06:00
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -58,67 +58,28 @@ Line 2 appended via SYS_FILE_APPEND
 [USER APP] AmigaDOS device paths (SYS: & HD0A:) verified OK
 [USER APP] RAM disk multi-cluster subdirectory (25 files in RAM:/TESTDIR) verified OK
 [USER APP] FAT16 Root Directory:
-  - KERNEL.BIN (48437 bytes)
+  - KERNEL.BIN (48715 bytes)
   - BIN/ <DIR>
   - BASIC/ <DIR>
-  - MATH.BAS (2106 bytes)
-  - SYS.BAS (2370 bytes)
-  - TEST1.BAS (113 bytes)
-  - TEST2.BAS (225 bytes)
-  - TEST3.BAS (113 bytes)
-  - STR.BAS (4402 bytes)
-  - ERR.BAS (3452 bytes)
-  - EVENT.BAS (3095 bytes)
-  - RANDOM.BAS (4262 bytes)
-  - FINAL.BAS (3556 bytes)
   - GAMES/ <DIR>
   - PICS/ <DIR>
   - MODELS/ <DIR>
   - MUSIC/ <DIR>
-  - BOOT.SH (109 bytes)
+  - BOOT.SH (168 bytes)
   - KEYMAPS/ <DIR>
   - DOCS/ <DIR>
 [EXEC] /BIN/HELLO.BIN exited with code 0
 Keyboard layout set to FR (/KEYMAPS/FR.MAP)
 Running /BOOT.SH...
-hobbyOS BASIC Version 1.0 (GW-BASIC Compatible)
-61440 Bytes free
-[2J[HhobbyOS BASIC Phase 12 Feature Test
-===================================
-
---- 1. DATE$ & TIME$ (READ/WRITE) ---
-DATE$ FORMAT:             PASSED
-TIME$ FORMAT:             PASSED
-DATE$ WRITE:              PASSED
-DBG: BEFORE TIME$
-DBG: AFTER TIME$ WRITE
-TIME$ WRITE:              PASSED
-DBG: AFTER TIME$ READ
-
---- 2. CSRLIN, POS, TAB, SPC ---
-CSRLIN & POS(0):          PASSED
-                   X          Y
-TAB & SPC COLUMN METRICS: PASSED
-
---- 3. BSAVE & BLOAD ---
-BLOAD DEFAULT OFFSET:     PASSED
-BLOAD OVERRIDE OFFSET:    PASSED
-
---- 4. FILE & DIR MANAGEMENT ---
-NAME AS (RENAME):         PASSED
-KILL (DELETE):            PASSED
-MKDIR/CHDIR/RMDIR:        PASSED
-
---- 5. GRAPHICS POINT(x, y) ---
-[2J[HPOINT(x, y):              PASSED
-
---- 6. TRON / TROFF ---
-[710][720][730]TRON / TROFF:             PASSED
-
-=================================================
-ALL PHASE 12 GW-BASIC FEATURES TESTED OK!
-=================================================
 System ready.
+Creating archive: /test.har
+  Adding: GAMES/ZORK1.Z3 (86838 -> 77090 bytes, 88% LZ4)
+Archive created: 1 file(s) stored.
+Testing: GAMES/ZORK1.Z3 - OK
+All 1 file(s) tested OK.
+Extracting archive: /test.har to /EXTRACT
+  Extracting: GAMES/ZORK1.Z3 (86838 bytes) - OK
+Extracted 1 file(s).
 
 hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.
 SYS:/> 

@@ -23,6 +23,21 @@ _cstart_:
     mov ss, ax
     mov sp, stack_top
 
+    ; Check if running on real MS-DOS instead of hobbyOS
+    xor bx, bx
+    mov ax, 0x3000
+    int 0x21
+    test al, al             ; On MS-DOS, AL >= 2 (DOS version); on hobbyOS, AX == 0
+    jz .on_hobbyos
+
+    ; We are running under real MS-DOS! Exit gracefully with a warning message.
+    mov dx, msg_not_dos
+    mov ah, 0x09            ; MS-DOS Print String (DS:DX, '$'-terminated)
+    int 0x21
+    mov ax, 0x4C01          ; MS-DOS Terminate Process (Exit Code 1)
+    int 0x21
+
+.on_hobbyos:
     ; Copy command-line args from PSP:0x0080 to DGROUP:0xFF00 (USER_ARGS_OFFSET)
     xor ch, ch
     mov cl, [es:0x0080]     ; length of args
@@ -47,6 +62,9 @@ _cstart_:
 
 section _DATA class=DATA
 section CONST class=CONST
+msg_not_dos:
+    db "This program requires hobbyOS.", 0x0D, 0x0A, "$"
+
 section _BSS class=BSS
 
 section STACK class=STACK

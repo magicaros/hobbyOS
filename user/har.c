@@ -677,14 +677,35 @@ static int append_single_file(const char *arc_name, const char *file_path,
             }
         }
     } else {
-        /* Multi-chunk streaming via temporary staging file */
-        const char *tmp_name = "_HARTMP.$$$";
+        /* Multi-chunk streaming via single-pass backpatch */
+        uint32_t entry_hdr_off = (uint32_t)os_file_size(arc_name);
         uint32_t in_offset = 0;
         uint32_t total_comp_payload = 0;
         uint16_t crc = 0xFFFF;
         int any_compressed = 0;
 
-        os_file_delete(tmp_name);
+        entry.magic[0]    = 'H';
+        entry.magic[1]    = 'F';
+        entry.attr        = OS_ATTR_ARCHIVE;
+        entry.name_len    = name_len;
+        entry.uncomp_size = (uint32_t)sz;
+        entry.comp_size   = 0;
+        entry.flags       = 0;
+        entry.crc         = 0;
+
+        for (i = 0; i < sizeof(har_entry_t); i++) {
+            hdr_buf[i] = ((const uint8_t *)&entry)[i];
+        }
+        for (i = 0; i < name_len; i++) {
+            hdr_buf[sizeof(har_entry_t) + i] = (uint8_t)arc_path[i];
+        }
+
+        if (os_file_append(arc_name, (const void __far *)hdr_buf, sizeof(har_entry_t) + name_len) != sizeof(har_entry_t) + name_len) {
+            os_puts("Error appending entry header to ");
+            os_puts(arc_name);
+            os_putc('\n');
+            return -1;
+        }
 
         while (in_offset < (uint32_t)sz) {
             uint16_t to_read = (sz - in_offset > (long)BUF_BYTES_32K) ? BUF_BYTES_32K : (uint16_t)(sz - in_offset);
@@ -698,7 +719,6 @@ static int append_single_file(const char *arc_name, const char *file_path,
                 os_puts("Error reading: ");
                 os_puts(file_path);
                 os_putc('\n');
-                os_file_delete(tmp_name);
                 return -1;
             }
 
@@ -722,23 +742,12 @@ static int append_single_file(const char *arc_name, const char *file_path,
             chk.raw_len  = r;
             payload = is_comp ? (const void __far *)comp_buf : (const void __far *)raw_buf;
 
-            if (in_offset == 0) {
-                if (os_file_write(tmp_name, (const void __far *)&chk, sizeof(har_chunk_hdr_t)) != sizeof(har_chunk_hdr_t)) {
-                    os_puts("Error creating temporary staging file.\n");
-                    os_file_delete(tmp_name);
-                    return -1;
-                }
-            } else {
-                if (os_file_append(tmp_name, (const void __far *)&chk, sizeof(har_chunk_hdr_t)) != sizeof(har_chunk_hdr_t)) {
-                    os_puts("Error appending to temporary staging file.\n");
-                    os_file_delete(tmp_name);
-                    return -1;
-                }
-            }
-
-            if (os_file_append(tmp_name, payload, comp_bytes) != comp_bytes) {
-                os_puts("Error appending payload to temporary staging file.\n");
-                os_file_delete(tmp_name);
+            if (os_file_append(arc_name, (const void __far *)&chk, sizeof(har_chunk_hdr_t)) != sizeof(har_chunk_hdr_t) ||
+                os_file_append(arc_name, payload, comp_bytes) != comp_bytes)
+            {
+                os_puts("Error appending payload to ");
+                os_puts(arc_name);
+                os_putc('\n');
                 return -1;
             }
 
@@ -746,11 +755,6 @@ static int append_single_file(const char *arc_name, const char *file_path,
             in_offset += r;
         }
 
-        entry.magic[0]    = 'H';
-        entry.magic[1]    = 'F';
-        entry.attr        = OS_ATTR_ARCHIVE;
-        entry.name_len    = name_len;
-        entry.uncomp_size = (uint32_t)sz;
         entry.comp_size   = total_comp_payload;
         entry.flags       = any_compressed ? HAR_FLAG_COMPRESSED : 0;
         entry.crc         = crc;
@@ -758,39 +762,13 @@ static int append_single_file(const char *arc_name, const char *file_path,
         for (i = 0; i < sizeof(har_entry_t); i++) {
             hdr_buf[i] = ((const uint8_t *)&entry)[i];
         }
-        for (i = 0; i < name_len; i++) {
-            hdr_buf[sizeof(har_entry_t) + i] = (uint8_t)arc_path[i];
-        }
 
-        if (os_file_append(arc_name, (const void __far *)hdr_buf, sizeof(har_entry_t) + name_len) != sizeof(har_entry_t) + name_len) {
-            os_puts("Error appending entry header to ");
+        if (os_file_write_offset(arc_name, (const void __far *)hdr_buf, sizeof(har_entry_t), entry_hdr_off) != sizeof(har_entry_t)) {
+            os_puts("Error backpatching entry header in ");
             os_puts(arc_name);
             os_putc('\n');
-            os_file_delete(tmp_name);
             return -1;
         }
-
-        /* Stream temporary file into archive */
-        {
-            uint32_t tmp_off = 0;
-            while (tmp_off < total_comp_payload) {
-                uint16_t tr = (total_comp_payload - tmp_off > (uint32_t)BUF_BYTES_32K) ?
-                               BUF_BYTES_32K : (uint16_t)(total_comp_payload - tmp_off);
-                uint16_t r = os_file_read_offset(tmp_name, raw_buf, tr, tmp_off);
-                if (r == 0xFFFF || r != tr) {
-                    os_puts("Error streaming temporary payload to archive.\n");
-                    os_file_delete(tmp_name);
-                    return -1;
-                }
-                if (os_file_append(arc_name, (const void __far *)raw_buf, r) != r) {
-                    os_puts("Error writing payload to archive.\n");
-                    os_file_delete(tmp_name);
-                    return -1;
-                }
-                tmp_off += r;
-            }
-        }
-        os_file_delete(tmp_name);
     }
 
     os_puts("  Adding: ");

@@ -1,6 +1,12 @@
 # Changelog
 
-## Revision 1.0.3 (2026-11-23)
+## Revision 1.0.3 (2026-11-25)
+
+- **HobbyOS Archiver (HAR) Single-Pass Large File Streaming (`/BIN/HAR.BIN`, `user/har.c`)**:
+  - Eliminated the temporary staging file `_HARTMP.$$$` previously required when archiving files > 32 KB.
+  - Leverages `SYS_FILE_WRITE_OFFSET` (`os_file_write_offset`) to backpatch the 14-byte `har_entry_t` header (updating final CRC-16 and total compressed payload size) after streaming chunks directly into the archive file via `os_file_append()`.
+  - Halves disk I/O and wear when creating archives containing large files (such as 86 KB `ZORK1.Z3` and 64 KB VGA images), eliminating redundant temporary file creation, secondary readback, copy appending, and file deletion.
+  - Fully verified via headless 86Box testing covering archive creation, chunk integrity testing (`har -t`), and full archive extraction (`har -x`).
 
 - **GW-BASIC Compatible Native BASIC Subsystem (`/BIN/BASIC.BIN`, `user/basic.c`, `user/basic_tokens.h`, `tools/gen_basic_tokens.py`)**:
   - Initiated development of a native, pure user-space GW-BASIC / BASICA compatible interpreter subsystem based on PC-BASIC (GPL v3) token and language specifications.
@@ -213,7 +219,37 @@
     - **System Clock (`DATE$`, `TIME$`)**:
       - `DATE$`: Reads date formatted as `"MM-DD-YYYY"`; sets date via `DATE$ = "MM-DD-YYYY"`.
       - `TIME$`: Reads time formatted as `"HH:MM:SS"`; sets system timer ticks via `TIME$ = "HH:MM:SS"` using universal BIOS `INT 1Ah, AH=01h` and BIOS Data Area `0040:006C`.
-    - **Target Verification Suite (`/BASIC/FINAL.BAS`, `/FINAL.BAS`)**: Comprehensive verification suite covering `DATE$`, `TIME$`, `CSRLIN`, `POS`, `TAB`, `SPC`, `BSAVE`, `BLOAD`, `NAME AS`, `KILL`, `MKDIR`, `CHDIR`, `RMDIR`, `POINT`, and `TRON`/`TROFF`. Verified 100% passed on target Book8088 emulator.
+    - **Target Verification Suite (`/BASIC/FINAL.BAS`)**: Comprehensive verification suite covering `DATE$`, `TIME$`, `CSRLIN`, `POS`, `TAB`, `SPC`, `BSAVE`, `BLOAD`, `NAME AS`, `KILL`, `MKDIR`, `CHDIR`, `RMDIR`, `POINT`, and `TRON`/`TROFF`. Verified 100% passed on target Book8088 emulator.
+  - **Phase 13: VGA Modes (`SCREEN 12`, `SCREEN 13`) & Docked GW-BASIC Function Key List (`KEY ON`, `KEY OFF`, `KEY LIST`, `KEY n, "string"`, De-Snowed Retrace-Synchronized Kernel Scrolling)**:
+    - **VGA Graphics Modes (`SCREEN 12`, `SCREEN 13`) & Full Graphics Mode REPL Echo**:
+      - `SCREEN 12`: Standard VGA 640x480 16-color mode via BIOS mode `0x12`.
+      - `SCREEN 13`: Standard VGA 320x200 256-color linear framebuffer mode via BIOS mode `0x13`.
+      - Added hardware video adapter verification requiring `VIDEO_TYPE_VGA` (raising error 5 *Illegal function call* gracefully if attempted on CGA/EGA).
+      - Extended graphics text rendering (`os_gfx_text`), circle clipping, pixel plotting, line drawing, and foreground defaults (`s_gfx_fg = 15`) across 640x480 and 320x200 coordinate bounds.
+      - Fixed Open Watcom `-mm` Medium Model stack far-pointer bug in `basic_gfx_print_str`: declared character buffer as `static` in `DS` so `FP_HERE` produces valid far pointers across segmented calls, preventing crashes/freezes in graphics mode.
+      - Transparent Terminal Routing in Graphics Modes: routed all text console output, interactive REPL input echo, prompt (`BASIC_PROMPT`), backspace character erasing (`\b \b`), line clearing, error reporting, `FILES`, and `KEY LIST` through the active graphics framebuffer via `basic_gfx_print_str()` whenever `s_screen_mode != 0`. Resolves typing in the blind while interactively issuing commands under graphics modes (`SCREEN 1`, `SCREEN 2`, `SCREEN 12`, `SCREEN 13`).
+      - Added 2-second delays via `TIMER` loops in `phase13.bas` to allow visual inspection of `SCREEN 1`, `SCREEN 2`, and `SCREEN 12` on high-speed CPUs (286/386/486).
+    - **Docked GW-BASIC Softkey List & De-Snowed Retrace-Synchronized Kernel Scrolling**:
+      - Modeled after authentic IBM GW-BASIC / BASICA row 25 docked function key ribbon (`1LIST  2RUN   3LOAD" 4SAVE" 5CONT  6,"LPT1 7TRON  8TROFF 9KEY   0SCREEN`).
+      - Key numbers displayed in inverse video (`0x70`), 6-char labels in normal video (`0x07`), and ribbon separators / trailing margins styled with Light Blue / Cyan background (`0x30`), giving row 25 a clean toolbar ribbon appearance.
+      - Cleared screen on BASIC startup (`os_cls(0x07)` and `os_set_cursor(0, 0)`), presenting a clean GW-BASIC environment.
+      - Extended kernel console subsystem (`kernel/console.c`, `kernel/kernel.h`, `kernel/syscall.c`, `include/hobbyos.h`):
+        - Added configurable `scroll_bottom` (defaults to 25, sets to 24 when softkeys are active via `os_console_set_scroll_rows(24)`).
+        - Kernel `scroll_up()` updates shadow RAM and executes hardware window scroll via BIOS `INT 10h, AH=06h` (`_bios_scroll_up`), scrolling strictly rows `0..(scroll_bottom - 1)` while preserving row 24 permanently docked, stationary, and un-scrolled.
+        - Hardened CGA snow suppression (`_cga_write_cell` and `_cga_sync_copy` in `kernel/entry.asm`): added loop countdown timeouts (`0x0FFF`) and tested `0x09` (HBlank | VBlank) to prevent indefinite CPU hangs with interrupts disabled.
+        - Added `os_console_write_cell(row, col, val)` (`SYS_CONSOLE_SHADOW` Function 4) routing user-space cell updates through kernel `put_cell()` and `cga_write_cell()`, synchronizing VRAM writes with CGA retrace status port `0x3DA` blanking.
+        - Automatically restores 25-row standard console on process exit in kernel `SYS_EXIT` and `exec_program`.
+    - **IF Statement Branch Parser Fix (`basic_exec_if`)**:
+      - Fixed statement position pointer writeback in `basic_exec_if`: when skipping false `IF` branches or `GOTO` statements via `basic_skip_to_else()`, `*pos = p` is now properly written back to the caller's statement position. Previously, `*pos` was left pointing to `TOK_IF`, causing an infinite loop when an `IF` condition evaluated to false without an `ELSE` clause (such as line 100 in `phase13.bas`).
+    - **Raw Break Mode Integration (`BREAK_MODE_RAW`)**:
+      - Switched keyboard break mode to `BREAK_MODE_RAW` via `os_set_break_mode(BREAK_MODE_RAW)` on BASIC startup, restoring `BREAK_MODE_NORMAL` on exit.
+      - Enables BASIC to intercept and handle `Ctrl+C` natively (`Break in <line>` into REPL, `^C` input line cancel) without the kernel aborting to shell, while preserving `Ctrl+Alt+C` for emergency exit.
+    - **Target Verification Suite (`/BASIC/PHASE13.BAS`)**: Comprehensive verification suite covering softkey scrolling across 30 lines, `CSRLIN` clamping to row 24, custom function key strings, toggle with `KEY OFF`/`KEY ON`, `SCREEN 1` & `SCREEN 2` graphics and pixel reading, and VGA mode autodetection with error trapping. Verified 100% passed on target Book8088 emulator.
+- **File Manager Function Ribbon & BSS Buffer Initialization Fix (`user/fm.c`)**:
+  - Fixed residual characters appearing on row 24 in `FM.BIN` when launched after programs that used conventional memory:
+    - Initialized the back-buffer screen cache `s_screen` to blank spaces in `fm_invalidate_cache()` and on startup in `app_main`.
+    - Added explicit row background filling via `fm_fill_rect(24, 0, 24, 79, ' ', ATTR_FN_LBL)` before drawing function keys.
+    - Padded all 10 function key labels in `fn_keys` to exact 6-character widths (`"Help  "`, `"Drive "`, `"View  "`, `"Edit  "`, `"Copy  "`, `"RenMov"`, `"Mkdir "`, `"Delete"`, `"Menu  "`, `"Quit  "`), preventing columns 7, 15, 23, 31, 39, 55, 71, and 79 from retaining dirty uninitialized RAM bytes.
 - **MS-DOS 16-bit MZ Executable Support & Medium Model Toolchain (`kernel/syscall.c`, `kernel/entry.asm`, `user/crt0_mz.asm`, `Makefile`)**:
   - **MS-DOS Relocatable MZ Header & Image Loader (`exec_program` in `kernel/syscall.c`)**:
     - Implemented a standard MS-DOS 16-bit MZ executable loader (`0x5A4D` / `0x4D5A`) into the kernel `SYS_EXEC` subsystem, eliminating the 64 KB single-segment memory limitation for user-space applications.
@@ -225,6 +261,7 @@
     - Implemented `proc_exec_mz(cs, ip, ss, sp, ds_es)` executing real-mode user applications with decoupled `CS`, `IP`, `SS`, `SP`, and `DS/ES` segments via atomic `retf` transfer.
   - **Medium Model User-Space C Runtime (`user/crt0_mz.asm`)**:
     - Created freestanding Open Watcom C Medium Model (`-mm`) startup runtime: initializes `DS = SS = DGROUP`, sets up a dedicated 4096-byte stack, bridges command-line arguments from `PSP:0x0080` to `USER_ARGS_OFFSET` (`0xFF00`), and executes `call far _app_main`.
+    - Integrated MS-DOS Stub Safety Guard: probes `INT 0x21, AX=0x3000` on entry; if running on a real MS-DOS / DOSBox environment (`AL >= 2`), prints `"This program requires hobbyOS."` via DOS `INT 21h, AH=09h` and exits cleanly via `INT 21h, AX=0x4C01` (preventing printer/IVT corruption and system crashes).
   - **Binary Resolution & Build System (`Makefile`, `kernel/syscall.c`)**:
     - Extended PATH and direct binary resolution (`resolve_exec_target` in `kernel/syscall.c`) to auto-probe `.EXE` binaries in addition to `.BIN`.
     - Added Open Watcom `-mm` Medium Model compilation rules (`CFLAGS_MM`) and `wlink format dos` executable linking.

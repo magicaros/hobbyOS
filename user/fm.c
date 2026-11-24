@@ -438,6 +438,7 @@ static void fm_draw_box(int r1, int c1, int r2, int c2, uint8_t attr, int is_dou
 static void fm_invalidate_cache(void) {
     int i;
     for (i = 0; i < 80 * 25; i++) {
+        s_screen[i] = ((uint16_t)ATTR_DEFAULT << 8) | ' ';
         s_cache[i] = 0xFFFF;
     }
 }
@@ -1106,21 +1107,22 @@ static void fm_draw_bars(void) {
     }
 
     /* Function Key Bar (Row 24) */
+    fm_fill_rect(24, 0, 24, 79, ' ', ATTR_FN_LBL);
     {
         static const struct {
             const char *num;
             const char *lbl;
         } fn_keys[10] = {
-            { " 1", "Help " },
-            { " 2", "Drive" },
-            { " 3", "View " },
-            { " 4", "Edit " },
-            { " 5", "Copy " },
+            { " 1", "Help  " },
+            { " 2", "Drive " },
+            { " 3", "View  " },
+            { " 4", "Edit  " },
+            { " 5", "Copy  " },
             { " 6", "RenMov" },
-            { " 7", "Mkdir" },
+            { " 7", "Mkdir " },
             { " 8", "Delete" },
-            { " 9", "Menu " },
-            { "10", "Quit " }
+            { " 9", "Menu  " },
+            { "10", "Quit  " }
         };
         int col = 0;
         for (i = 0; i < 10; i++) {
@@ -2007,6 +2009,7 @@ int app_main(void) {
 
     os_cls(ATTR_DEFAULT);
     fm_init_colors();
+    fm_invalidate_cache();
 
     /* Check for INT 0x33 mouse driver */
     s_mouse_avail = (os_mouse_reset(&dummy) != 0);

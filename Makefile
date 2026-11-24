@@ -147,27 +147,17 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		build/fm.bin:/BIN/FM.BIN \
 		build/cpm.bin:/BIN/CPM.BIN \
 		build/basic.exe:/BIN/BASIC.EXE \
-		build/basic.exe:/BIN/BASIC.BIN \
 		basic/math.bas:/BASIC/MATH.BAS \
-		basic/math.bas:/MATH.BAS \
 		basic/sys.bas:/BASIC/SYS.BAS \
-		basic/sys.bas:/SYS.BAS \
 		basic/test1.bas:/BASIC/TEST1.BAS \
-		basic/test1.bas:/TEST1.BAS \
 		basic/test2.bas:/BASIC/TEST2.BAS \
-		basic/test2.bas:/TEST2.BAS \
 		basic/test3.bas:/BASIC/TEST3.BAS \
-		basic/test3.bas:/TEST3.BAS \
 		basic/str.bas:/BASIC/STR.BAS \
-		basic/str.bas:/STR.BAS \
 		basic/err.bas:/BASIC/ERR.BAS \
-		basic/err.bas:/ERR.BAS \
 		basic/event.bas:/BASIC/EVENT.BAS \
-		basic/event.bas:/EVENT.BAS \
 		basic/random.bas:/BASIC/RANDOM.BAS \
-		basic/random.bas:/RANDOM.BAS \
 		basic/final.bas:/BASIC/FINAL.BAS \
-		basic/final.bas:/FINAL.BAS \
+		basic/phase13.bas:/BASIC/PHASE13.BAS \
 		build/test80.com:/BIN/TEST80.COM \
 		games/zork1.z3:/GAMES/ZORK1.Z3 \
 		build/sample.cga:/PICS/SAMPLE.CGA \

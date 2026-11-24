@@ -584,6 +584,7 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
     switch (func) {
     case SYS_EXIT:
         redir_stdout_flush();
+        con_set_scroll_rows(25);
         if (get_usermode_active()) {
             proc_exit_usermode(al);
         }
@@ -715,6 +716,14 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
             con_redraw();
             regs->ax = 0;
             break;
+        case CONSOLE_SET_SCROLL_ROWS:
+            con_set_scroll_rows((uint8_t)(regs->dx & 0xFF));
+            regs->ax = 0;
+            break;
+        case CONSOLE_WRITE_CELL:
+            con_write_cell((uint8_t)(regs->dx >> 8), (uint8_t)(regs->dx & 0xFF), regs->bx);
+            regs->ax = 0;
+            break;
         default:
             regs->ax = 0xFFFF;
             break;
@@ -838,6 +847,7 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         const char __far *fname = (const char __far *)MK_FP(regs->ds, regs->bx);
         const char __far *args  = regs->di ? (const char __far *)MK_FP(regs->es, regs->di) : 0;
         int res = exec_program(fname, args);
+        con_set_scroll_rows(25);
         regs->ax = (res < 0) ? 0xFFFF : (uint16_t)res;
         break;
     }

@@ -670,6 +670,7 @@ _cga_write_cell:
     push bp
     mov bp, sp
     push bx
+    push cx
     push dx
     push di
     push es
@@ -685,18 +686,25 @@ _cga_write_cell:
 
     mov dx, [_video_status_port]
 
+    mov cx, 0x0FFF
 .wait_active:
     in  al, dx
     test al, 0x08           ; Vertical retrace active? Safe to write immediately
     jnz .write_now
     test al, 0x01           ; Wait for active scanline before catching rising hblank edge
-    jnz .wait_active
+    jz  .active_ok
+    loop .wait_active
+    jmp .write_now          ; Timeout safeguard -> write anyway
 
+.active_ok:
     cli
+    mov cx, 0x0FFF
 .wait_hblank:
     in  al, dx
-    test al, 0x01           ; Wait for start of horizontal blanking
-    jz  .wait_hblank
+    test al, 0x09           ; Horizontal blanking (0x01) or Vertical retrace (0x08)
+    jnz .write_now
+    loop .wait_hblank
+
 .write_now:
     mov [es:di], bx
     sti
@@ -704,6 +712,7 @@ _cga_write_cell:
     pop es
     pop di
     pop dx
+    pop cx
     pop bx
     pop bp
     ret
@@ -741,18 +750,28 @@ _cga_sync_copy:
     mov bx, [si]            ; Pre-fetch word from system RAM before waiting for retrace
     add si, 2
 
+    push cx
+    mov cx, 0x0FFF
 .wait_disp:
     in  al, dx
     test al, 0x08           ; Vertical retrace active? Write immediately
-    jnz .store_word
+    jnz .store_word_pop
     test al, 0x01
-    jnz .wait_disp
+    jz  .disp_ok
+    loop .wait_disp
+    jmp .store_word_pop
 
+.disp_ok:
     cli
+    mov cx, 0x0FFF
 .wait_retrace:
     in  al, dx
-    test al, 0x01
-    jz  .wait_retrace
+    test al, 0x09
+    jnz .store_word_pop
+    loop .wait_retrace
+
+.store_word_pop:
+    pop cx
 .store_word:
     mov [es:di], bx
     sti
@@ -834,6 +853,39 @@ _bios_set_video_mode:
 
     xor ah, ah
     mov al, [bp+4]
+    int 0x10
+
+    pop es
+    pop ds
+    pop di
+    pop si
+    pop dx
+    pop cx
+    pop bx
+    pop bp
+    ret
+
+; void bios_scroll_up(uint8_t lines, uint8_t attr, uint8_t top, uint8_t left, uint8_t bottom, uint8_t right)
+; INT 0x10, AH=0x06 (Scroll Window Up)
+global _bios_scroll_up
+_bios_scroll_up:
+    push bp
+    mov bp, sp
+    push bx
+    push cx
+    push dx
+    push si
+    push di
+    push ds
+    push es
+
+    mov ah, 0x06
+    mov al, [bp+4]          ; lines
+    mov bh, [bp+6]          ; attr
+    mov ch, [bp+8]          ; top
+    mov cl, [bp+10]         ; left
+    mov dh, [bp+12]         ; bottom
+    mov dl, [bp+14]         ; right
     int 0x10
 
     pop es

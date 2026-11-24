@@ -61,6 +61,7 @@ extern void     cga_write_cell(uint16_t cell_idx, uint16_t cell_val);
 extern void     cga_sync_copy(const uint16_t *src, uint16_t word_count);
 extern void     bios_set_video_mode(uint8_t mode);
 extern void     bios_set_palette_reg(uint8_t reg, uint8_t val);
+extern void     bios_scroll_up(uint8_t lines, uint8_t attr, uint8_t top, uint8_t left, uint8_t bottom, uint8_t right);
 extern void     cga_wait_vsync(void);
 extern void     cga_lcd_sync_delay(void);
 extern void     cga_blit_linear(const void __far *src);
@@ -113,6 +114,9 @@ uint16_t con_get_cell(uint16_t idx);
 void     con_get_shadow(uint16_t __far *dst);
 void     con_sync_shadow(const uint16_t __far *src, uint8_t row, uint8_t col);
 void     con_redraw(void);
+void     con_set_scroll_rows(uint8_t rows);
+uint8_t  con_get_scroll_rows(void);
+void     con_write_cell(uint8_t row, uint8_t col, uint16_t val);
 
 /* Mouse & INT 0x33 subsystem (kernel/mouse.c) */
 #define MOUSE_TYPE_NONE             0

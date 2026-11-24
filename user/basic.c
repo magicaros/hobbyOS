@@ -243,13 +243,14 @@ static uint8_t inb(uint16_t port) { (void)port; return 0; }
 static void outb(uint16_t port, uint8_t val) { (void)port; (void)val; }
 #endif
 
-/* Graphics and Sound state (Phase 5) */
-static uint8_t  s_screen_mode       = 0;    /* 0 = text 80x25, 1 = CGA 320x200, 2 = CGA 640x200 */
+/* Graphics and Sound state (Phase 5, 13) */
+static uint8_t  s_screen_mode       = 0;    /* 0 = text 80x25, 1 = CGA 320x200, 2 = CGA 640x200, 12 = VGA 640x480, 13 = VGA 320x200 */
 static uint8_t  s_text_fg           = 7;
 static uint8_t  s_text_bg           = 0;
 static uint8_t  s_text_attr         = 0x07;
 static uint8_t  s_cga_bg            = 0;
 static uint8_t  s_cga_palette       = 1;
+static uint8_t  s_gfx_fg            = 15;
 static int16_t  s_last_x            = 0;
 static int16_t  s_last_y            = 0;
 static uint8_t  s_gfx_row           = 0;
@@ -280,6 +281,9 @@ static int basic_kbhit(void);
 static void basic_init_fkeys(void);
 static void basic_display_softkeys(void);
 static void basic_clear_softkeys(void);
+static void basic_gfx_print_str(const char *str, uint8_t color);
+static void basic_term_putc(char c);
+static void basic_term_puts(const char *s);
 
 /* Phase 12 Forward Declarations */
 static void basic_new(void);
@@ -434,11 +438,74 @@ static int16_t basic_atoi(const char *s) {
     return val * sign;
 }
 
+static void basic_gfx_print_str(const char *str, uint8_t color) {
+    uint16_t max_cols = (s_screen_mode == 2 || s_screen_mode == 12) ? 80 : 40;
+    uint16_t max_rows = (s_screen_mode == 12) ? 60 : 25;
+    while (*str) {
+        char c = *str++;
+        if (c == '\r') {
+            s_gfx_col = 0;
+            continue;
+        }
+        if (c == '\n') {
+            s_gfx_col = 0;
+            s_gfx_row++;
+            if (s_gfx_row >= max_rows) s_gfx_row = 0;
+            os_gfx_rect(0, (uint16_t)s_gfx_row * 8, (uint16_t)max_cols * 8, 8, 0, 1);
+            continue;
+        }
+        if (c == '\b') {
+            if (s_gfx_col > 0) {
+                s_gfx_col--;
+                os_gfx_rect((uint16_t)s_gfx_col * 8, (uint16_t)s_gfx_row * 8, 8, 8, 0, 1);
+            }
+            continue;
+        }
+        if (s_gfx_col >= max_cols) {
+            s_gfx_col = 0;
+            s_gfx_row++;
+            if (s_gfx_row >= max_rows) s_gfx_row = 0;
+            os_gfx_rect(0, (uint16_t)s_gfx_row * 8, (uint16_t)max_cols * 8, 8, 0, 1);
+        }
+        {
+            static char single[2];
+            single[0] = c;
+            single[1] = '\0';
+            os_gfx_rect((uint16_t)s_gfx_col * 8, (uint16_t)s_gfx_row * 8, 8, 8, 0, 1);
+            os_gfx_text((uint16_t)s_gfx_col * 8, (uint16_t)s_gfx_row * 8, (const char __far *)FP_HERE(single), color);
+        }
+        s_gfx_col++;
+    }
+}
+
+static void basic_term_putc(char c) {
+    if (s_screen_mode == 0) {
+        (os_putc)(c);
+    } else {
+        static char s[2];
+        s[0] = c;
+        s[1] = '\0';
+        basic_gfx_print_str(s, (s_screen_mode == 1) ? 3 : ((s_screen_mode == 12 || s_screen_mode == 13) ? s_gfx_fg : 1));
+    }
+}
+
+static void basic_term_puts(const char *s) {
+    if (!s) return;
+    if (s_screen_mode == 0) {
+        (os_puts)(s);
+    } else {
+        basic_gfx_print_str(s, (s_screen_mode == 1) ? 3 : ((s_screen_mode == 12 || s_screen_mode == 13) ? s_gfx_fg : 1));
+    }
+}
+
+#define os_puts basic_term_puts
+#define os_putc basic_term_putc
+
 static void basic_print_uint(uint16_t val) {
     char buf[8];
     int p = 0;
     if (val == 0) {
-        os_putc('0');
+        basic_term_putc('0');
         return;
     }
     while (val > 0) {
@@ -446,15 +513,15 @@ static void basic_print_uint(uint16_t val) {
         val /= 10;
     }
     while (p > 0) {
-        os_putc(buf[--p]);
+        basic_term_putc(buf[--p]);
     }
 }
 
 static void basic_print_int(int16_t val) {
     if (val < 0) {
-        os_putc('-');
+        basic_term_putc('-');
         if (val == -32768) {
-            os_puts("32768");
+            basic_term_puts("32768");
             return;
         }
         val = -val;
@@ -1011,8 +1078,8 @@ static uint16_t basic_detokenize_line(uint16_t line_num, const uint8_t __far *to
 static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
     char buf[BASIC_MAX_LINE_LEN];
     basic_detokenize_line(line_num, tok_data, buf, sizeof(buf));
-    os_puts(buf);
-    os_putc('\n');
+    basic_term_puts(buf);
+    basic_term_putc('\n');
 }
 
 /* --------------------------------------------------------------------------
@@ -1426,7 +1493,7 @@ static void basic_init_fkeys(void) {
         }
         s_fkey_strings[i][j] = '\0';
     }
-    s_key_visible = 0;
+    s_key_visible = 1;
 }
 
 static void basic_display_softkeys(void) {
@@ -1438,47 +1505,67 @@ static void basic_display_softkeys(void) {
 
     if (s_screen_mode != 0) return;
     bda_cols = *((const uint8_t __far *)0x0040004AUL);
+    if (bda_cols == 0) bda_cols = 80;
     max_k = (bda_cols <= 40) ? 5 : 10;
 
     cur = os_get_cursor();
     row = (uint8_t)(cur >> 8);
     col = (uint8_t)(cur & 0xFF);
-    os_set_cursor(24, 0);
+
     for (k = 1; k <= max_k; k++) {
-        int l;
-        basic_print_uint((uint16_t)k);
-        for (l = 0; l < 5 && s_fkey_strings[k][l] != '\0'; l++) {
-            char c = s_fkey_strings[k][l];
-            if (c == '\r' || c == '\n') c = ' ';
-            os_putc(c);
-        }
-        while (l < 5) {
-            os_putc(' ');
+        char num_c = (k == 10) ? '0' : (char)('0' + k);
+        uint8_t base = (uint8_t)((k - 1) * 8);
+        int l, m;
+
+        /* Inverse video for key number (0x70) */
+        os_console_write_cell(24, base, (0x70 << 8) | (uint8_t)num_c);
+
+        /* Normal video for up to 6 label characters (0x07) */
+        m = 0;
+        for (l = 0; l < 6 && s_fkey_strings[k][m] != '\0'; m++) {
+            char c = s_fkey_strings[k][m];
+            if (c == '\r' || c == '\n') continue;
+            os_console_write_cell(24, (uint8_t)(base + 1 + l), (0x07 << 8) | (uint8_t)c);
             l++;
         }
-        if (k < max_k) os_putc(' ');
+        while (l < 6) {
+            os_console_write_cell(24, (uint8_t)(base + 1 + l), (0x07 << 8) | ' ');
+            l++;
+        }
+        /* Trailing space between keys (Light Blue / Cyan background: 0x30) */
+        os_console_write_cell(24, (uint8_t)(base + 7), (0x30 << 8) | ' ');
     }
+
+    {
+        uint8_t col_idx;
+        for (col_idx = (uint8_t)(max_k * 8); col_idx < bda_cols; col_idx++) {
+            os_console_write_cell(24, col_idx, (0x30 << 8) | ' ');
+        }
+    }
+
     os_set_cursor(row, col);
 }
 
 static void basic_clear_softkeys(void) {
     uint16_t cur;
     uint8_t row, col;
-    int i;
+    uint8_t i;
     uint8_t bda_cols;
-    int max_c;
+    uint8_t attr;
 
     if (s_screen_mode != 0) return;
     bda_cols = *((const uint8_t __far *)0x0040004AUL);
-    max_c = (bda_cols <= 40) ? 39 : 79;
+    if (bda_cols == 0) bda_cols = 80;
 
     cur = os_get_cursor();
     row = (uint8_t)(cur >> 8);
     col = (uint8_t)(cur & 0xFF);
-    os_set_cursor(24, 0);
-    for (i = 0; i < max_c; i++) {
-        os_putc(' ');
+
+    attr = s_text_attr ? s_text_attr : 0x07;
+    for (i = 0; i < bda_cols; i++) {
+        os_console_write_cell(24, i, ((uint16_t)attr << 8) | ' ');
     }
+
     os_set_cursor(row, col);
 }
 
@@ -1704,26 +1791,26 @@ static uint16_t basic_find_line(uint16_t line_num) {
 
 static void basic_print_error_name(uint8_t code) {
     switch (code) {
-        case 1:  os_puts("NEXT without FOR"); break;
-        case 2:  os_puts("Syntax error"); break;
-        case 3:  os_puts("RETURN without GOSUB"); break;
-        case 4:  os_puts("Out of DATA"); break;
-        case 5:  os_puts("Illegal function call"); break;
-        case 6:  os_puts("Overflow"); break;
-        case 7:  os_puts("Out of memory"); break;
-        case 8:  os_puts("Undefined line number"); break;
-        case 9:  os_puts("Subscript out of range"); break;
-        case 10: os_puts("Duplicate Definition"); break;
-        case 11: os_puts("Division by zero"); break;
-        case 13: os_puts("Type mismatch"); break;
-        case 14: os_puts("Out of string space"); break;
-        case 20: os_puts("RESUME without error"); break;
-        case 30: os_puts("WEND without WHILE"); break;
-        case 52: os_puts("Bad file number"); break;
-        case 53: os_puts("File not found"); break;
-        case 54: os_puts("Bad file mode"); break;
-        case 55: os_puts("File already open"); break;
-        default: os_puts("Unprintable error"); break;
+        case 1:  basic_term_puts("NEXT without FOR"); break;
+        case 2:  basic_term_puts("Syntax error"); break;
+        case 3:  basic_term_puts("RETURN without GOSUB"); break;
+        case 4:  basic_term_puts("Out of DATA"); break;
+        case 5:  basic_term_puts("Illegal function call"); break;
+        case 6:  basic_term_puts("Overflow"); break;
+        case 7:  basic_term_puts("Out of memory"); break;
+        case 8:  basic_term_puts("Undefined line number"); break;
+        case 9:  basic_term_puts("Subscript out of range"); break;
+        case 10: basic_term_puts("Duplicate Definition"); break;
+        case 11: basic_term_puts("Division by zero"); break;
+        case 13: basic_term_puts("Type mismatch"); break;
+        case 14: basic_term_puts("Out of string space"); break;
+        case 20: basic_term_puts("RESUME without error"); break;
+        case 30: basic_term_puts("WEND without WHILE"); break;
+        case 52: basic_term_puts("Bad file number"); break;
+        case 53: basic_term_puts("File not found"); break;
+        case 54: basic_term_puts("Bad file mode"); break;
+        case 55: basic_term_puts("File already open"); break;
+        default: basic_term_puts("Unprintable error"); break;
     }
 }
 
@@ -1731,7 +1818,7 @@ static void basic_puts_no_nl(const char *s) {
     if (!s) return;
     while (*s) {
         if (*s == '\n' && *(s + 1) == '\0') break;
-        os_putc(*s++);
+        basic_term_putc(*s++);
     }
 }
 
@@ -1742,7 +1829,7 @@ static int basic_error(uint8_t code, const char *msg) {
     if (s_error_goto_line != 0 && !s_in_error_handler && s_cur_line_num != 0) {
         uint16_t target_off = basic_find_line(s_error_goto_line);
         if (!target_off) {
-            os_puts("Undefined line number in ON ERROR GOTO\n");
+            basic_term_puts("Undefined line number in ON ERROR GOTO\n");
             s_running = 0;
             return -1;
         }
@@ -1762,12 +1849,12 @@ static int basic_error(uint8_t code, const char *msg) {
         if (s_cur_line_num != 0) {
             basic_puts_no_nl(msg);
         } else {
-            os_puts(msg);
-            if (msg[basic_strlen(msg) - 1] != '\n') os_putc('\n');
+            basic_term_puts(msg);
+            if (msg[basic_strlen(msg) - 1] != '\n') basic_term_putc('\n');
         }
     } else {
         basic_print_error_name(code);
-        if (s_cur_line_num == 0) os_putc('\n');
+        if (s_cur_line_num == 0) basic_term_putc('\n');
     }
 
     s_running = 0;
@@ -2109,8 +2196,8 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         if (s_screen_mode == 0) {
             out_val->ival = -1;
         } else {
-            int16_t max_x = (s_screen_mode == 2) ? 640 : 320;
-            int16_t max_y = 200;
+            int16_t max_x = (s_screen_mode == 2 || s_screen_mode == 12) ? 640 : 320;
+            int16_t max_y = (s_screen_mode == 12) ? 480 : 200;
             if (x < 0 || x >= max_x || y < 0 || y >= max_y) {
                 out_val->ival = -1;
             } else {
@@ -5202,13 +5289,19 @@ static int basic_exec_locate(const uint8_t __far *tok, uint16_t *pos) {
 
     row = (r_val.ival > 0) ? (uint8_t)(r_val.ival - 1) : 0;
     col = (c_val.ival > 0) ? (uint8_t)(c_val.ival - 1) : 0;
-    if (row > 24) row = 24;
-    if (col > 79) col = 79;
+    if (s_screen_mode == 0) {
+        uint8_t max_r = s_key_visible ? 23 : 24;
+        if (row > max_r) row = max_r;
+        if (col > 79) col = 79;
+        os_set_cursor(row, col);
+    } else {
+        uint8_t max_r = (s_screen_mode == 12) ? 59 : 24;
+        uint8_t max_c = (s_screen_mode == 2 || s_screen_mode == 12) ? 79 : 39;
+        if (row > max_r) row = max_r;
+        if (col > max_c) col = max_c;
+    }
     s_gfx_row = row;
     s_gfx_col = col;
-    if (s_screen_mode == 0) {
-        os_set_cursor(row, col);
-    }
 
     *pos = p;
     return 0;
@@ -5394,9 +5487,14 @@ static int basic_exec_if(const uint8_t __far *tok, uint16_t *pos) {
 
     if (tok[p] == TOK_GOTO) {
         if (cond.ival != 0) {
-            return basic_exec_goto(tok, &p);
+            int ret;
+            *pos = p;
+            ret = basic_exec_goto(tok, pos);
+            return ret;
         } else {
-            return basic_skip_to_else(tok, &p);
+            int ret = basic_skip_to_else(tok, &p);
+            *pos = p;
+            return ret;
         }
     } else if (tok[p] == TOK_THEN) {
         p++;
@@ -5419,7 +5517,9 @@ static int basic_exec_if(const uint8_t __far *tok, uint16_t *pos) {
                 return 0;
             }
         } else {
-            return basic_skip_to_else(tok, &p);
+            int ret = basic_skip_to_else(tok, &p);
+            *pos = p;
+            return ret;
         }
     } else {
         os_puts("Syntax error in IF (expected THEN or GOTO)\n");
@@ -5632,53 +5732,6 @@ static void basic_delay_ms(uint16_t ms) {
     while ((uint16_t)(*bda_ticks - start) < ticks);
 }
 
-static void basic_gfx_print_str(const char *str, uint8_t color) {
-    uint16_t max_cols = (s_screen_mode == 2) ? 80 : 40;
-    while (*str) {
-        char c = *str++;
-        if (c == '\r') {
-            s_gfx_col = 0;
-            continue;
-        }
-        if (c == '\n') {
-            s_gfx_col = 0;
-            s_gfx_row++;
-            if (s_gfx_row >= 25) s_gfx_row = 0;
-            continue;
-        }
-        if (s_gfx_col >= max_cols) {
-            s_gfx_col = 0;
-            s_gfx_row++;
-            if (s_gfx_row >= 25) s_gfx_row = 0;
-        }
-        {
-            char single[2];
-            single[0] = c;
-            single[1] = '\0';
-            os_gfx_text((uint16_t)s_gfx_col * 8, (uint16_t)s_gfx_row * 8, (const char __far *)FP_HERE(single), color);
-        }
-        s_gfx_col++;
-    }
-}
-
-static void basic_term_putc(char c) {
-    if (s_screen_mode == 0) {
-        os_putc(c);
-    } else {
-        char s[2];
-        s[0] = c;
-        s[1] = '\0';
-        basic_gfx_print_str(s, (s_screen_mode == 1) ? 3 : 1);
-    }
-}
-
-static void basic_term_puts(const char *s) {
-    if (s_screen_mode == 0) {
-        os_puts(s);
-    } else {
-        basic_gfx_print_str(s, (s_screen_mode == 1) ? 3 : 1);
-    }
-}
 
 static int basic_exec_screen(const uint8_t __far *tok, uint16_t *pos) {
     uint16_t p = *pos;
@@ -5697,9 +5750,16 @@ static int basic_exec_screen(const uint8_t __far *tok, uint16_t *pos) {
             s_last_y = 0;
             s_gfx_row = 0;
             s_gfx_col = 0;
+            if (s_key_visible) {
+                os_console_set_scroll_rows(24);
+                basic_display_softkeys();
+            } else {
+                os_console_set_scroll_rows(25);
+            }
         } else if (m == 1) {
             os_gfx_set_mode(0x04);
             s_screen_mode = 1;
+            s_gfx_fg = 3;
             s_last_x = 160;
             s_last_y = 100;
             s_gfx_row = 0;
@@ -5707,13 +5767,39 @@ static int basic_exec_screen(const uint8_t __far *tok, uint16_t *pos) {
         } else if (m == 2) {
             os_gfx_set_mode(0x06);
             s_screen_mode = 2;
+            s_gfx_fg = 1;
             s_last_x = 320;
             s_last_y = 100;
             s_gfx_row = 0;
             s_gfx_col = 0;
+        } else if (m == 12) {
+            if (os_video_type() < VIDEO_TYPE_VGA) {
+                return basic_error(5, "Illegal function call (VGA required)\n");
+            }
+            if (os_gfx_set_mode(0x12) != 0) {
+                return basic_error(5, "Illegal function call\n");
+            }
+            s_screen_mode = 12;
+            s_gfx_fg = 15;
+            s_last_x = 320;
+            s_last_y = 240;
+            s_gfx_row = 0;
+            s_gfx_col = 0;
+        } else if (m == 13) {
+            if (os_video_type() < VIDEO_TYPE_VGA) {
+                return basic_error(5, "Illegal function call (VGA required)\n");
+            }
+            if (os_gfx_set_mode(0x13) != 0) {
+                return basic_error(5, "Illegal function call\n");
+            }
+            s_screen_mode = 13;
+            s_gfx_fg = 15;
+            s_last_x = 160;
+            s_last_y = 100;
+            s_gfx_row = 0;
+            s_gfx_col = 0;
         } else {
-            os_puts("Illegal function call in SCREEN\n");
-            return -1;
+            return basic_error(5, "Illegal function call in SCREEN\n");
         }
 
         while (tok[p] == ' ' || tok[p] == '\t') p++;
@@ -5783,10 +5869,11 @@ static int basic_exec_color(const uint8_t __far *tok, uint16_t *pos) {
         }
         os_gfx_set_palette(s_cga_palette, 1, s_cga_bg);
     } else {
-        /* Screen mode 2: foreground color */
+        /* Screen mode 2, 12, 13: foreground color */
         if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != ',') {
             basic_val_t fg_val;
             if (basic_eval_expr(tok, &p, &fg_val) != 0) return -1;
+            s_gfx_fg = (uint8_t)fg_val.ival;
         }
     }
 
@@ -5830,7 +5917,7 @@ static int basic_exec_pset(const uint8_t __far *tok, uint16_t *pos, int is_prese
     if (is_preset) {
         color = 0;
     } else {
-        color = (s_screen_mode == 1) ? 3 : 1;
+        color = (s_screen_mode == 1) ? 3 : ((s_screen_mode == 12 || s_screen_mode == 13) ? s_gfx_fg : 1);
     }
 
     while (tok[p] == ' ' || tok[p] == '\t') p++;
@@ -5845,8 +5932,9 @@ static int basic_exec_pset(const uint8_t __far *tok, uint16_t *pos, int is_prese
     s_last_y = y;
 
     if (x >= 0 && y >= 0) {
-        uint16_t max_x = (s_screen_mode == 2) ? 640 : 320;
-        if ((uint16_t)x < max_x && (uint16_t)y < 200) {
+        uint16_t max_x = (s_screen_mode == 2 || s_screen_mode == 12) ? 640 : 320;
+        uint16_t max_y = (s_screen_mode == 12) ? 480 : 200;
+        if ((uint16_t)x < max_x && (uint16_t)y < max_y) {
             os_gfx_putpixel((uint16_t)x, (uint16_t)y, color);
         }
     }
@@ -5922,7 +6010,7 @@ static int basic_exec_line_gfx(const uint8_t __far *tok, uint16_t *pos) {
         y2 = y2_val.ival;
     }
 
-    color = (s_screen_mode == 1) ? 3 : 1;
+    color = (s_screen_mode == 1) ? 3 : ((s_screen_mode == 12 || s_screen_mode == 13) ? s_gfx_fg : 1);
     while (tok[p] == ' ' || tok[p] == '\t') p++;
     if (tok[p] == ',') {
         p++;
@@ -5973,25 +6061,26 @@ static void basic_draw_circle(int16_t xc, int16_t yc, int16_t r, uint8_t color) 
     int16_t x = 0;
     int16_t y = r;
     int16_t d = 1 - r;
-    uint16_t max_x = (s_screen_mode == 2) ? 640 : 320;
+    uint16_t max_x = (s_screen_mode == 2 || s_screen_mode == 12) ? 640 : 320;
+    uint16_t max_y = (s_screen_mode == 12) ? 480 : 200;
 
     while (x <= y) {
-        if (xc + x >= 0 && (uint16_t)(xc + x) < max_x && yc + y >= 0 && (uint16_t)(yc + y) < 200)
+        if (xc + x >= 0 && (uint16_t)(xc + x) < max_x && yc + y >= 0 && (uint16_t)(yc + y) < max_y)
             os_gfx_putpixel((uint16_t)(xc + x), (uint16_t)(yc + y), color);
-        if (xc - x >= 0 && (uint16_t)(xc - x) < max_x && yc + y >= 0 && (uint16_t)(yc + y) < 200)
+        if (xc - x >= 0 && (uint16_t)(xc - x) < max_x && yc + y >= 0 && (uint16_t)(yc + y) < max_y)
             os_gfx_putpixel((uint16_t)(xc - x), (uint16_t)(yc + y), color);
-        if (xc + x >= 0 && (uint16_t)(xc + x) < max_x && yc - y >= 0 && (uint16_t)(yc - y) < 200)
+        if (xc + x >= 0 && (uint16_t)(xc + x) < max_x && yc - y >= 0 && (uint16_t)(yc - y) < max_y)
             os_gfx_putpixel((uint16_t)(xc + x), (uint16_t)(yc - y), color);
-        if (xc - x >= 0 && (uint16_t)(xc - x) < max_x && yc - y >= 0 && (uint16_t)(yc - y) < 200)
+        if (xc - x >= 0 && (uint16_t)(xc - x) < max_x && yc - y >= 0 && (uint16_t)(yc - y) < max_y)
             os_gfx_putpixel((uint16_t)(xc - x), (uint16_t)(yc - y), color);
 
-        if (xc + y >= 0 && (uint16_t)(xc + y) < max_x && yc + x >= 0 && (uint16_t)(yc + x) < 200)
+        if (xc + y >= 0 && (uint16_t)(xc + y) < max_x && yc + x >= 0 && (uint16_t)(yc + x) < max_y)
             os_gfx_putpixel((uint16_t)(xc + y), (uint16_t)(yc + x), color);
-        if (xc - y >= 0 && (uint16_t)(xc - y) < max_x && yc + x >= 0 && (uint16_t)(yc + x) < 200)
+        if (xc - y >= 0 && (uint16_t)(xc - y) < max_x && yc + x >= 0 && (uint16_t)(yc + x) < max_y)
             os_gfx_putpixel((uint16_t)(xc - y), (uint16_t)(yc + x), color);
-        if (xc + y >= 0 && (uint16_t)(xc + y) < max_x && yc - x >= 0 && (uint16_t)(yc - x) < 200)
+        if (xc + y >= 0 && (uint16_t)(xc + y) < max_x && yc - x >= 0 && (uint16_t)(yc - x) < max_y)
             os_gfx_putpixel((uint16_t)(xc + y), (uint16_t)(yc - x), color);
-        if (xc - y >= 0 && (uint16_t)(xc - y) < max_x && yc - x >= 0 && (uint16_t)(yc - x) < 200)
+        if (xc - y >= 0 && (uint16_t)(xc - y) < max_x && yc - x >= 0 && (uint16_t)(yc - x) < max_y)
             os_gfx_putpixel((uint16_t)(xc - y), (uint16_t)(yc - x), color);
 
         if (d < 0) {
@@ -6044,7 +6133,7 @@ static int basic_exec_circle(const uint8_t __far *tok, uint16_t *pos) {
     xc = xc_val.ival;
     yc = yc_val.ival;
     r = r_val.ival;
-    color = (s_screen_mode == 1) ? 3 : 1;
+    color = (s_screen_mode == 1) ? 3 : ((s_screen_mode == 12 || s_screen_mode == 13) ? s_gfx_fg : 1);
 
     while (tok[p] == ' ' || tok[p] == '\t') p++;
     if (tok[p] == ',') {
@@ -7243,6 +7332,13 @@ static int basic_exec_key(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == TOK_ON) {
         p++;
         s_key_visible = 1;
+        os_console_set_scroll_rows(24);
+        {
+            uint16_t cur = os_get_cursor();
+            if ((uint8_t)(cur >> 8) >= 24) {
+                os_set_cursor(23, (uint8_t)(cur & 0xFF));
+            }
+        }
         basic_display_softkeys();
         *pos = p;
         return 0;
@@ -7252,6 +7348,7 @@ static int basic_exec_key(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == TOK_OFF) {
         p++;
         s_key_visible = 0;
+        os_console_set_scroll_rows(25);
         basic_clear_softkeys();
         *pos = p;
         return 0;
@@ -7685,7 +7782,10 @@ static int basic_exec_width(const uint8_t __far *tok, uint16_t *pos) {
     }
 
     if (s_key_visible) {
+        os_console_set_scroll_rows(24);
         basic_display_softkeys();
+    } else {
+        os_console_set_scroll_rows(25);
     }
 
     *pos = p;
@@ -8130,7 +8230,7 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                 p++;
             } else if (tok[p] == ',') {
                 uint8_t col = (s_screen_mode == 0) ? (uint8_t)(os_get_cursor() & 0xFF) : s_gfx_col;
-                uint8_t max_cols = (s_screen_mode == 1) ? 40 : 80;
+                uint8_t max_cols = (s_screen_mode == 2 || s_screen_mode == 12) ? 80 : 40;
                 uint8_t next_tab = (uint8_t)(((col / 14) + 1) * 14);
                 if (next_tab >= max_cols) {
                     basic_term_putc('\n');
@@ -8146,7 +8246,7 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                 basic_val_t t_val;
                 int16_t target_col;
                 uint8_t cur_col;
-                uint8_t max_cols = (s_screen_mode == 1) ? 40 : 80;
+                uint8_t max_cols = (s_screen_mode == 2 || s_screen_mode == 12) ? 80 : 40;
                 p++;
                 while (tok[p] == ' ' || tok[p] == '\t') p++;
                 if (basic_eval_expr(tok, &p, &t_val) != 0) return -1;
@@ -8331,6 +8431,9 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
 
     /* SYSTEM statement in program (2-byte token 0xFE, 0x83) */
     if (tok[p] == (uint8_t)(TOK_SYSTEM >> 8) && tok[p + 1] == (uint8_t)(TOK_SYSTEM & 0xFF)) {
+        os_set_break_mode(BREAK_MODE_NORMAL);
+        os_console_set_scroll_rows(25);
+        basic_clear_softkeys();
         basic_sound_tone(0, 0);
         if (s_screen_mode != 0) {
             os_gfx_set_mode(0x03);
@@ -8524,7 +8627,10 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
             os_cls(s_text_attr ? s_text_attr : 0x07);
             os_set_cursor(0, 0);
             if (s_key_visible) {
+                os_console_set_scroll_rows(24);
                 basic_display_softkeys();
+            } else {
+                os_console_set_scroll_rows(25);
             }
         } else {
             os_gfx_clear(0);
@@ -8651,6 +8757,12 @@ static void basic_run_from_pc(void) {
             if (s_screen_mode != 0) {
                 os_gfx_set_mode(0x03);
                 s_screen_mode = 0;
+                if (s_key_visible) {
+                    os_console_set_scroll_rows(24);
+                    basic_display_softkeys();
+                } else {
+                    os_console_set_scroll_rows(25);
+                }
             }
             s_cont_line_off = s_cur_line_off;
             s_cont_stmt_pos = s_pc_stmt;
@@ -8781,7 +8893,6 @@ static void basic_cmd_run(void) {
     s_auto_mode = 0;
     s_cont_line_off = 0;
     s_cont_stmt_pos = 4;
-    basic_init_fkeys();
     s_err_reported = 0;
     s_running = 1;
     s_pc_line = s_prog_head;
@@ -8806,6 +8917,12 @@ static uint16_t basic_read_line(char *buf, uint16_t max_len) {
             if (s_screen_mode != 0) {
                 os_gfx_set_mode(0x03);
                 s_screen_mode = 0;
+                if (s_key_visible) {
+                    os_console_set_scroll_rows(24);
+                    basic_display_softkeys();
+                } else {
+                    os_console_set_scroll_rows(25);
+                }
             }
             os_puts("^C\n");
             buf[0] = '\0';
@@ -8939,6 +9056,9 @@ static void basic_process_input(char *line) {
         }
 
         if (tok_buf[0] == (uint8_t)(TOK_SYSTEM >> 8) && tok_buf[1] == (uint8_t)(TOK_SYSTEM & 0xFF)) {
+            os_set_break_mode(BREAK_MODE_NORMAL);
+            os_console_set_scroll_rows(25);
+            basic_clear_softkeys();
             basic_sound_tone(0, 0);
             if (s_screen_mode != 0) {
                 os_gfx_set_mode(0x03);
@@ -8971,6 +9091,8 @@ static void basic_process_input(char *line) {
 int app_main(void) {
     static char line_buf[BASIC_MAX_LINE_LEN];
 
+    os_set_break_mode(BREAK_MODE_RAW);
+
     s_basic_seg = os_mem_alloc(BASIC_SEG_PARAS);
     if (s_basic_seg == 0) {
         os_puts("BASIC: Out of conventional memory (64KB required)\n");
@@ -8981,6 +9103,9 @@ int app_main(void) {
     basic_math_init();
     basic_sound_init_opl();
     basic_sound_tone(0, 0);
+
+    os_cls(0x07);
+    os_set_cursor(0, 0);
 
     os_puts("hobbyOS BASIC Version 1.0 (GW-BASIC Compatible)\n");
     {
@@ -8997,6 +9122,13 @@ int app_main(void) {
             while (np > 0) os_putc(nbuf[--np]);
         }
         os_puts(" Bytes free\n");
+    }
+
+    if (s_key_visible) {
+        os_console_set_scroll_rows(24);
+        basic_display_softkeys();
+    } else {
+        os_console_set_scroll_rows(25);
     }
 
     {
@@ -9021,6 +9153,9 @@ int app_main(void) {
             }
         }
         if (has_file_arg) {
+            os_set_break_mode(BREAK_MODE_NORMAL);
+            os_console_set_scroll_rows(25);
+            basic_clear_softkeys();
             basic_sound_tone(0, 0);
             if (s_screen_mode != 0) {
                 os_gfx_set_mode(0x03);
@@ -9100,6 +9235,9 @@ int app_main(void) {
         }
     }
 
+    os_set_break_mode(BREAK_MODE_NORMAL);
+    os_console_set_scroll_rows(25);
+    basic_clear_softkeys();
     basic_sound_tone(0, 0);
     if (s_screen_mode != 0) {
         os_gfx_set_mode(0x03);

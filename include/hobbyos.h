@@ -42,9 +42,11 @@ typedef signed long    int32_t;
 #define SYS_REDIR        0x0E
 #define SYS_CONSOLE_SHADOW 0x0F
 
-#define CONSOLE_SHADOW_GET     0
-#define CONSOLE_SHADOW_SET     1
-#define CONSOLE_SHADOW_REDRAW  2
+#define CONSOLE_SHADOW_GET         0
+#define CONSOLE_SHADOW_SET         1
+#define CONSOLE_SHADOW_REDRAW      2
+#define CONSOLE_SET_SCROLL_ROWS    3
+#define CONSOLE_WRITE_CELL         4
 
 #define REDIR_STDOUT     0
 #define REDIR_STDIN      1
@@ -494,6 +496,20 @@ int os_console_redraw(void);
     "mov al, 2" \
     "int 0x21" \
     value [ax];
+
+int os_console_set_scroll_rows(uint8_t rows);
+#pragma aux os_console_set_scroll_rows = \
+    "mov ah, 0x0F" \
+    "mov al, 3" \
+    "int 0x21" \
+    parm [dl] value [ax] modify [al];
+
+int os_console_write_cell(uint8_t row, uint8_t col, uint16_t val);
+#pragma aux os_console_write_cell = \
+    "mov ah, 0x0F" \
+    "mov al, 4" \
+    "int 0x21" \
+    parm [dh] [dl] [bx] value [ax] modify [al];
 
 static __inline const char *os_video_name(uint16_t type) {
     switch (type) {

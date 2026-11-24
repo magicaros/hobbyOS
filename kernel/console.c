@@ -21,6 +21,7 @@ static uint8_t  cur_row  = 0;
 static uint8_t  cur_col  = 0;
 static uint8_t  cur_attr = ATTR_DEFAULT;
 static uint8_t  cursor_visible = 1;
+static uint8_t  scroll_bottom = CGA_ROWS;
 static uint16_t cga_shadow[CGA_CELLS];
 
 static uint16_t active_video_type = VIDEO_TYPE_CGA;
@@ -183,34 +184,32 @@ static void update_hw_cursor(void) {
 static void scroll_up(void) {
     uint16_t blank = ((uint16_t)cur_attr << 8) | ' ';
     uint16_t i;
+    uint16_t limit = (uint16_t)(scroll_bottom - 1) * CGA_COLS;
+    uint16_t clear_end = (uint16_t)scroll_bottom * CGA_COLS;
 
-    for (i = 0; i < (CGA_ROWS - 1) * CGA_COLS; i++) {
-        uint16_t next_val = cga_shadow[i + CGA_COLS];
-        if (cga_shadow[i] != next_val) {
-            cga_shadow[i] = next_val;
-            cga_write_cell(i, next_val);
-        }
+    for (i = 0; i < limit; i++) {
+        cga_shadow[i] = cga_shadow[i + CGA_COLS];
     }
-    for (i = (CGA_ROWS - 1) * CGA_COLS; i < CGA_CELLS; i++) {
-        if (cga_shadow[i] != blank) {
-            cga_shadow[i] = blank;
-            cga_write_cell(i, blank);
-        }
+    for (i = limit; i < clear_end; i++) {
+        cga_shadow[i] = blank;
     }
+
+    bios_scroll_up(1, cur_attr, 0, 0, (uint8_t)(scroll_bottom - 1), (uint8_t)(CGA_COLS - 1));
 }
 
 void con_clear(uint8_t attr) {
     uint16_t blank;
     uint16_t i;
+    uint16_t clear_end = (uint16_t)scroll_bottom * CGA_COLS;
 
     if (attr != 0) {
         cur_attr = translate_attr(attr);
     }
     blank = ((uint16_t)cur_attr << 8) | ' ';
-    for (i = 0; i < CGA_CELLS; i++) {
+    for (i = 0; i < clear_end; i++) {
         cga_shadow[i] = blank;
     }
-    cga_sync_copy(cga_shadow, CGA_CELLS);
+    cga_sync_copy(cga_shadow, clear_end);
     cur_row = 0;
     cur_col = 0;
     update_hw_cursor();
@@ -243,6 +242,7 @@ void con_init(void) {
 
     cur_attr = translate_attr(ATTR_DEFAULT);
     cursor_visible = 1;
+    scroll_bottom = CGA_ROWS;
     con_clear(cur_attr);
 }
 
@@ -251,11 +251,29 @@ void con_set_attr(uint8_t attr) {
 }
 
 void con_set_cursor(uint8_t row, uint8_t col) {
-    if (row >= CGA_ROWS) row = CGA_ROWS - 1;
+    if (row >= scroll_bottom) row = scroll_bottom - 1;
     if (col >= CGA_COLS) col = CGA_COLS - 1;
     cur_row = row;
     cur_col = col;
     update_hw_cursor();
+}
+
+void con_set_scroll_rows(uint8_t rows) {
+    if (rows == 0 || rows > CGA_ROWS) {
+        scroll_bottom = CGA_ROWS;
+    } else {
+        scroll_bottom = rows;
+    }
+}
+
+uint8_t con_get_scroll_rows(void) {
+    return scroll_bottom;
+}
+
+void con_write_cell(uint8_t row, uint8_t col, uint16_t val) {
+    if (row < CGA_ROWS && col < CGA_COLS) {
+        put_cell((uint16_t)row * CGA_COLS + col, val);
+    }
 }
 
 void con_get_cursor(uint8_t *row, uint8_t *col) {
@@ -318,9 +336,9 @@ static void putc_no_cursor(char c) {
         }
     }
 
-    if (cur_row >= CGA_ROWS) {
+    if (cur_row >= scroll_bottom) {
         scroll_up();
-        cur_row = CGA_ROWS - 1;
+        cur_row = scroll_bottom - 1;
     }
 }
 
