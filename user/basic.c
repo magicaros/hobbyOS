@@ -59,6 +59,7 @@ typedef struct {
     int16_t       ival;
     basic_float_t fval;
     char          sval[BASIC_MAX_STR_LEN + 1];
+    uint16_t      slen;
 } basic_var_t;
 
 /* Array descriptor structure */
@@ -71,17 +72,33 @@ typedef struct {
     uint16_t data_off;  /* Offset in s_basic_seg */
 } basic_array_t;
 
+#define BASIC_MAX_FIELDS    16
+#define BASIC_MAX_REC_LEN   512
+
+/* FIELD mapping descriptor for random-access files */
+typedef struct {
+    char     var_name[BASIC_MAX_VARNAME];
+    uint16_t offset;
+    uint16_t len;
+} basic_field_t;
+
 /* File handle structure */
 typedef struct {
-    int      is_open;
-    uint8_t  mode;      /* 'I', 'O', 'A' */
-    char     filename[32];
-    uint32_t file_pos;
-    uint32_t file_len;
-    uint8_t  buf[BASIC_FILE_BUF_SIZE];
-    uint16_t buf_pos;
-    uint16_t buf_len;
-    uint8_t  eof;
+    int           is_open;
+    uint8_t       mode;      /* 'I', 'O', 'A', 'R' */
+    char          filename[32];
+    uint32_t      file_pos;
+    uint32_t      file_len;
+    uint8_t       buf[BASIC_FILE_BUF_SIZE];
+    uint16_t      buf_pos;
+    uint16_t      buf_len;
+    uint8_t       eof;
+    /* Phase 11: Random-access file support */
+    uint16_t      record_len;
+    uint32_t      current_record;
+    uint8_t       rec_buf[BASIC_MAX_REC_LEN];
+    basic_field_t fields[BASIC_MAX_FIELDS];
+    uint8_t       num_fields;
 } basic_file_t;
 
 /* Call stack frame for GOSUB / RETURN */
@@ -199,6 +216,18 @@ static uint16_t s_rnd_seed          = 0x1234;
 /* Active memory segment for PEEK/POKE/DEF SEG (Phase 7) */
 static uint16_t s_def_seg           = 0;
 
+/* Phase 12 State Variables */
+static uint8_t  s_tron              = 0;
+static uint8_t  s_can_cont          = 0;
+static uint16_t s_cont_line_off     = 0;
+static uint16_t s_cont_stmt_pos     = 4;
+static uint8_t  s_auto_mode         = 0;
+static uint16_t s_auto_line         = 10;
+static uint16_t s_auto_step         = 10;
+static uint8_t  s_date_month        = 1;
+static uint8_t  s_date_day          = 1;
+static uint16_t s_date_year         = 2026;
+
 #ifdef __WATCOMC__
 static uint8_t inb(uint16_t port);
 #pragma aux inb = \
@@ -251,6 +280,33 @@ static int basic_kbhit(void);
 static void basic_init_fkeys(void);
 static void basic_display_softkeys(void);
 static void basic_clear_softkeys(void);
+
+/* Phase 12 Forward Declarations */
+static void basic_new(void);
+static void basic_run_from_pc(void);
+static int basic_cmd_cont(void);
+static int basic_cmd_delete(uint16_t start, uint16_t end);
+static int basic_cmd_renum(uint16_t new_start, uint16_t old_start, uint16_t step);
+static uint16_t basic_detokenize_tokens(const uint8_t __far *tok_data, char *out_buf, uint16_t max_out);
+static void basic_get_date_str(char *buf);
+static void basic_get_time_str(char *buf);
+static int basic_set_date_str(const char *s);
+static int basic_set_time_str(const char *s);
+static uint8_t bios_read_pixel(uint16_t x, uint16_t y);
+static int basic_exec_bsave(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_bload(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_width(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_delete(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_auto(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_renum(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_kill(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_name(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_chdir(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_mkdir(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_rmdir(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_shell(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_date_stmt(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_time_stmt(const uint8_t __far *tok, uint16_t *pos);
 
 /* --------------------------------------------------------------------------
  * Helper String & Math Functions
@@ -348,6 +404,19 @@ static int basic_strnicmp_far(const uint8_t __far *s1, const char *s2, uint16_t 
         if (c1 == '\0') break;
     }
     return 0;
+}
+
+static void basic_memcpy(void *dest, const void *src, uint16_t n) {
+    uint8_t *d = (uint8_t *)dest;
+    const uint8_t *s = (const uint8_t *)src;
+    uint16_t i;
+    for (i = 0; i < n; i++) d[i] = s[i];
+}
+
+static void basic_memset(void *dest, uint8_t val, uint16_t n) {
+    uint8_t *d = (uint8_t *)dest;
+    uint16_t i;
+    for (i = 0; i < n; i++) d[i] = val;
 }
 
 static int16_t basic_atoi(const char *s) {
@@ -500,6 +569,7 @@ static basic_var_t *basic_get_or_create_var(const char *name) {
     if (len > 0 && v->name[len - 1] == '$') {
         v->type = BASIC_TYPE_STR;
         v->sval[0] = '\0';
+        v->slen = 0;
         v->ival = 0;
         v->fval = 0;
     } else if (len > 0 && v->name[len - 1] == '%') {
@@ -507,13 +577,27 @@ static basic_var_t *basic_get_or_create_var(const char *name) {
         v->ival = 0;
         v->fval = 0;
         v->sval[0] = '\0';
+        v->slen = 0;
     } else {
         v->type = BASIC_TYPE_FLOAT;
         v->ival = 0;
         v->fval = 0;
         v->sval[0] = '\0';
+        v->slen = 0;
     }
     return v;
+}
+
+static void basic_set_var_str_len(const char *name, const char *val, uint16_t len) {
+    basic_var_t *var = basic_get_or_create_var(name);
+    if (!var) return;
+    var->type = BASIC_TYPE_STR;
+    if (len > BASIC_MAX_STR_LEN) len = BASIC_MAX_STR_LEN;
+    if (len > 0 && val) {
+        basic_memcpy(var->sval, val, len);
+    }
+    var->sval[len] = '\0';
+    var->slen = len;
 }
 
 static int basic_parse_var_name(const uint8_t __far *tok, uint16_t *pos, char *out_name, uint16_t max_len) {
@@ -704,6 +788,7 @@ static void basic_close_all_files(void) {
     uint8_t i;
     for (i = 0; i < BASIC_MAX_FILES; i++) {
         s_files[i].is_open = 0;
+        s_files[i].num_fields = 0;
     }
 }
 
@@ -826,7 +911,8 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
                     }
 
                     if (basic_is_alpha(last_kw_char) || basic_is_digit(last_kw_char)) {
-                        if (basic_is_alpha(next_in_char) || basic_is_digit(next_in_char) || next_in_char == '.' || next_in_char == '_') {
+                        if (basic_is_alpha(next_in_char) || basic_is_digit(next_in_char) || next_in_char == '.' || next_in_char == '_' ||
+                            next_in_char == '$' || next_in_char == '%' || next_in_char == '!' || next_in_char == '#') {
                             continue;
                         }
                     }
@@ -866,25 +952,9 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
  * Lister & De-tokenizer
  * -------------------------------------------------------------------------- */
 
-static uint16_t basic_detokenize_line(uint16_t line_num, const uint8_t __far *tok_data, char *out_buf, uint16_t max_out) {
+static uint16_t basic_detokenize_tokens(const uint8_t __far *tok_data, char *out_buf, uint16_t max_out) {
     uint16_t p = 0;
     uint16_t op = 0;
-    char num_buf[8];
-    int np = 0;
-    uint16_t v = line_num;
-
-    if (v == 0) {
-        if (op + 1 < max_out) out_buf[op++] = '0';
-    } else {
-        while (v > 0) {
-            num_buf[np++] = (char)('0' + (v % 10));
-            v /= 10;
-        }
-        while (np > 0 && op + 1 < max_out) {
-            out_buf[op++] = num_buf[--np];
-        }
-    }
-    if (op + 1 < max_out) out_buf[op++] = ' ';
 
     while (tok_data[p] != 0x00 && op + 2 < max_out) {
         uint8_t b = tok_data[p++];
@@ -915,11 +985,420 @@ static uint16_t basic_detokenize_line(uint16_t line_num, const uint8_t __far *to
     return op;
 }
 
+static uint16_t basic_detokenize_line(uint16_t line_num, const uint8_t __far *tok_data, char *out_buf, uint16_t max_out) {
+    uint16_t op = 0;
+    char num_buf[8];
+    int np = 0;
+    uint16_t v = line_num;
+
+    if (v == 0) {
+        if (op + 1 < max_out) out_buf[op++] = '0';
+    } else {
+        while (v > 0) {
+            num_buf[np++] = (char)('0' + (v % 10));
+            v /= 10;
+        }
+        while (np > 0 && op + 1 < max_out) {
+            out_buf[op++] = num_buf[--np];
+        }
+    }
+    if (op + 1 < max_out) out_buf[op++] = ' ';
+
+    op += basic_detokenize_tokens(tok_data, &out_buf[op], max_out - op);
+    return op;
+}
+
 static void basic_list_line(uint16_t line_num, const uint8_t __far *tok_data) {
     char buf[BASIC_MAX_LINE_LEN];
     basic_detokenize_line(line_num, tok_data, buf, sizeof(buf));
     os_puts(buf);
     os_putc('\n');
+}
+
+/* --------------------------------------------------------------------------
+ * Phase 12 Helpers: BIOS RTC, Pixels, Date, Time & Program Management
+ * -------------------------------------------------------------------------- */
+
+#ifdef __WATCOMC__
+static uint8_t bios_read_pixel(uint16_t x, uint16_t y);
+#pragma aux bios_read_pixel = \
+    "mov ah, 0x0D" \
+    "xor bh, bh" \
+    "int 0x10" \
+    parm [cx] [dx] value [al] modify [ax bx];
+
+static void bios_set_timer_ticks(uint16_t hi, uint16_t lo);
+#pragma aux bios_set_timer_ticks = \
+    "mov ah, 0x01" \
+    "int 0x1a" \
+    parm [cx] [dx] modify [ax];
+#else
+static uint8_t bios_read_pixel(uint16_t x, uint16_t y) { (void)x; (void)y; return 0; }
+static void bios_set_timer_ticks(uint16_t hi, uint16_t lo) { (void)hi; (void)lo; }
+#endif
+
+static void basic_get_date_str(char *buf) {
+    uint8_t m = s_date_month;
+    uint8_t d = s_date_day;
+    uint16_t yr = s_date_year;
+
+    buf[0] = (char)('0' + (m / 10));
+    buf[1] = (char)('0' + (m % 10));
+    buf[2] = '-';
+    buf[3] = (char)('0' + (d / 10));
+    buf[4] = (char)('0' + (d % 10));
+    buf[5] = '-';
+    buf[6] = (char)('0' + ((yr / 1000) % 10));
+    buf[7] = (char)('0' + ((yr / 100) % 10));
+    buf[8] = (char)('0' + ((yr / 10) % 10));
+    buf[9] = (char)('0' + (yr % 10));
+    buf[10] = '\0';
+}
+
+static void basic_get_time_str(char *buf) {
+    uint8_t h, m, s;
+    uint32_t rem = *((const volatile uint32_t __far *)0x0040006CUL);
+
+    h = 0;
+    while (rem >= 65543UL) {
+        rem -= 65543UL;
+        h++;
+    }
+    h %= 24;
+    {
+        uint16_t hour_ticks = (uint16_t)rem;
+        m = (uint8_t)(hour_ticks / 1092U);
+        if (m > 59) m = 59;
+        {
+            uint16_t min_ticks = hour_ticks % 1092U;
+            s = (uint8_t)(((uint16_t)min_ticks * 10U) / 182U);
+            if (s > 59) s = 59;
+        }
+    }
+
+    buf[0] = (char)('0' + (h / 10));
+    buf[1] = (char)('0' + (h % 10));
+    buf[2] = ':';
+    buf[3] = (char)('0' + (m / 10));
+    buf[4] = (char)('0' + (m % 10));
+    buf[5] = ':';
+    buf[6] = (char)('0' + (s / 10));
+    buf[7] = (char)('0' + (s % 10));
+    buf[8] = '\0';
+}
+
+static int basic_set_date_str(const char *s) {
+    uint8_t m = 0, d = 0;
+    uint16_t yr = 0;
+    uint16_t idx = 0;
+
+    while (s[idx] == ' ' || s[idx] == '\t') idx++;
+    if (!basic_is_digit(s[idx])) return basic_error(5, "Illegal function call\n");
+    m = (uint8_t)basic_parse_uint(s, &idx);
+
+    if (s[idx] != '-' && s[idx] != '/') return basic_error(5, "Illegal function call\n");
+    idx++;
+
+    if (!basic_is_digit(s[idx])) return basic_error(5, "Illegal function call\n");
+    d = (uint8_t)basic_parse_uint(s, &idx);
+
+    if (s[idx] != '-' && s[idx] != '/') return basic_error(5, "Illegal function call\n");
+    idx++;
+
+    if (!basic_is_digit(s[idx])) return basic_error(5, "Illegal function call\n");
+    yr = basic_parse_uint(s, &idx);
+    if (yr < 100) {
+        yr += (yr < 80) ? 2000 : 1900;
+    }
+
+    if (m < 1 || m > 12 || d < 1 || d > 31 || yr < 1980 || yr > 2099) {
+        return basic_error(5, "Illegal function call\n");
+    }
+
+    s_date_month = m;
+    s_date_day = d;
+    s_date_year = yr;
+    return 0;
+}
+
+static int basic_set_time_str(const char *s) {
+    uint8_t h = 0, m = 0, sec = 0;
+    uint16_t idx = 0;
+
+    while (s[idx] == ' ' || s[idx] == '\t') idx++;
+    if (!basic_is_digit(s[idx])) return basic_error(5, "Illegal function call\n");
+    h = (uint8_t)basic_parse_uint(s, &idx);
+
+    if (s[idx] != ':') return basic_error(5, "Illegal function call\n");
+    idx++;
+
+    if (!basic_is_digit(s[idx])) return basic_error(5, "Illegal function call\n");
+    m = (uint8_t)basic_parse_uint(s, &idx);
+
+    if (s[idx] == ':') {
+        idx++;
+        if (basic_is_digit(s[idx])) {
+            sec = (uint8_t)basic_parse_uint(s, &idx);
+        }
+    }
+
+    if (h > 23 || m > 59 || sec > 59) {
+        return basic_error(5, "Illegal function call\n");
+    }
+
+    {
+        uint32_t h_ticks = ((uint32_t)h << 16) + (uint32_t)((uint16_t)h * 7U);
+        uint16_t m_ticks = (uint16_t)m * 1092U;
+        uint16_t s_ticks = ((uint16_t)sec * 182U) / 10U;
+        uint32_t ticks = h_ticks + (uint32_t)m_ticks + (uint32_t)s_ticks;
+        bios_set_timer_ticks((uint16_t)(ticks >> 16), (uint16_t)(ticks & 0xFFFFU));
+        *((uint32_t __far *)0x0040006CUL) = ticks;
+        *((uint8_t __far *)0x00400070UL) = 0;
+    }
+    return 0;
+}
+
+static int basic_cmd_delete(uint16_t start, uint16_t end) {
+    uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+    uint16_t cur = s_prog_head;
+    uint16_t prev = 0;
+    int deleted = 0;
+
+    if (start > end) {
+        return basic_error(5, "Illegal function call\n");
+    }
+
+    while (cur != 0) {
+        uint16_t next = (uint16_t)mem[cur] | ((uint16_t)mem[cur + 1] << 8);
+        uint16_t num  = (uint16_t)mem[cur + 2] | ((uint16_t)mem[cur + 3] << 8);
+
+        if (num >= start && num <= end) {
+            if (prev == 0) {
+                s_prog_head = next;
+            } else {
+                mem[prev] = (uint8_t)(next & 0xFF);
+                mem[prev + 1] = (uint8_t)(next >> 8);
+            }
+            deleted++;
+            cur = next;
+        } else {
+            prev = cur;
+            cur = next;
+        }
+    }
+
+    s_can_cont = 0;
+    if (deleted == 0 && start == end) {
+        return basic_error(5, "Illegal function call\n");
+    }
+    return 0;
+}
+
+typedef struct {
+    uint16_t old_num;
+    uint16_t new_num;
+} basic_renum_t;
+
+static int basic_cmd_renum(uint16_t new_start, uint16_t old_start, uint16_t step) {
+    uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
+    uint16_t temp_seg;
+    basic_renum_t __far *map;
+    uint8_t __far *text_buf;
+    uint16_t cur;
+    uint16_t count = 0;
+    uint16_t cur_new = new_start;
+    uint16_t text_len = 0;
+    uint16_t i;
+
+    if (s_prog_head == 0) return 0;
+    if (step == 0) step = 10;
+
+    temp_seg = os_mem_alloc(1024);
+    if (temp_seg == 0) {
+        return basic_error(7, "Out of memory\n");
+    }
+
+    map = (basic_renum_t __far *)MK_FP(temp_seg, 0);
+    text_buf = (uint8_t __far *)MK_FP(temp_seg, 2048);
+
+    cur = s_prog_head;
+    while (cur != 0 && count < 500) {
+        uint16_t next = (uint16_t)mem[cur] | ((uint16_t)mem[cur + 1] << 8);
+        uint16_t num  = (uint16_t)mem[cur + 2] | ((uint16_t)mem[cur + 3] << 8);
+
+        map[count].old_num = num;
+        if (num >= old_start) {
+            if ((uint32_t)cur_new > 65529UL) {
+                os_mem_free(temp_seg);
+                return basic_error(5, "Illegal function call\n");
+            }
+            map[count].new_num = cur_new;
+            cur_new += step;
+        } else {
+            map[count].new_num = num;
+        }
+        count++;
+        cur = next;
+    }
+
+    for (i = 1; i < count; i++) {
+        if (map[i].new_num <= map[i - 1].new_num) {
+            os_mem_free(temp_seg);
+            return basic_error(5, "Illegal function call\n");
+        }
+    }
+
+    for (i = 0; i < count; i++) {
+        char line_str[BASIC_MAX_LINE_LEN];
+        char updated_str[BASIC_MAX_LINE_LEN];
+        uint16_t lp = 0, up = 0;
+        uint16_t line_off = basic_find_line(map[i].old_num);
+        if (!line_off) continue;
+
+        basic_detokenize_tokens(&mem[line_off + 4], line_str, sizeof(line_str));
+
+        while (line_str[lp] != '\0' && up + 12 < sizeof(updated_str)) {
+            if (line_str[lp] == '"') {
+                updated_str[up++] = line_str[lp++];
+                while (line_str[lp] != '\0' && line_str[lp] != '"' && up + 2 < sizeof(updated_str)) {
+                    updated_str[up++] = line_str[lp++];
+                }
+                if (line_str[lp] == '"') updated_str[up++] = line_str[lp++];
+                continue;
+            }
+
+            if (line_str[lp] == '\'' || basic_strnicmp(&line_str[lp], "REM", 3) == 0) {
+                while (line_str[lp] != '\0' && up + 1 < sizeof(updated_str)) {
+                    updated_str[up++] = line_str[lp++];
+                }
+                break;
+            }
+
+            {
+                int kw_len = 0;
+                int is_branch = 0;
+                if (basic_strnicmp(&line_str[lp], "GOTO", 4) == 0) { kw_len = 4; is_branch = 1; }
+                else if (basic_strnicmp(&line_str[lp], "GOSUB", 5) == 0) { kw_len = 5; is_branch = 1; }
+                else if (basic_strnicmp(&line_str[lp], "THEN", 4) == 0) { kw_len = 4; is_branch = 1; }
+                else if (basic_strnicmp(&line_str[lp], "ELSE", 4) == 0) { kw_len = 4; is_branch = 1; }
+                else if (basic_strnicmp(&line_str[lp], "RESTORE", 7) == 0) { kw_len = 7; is_branch = 1; }
+                else if (basic_strnicmp(&line_str[lp], "RUN", 3) == 0) { kw_len = 3; is_branch = 1; }
+                else if (basic_strnicmp(&line_str[lp], "RESUME", 6) == 0) { kw_len = 6; is_branch = 1; }
+                else if (basic_strnicmp(&line_str[lp], "RETURN", 6) == 0) { kw_len = 6; is_branch = 1; }
+
+                if (is_branch) {
+                    int k;
+                    for (k = 0; k < kw_len; k++) {
+                        updated_str[up++] = line_str[lp++];
+                    }
+                    for (;;) {
+                        while (line_str[lp] == ' ' || line_str[lp] == '\t') {
+                            updated_str[up++] = line_str[lp++];
+                        }
+                        if (basic_is_digit(line_str[lp])) {
+                            uint16_t old_target = basic_parse_uint(line_str, &lp);
+                            uint16_t new_target = old_target;
+                            int found = 0;
+                            int m;
+                            for (m = 0; m < count; m++) {
+                                if (map[m].old_num == old_target) {
+                                    new_target = map[m].new_num;
+                                    found = 1;
+                                    break;
+                                }
+                            }
+                            if (!found) {
+                                os_puts("Undefined line number ");
+                                basic_print_uint(old_target);
+                                os_puts(" in ");
+                                basic_print_uint(map[i].old_num);
+                                os_putc('\n');
+                            }
+                            {
+                                char nbuf[8];
+                                int np = 0;
+                                uint16_t v = new_target;
+                                char tmp[8];
+                                int tp = 0;
+                                if (v == 0) nbuf[np++] = '0';
+                                else {
+                                    while (v > 0) { tmp[tp++] = (char)('0' + (v % 10)); v /= 10; }
+                                    while (tp > 0) nbuf[np++] = tmp[--tp];
+                                }
+                                for (m = 0; m < np; m++) updated_str[up++] = nbuf[m];
+                            }
+                            while (line_str[lp] == ' ' || line_str[lp] == '\t') {
+                                updated_str[up++] = line_str[lp++];
+                            }
+                            if (line_str[lp] == ',') {
+                                updated_str[up++] = line_str[lp++];
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    continue;
+                }
+            }
+
+            updated_str[up++] = line_str[lp++];
+        }
+        updated_str[up] = '\0';
+
+        {
+            char nbuf[8];
+            int np = 0;
+            uint16_t v = map[i].new_num;
+            char tmp[8];
+            int tp = 0;
+            int m;
+            if (v == 0) nbuf[np++] = '0';
+            else {
+                while (v > 0) { tmp[tp++] = (char)('0' + (v % 10)); v /= 10; }
+                while (tp > 0) nbuf[np++] = tmp[--tp];
+            }
+            for (m = 0; m < np && text_len + 1 < 14000; m++) {
+                text_buf[text_len++] = (uint8_t)nbuf[m];
+            }
+            if (text_len + 1 < 14000) text_buf[text_len++] = ' ';
+            for (m = 0; m < up && text_len + 1 < 14000; m++) {
+                text_buf[text_len++] = (uint8_t)updated_str[m];
+            }
+            if (text_len + 1 < 14000) text_buf[text_len++] = '\n';
+        }
+    }
+
+    basic_new();
+
+    {
+        uint16_t tp = 0;
+        char line_in[BASIC_MAX_LINE_LEN];
+        uint8_t tok_tmp[BASIC_MAX_LINE_LEN];
+
+        while (tp < text_len) {
+            uint16_t lp = 0;
+            uint16_t sp = 0;
+            while (tp < text_len && text_buf[tp] != '\r' && text_buf[tp] != '\n') {
+                if (lp + 1 < sizeof(line_in)) line_in[lp++] = (char)text_buf[tp];
+                tp++;
+            }
+            line_in[lp] = '\0';
+            while (tp < text_len && (text_buf[tp] == '\r' || text_buf[tp] == '\n')) tp++;
+
+            while (line_in[sp] == ' ' || line_in[sp] == '\t') sp++;
+            if (basic_is_digit(line_in[sp])) {
+                uint16_t num = basic_parse_uint(line_in, &sp);
+                uint16_t tlen;
+                while (line_in[sp] == ' ' || line_in[sp] == '\t') sp++;
+                tlen = basic_tokenize(&line_in[sp], tok_tmp, sizeof(tok_tmp));
+                basic_insert_line(num, tok_tmp, tlen);
+            }
+        }
+    }
+
+    os_mem_free(temp_seg);
+    s_can_cont = 0;
+    return 0;
 }
 
 /* --------------------------------------------------------------------------
@@ -954,12 +1433,18 @@ static void basic_display_softkeys(void) {
     uint16_t cur;
     uint8_t row, col;
     int k;
+    uint8_t bda_cols;
+    int max_k;
+
     if (s_screen_mode != 0) return;
+    bda_cols = *((const uint8_t __far *)0x0040004AUL);
+    max_k = (bda_cols <= 40) ? 5 : 10;
+
     cur = os_get_cursor();
     row = (uint8_t)(cur >> 8);
     col = (uint8_t)(cur & 0xFF);
     os_set_cursor(24, 0);
-    for (k = 1; k <= 10; k++) {
+    for (k = 1; k <= max_k; k++) {
         int l;
         basic_print_uint((uint16_t)k);
         for (l = 0; l < 5 && s_fkey_strings[k][l] != '\0'; l++) {
@@ -971,7 +1456,7 @@ static void basic_display_softkeys(void) {
             os_putc(' ');
             l++;
         }
-        if (k < 10) os_putc(' ');
+        if (k < max_k) os_putc(' ');
     }
     os_set_cursor(row, col);
 }
@@ -980,12 +1465,18 @@ static void basic_clear_softkeys(void) {
     uint16_t cur;
     uint8_t row, col;
     int i;
+    uint8_t bda_cols;
+    int max_c;
+
     if (s_screen_mode != 0) return;
+    bda_cols = *((const uint8_t __far *)0x0040004AUL);
+    max_c = (bda_cols <= 40) ? 39 : 79;
+
     cur = os_get_cursor();
     row = (uint8_t)(cur >> 8);
     col = (uint8_t)(cur & 0xFF);
     os_set_cursor(24, 0);
-    for (i = 0; i < 79; i++) {
+    for (i = 0; i < max_c; i++) {
         os_putc(' ');
     }
     os_set_cursor(row, col);
@@ -1171,6 +1662,11 @@ static void basic_new(void) {
     s_key_fifo_head = 0;
     s_key_fifo_count = 0;
     s_break_pending = 0;
+    s_can_cont = 0;
+    s_tron = 0;
+    s_auto_mode = 0;
+    s_cont_line_off = 0;
+    s_cont_stmt_pos = 4;
     basic_init_fkeys();
     if (s_basic_seg) {
         uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
@@ -1282,6 +1778,8 @@ static void basic_delete_line(uint16_t line_num) {
     uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
     uint16_t prev = 0;
     uint16_t cur = s_prog_head;
+
+    s_can_cont = 0;
 
     while (cur != 0) {
         uint16_t next = (uint16_t)mem[cur] | ((uint16_t)mem[cur + 1] << 8);
@@ -1567,6 +2065,62 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         return 0;
     }
 
+    /* Built-in variable/function: CSRLIN (token 0xDB) */
+    if (tok[p] == TOK_CSRLIN) {
+        uint16_t cur = os_get_cursor();
+        p++;
+        out_val->type = BASIC_TYPE_INT;
+        if (s_screen_mode == 0) {
+            out_val->ival = (int16_t)((cur >> 8) + 1);
+        } else {
+            out_val->ival = (int16_t)(s_gfx_row + 1);
+        }
+        out_val->fval = 0;
+        out_val->sval = 0;
+        *pos = p;
+        return 0;
+    }
+
+    /* Built-in function: POINT(x, y) (token 0xDC) */
+    if (tok[p] == TOK_POINT) {
+        basic_val_t x_val, y_val;
+        int16_t x, y;
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') {
+            os_puts("Syntax error in POINT (expected '(')\n");
+            return -1;
+        }
+        p++;
+        if (basic_eval_expr(tok, &p, &x_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') p++;
+        if (basic_eval_expr(tok, &p, &y_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+
+        x = val_to_int(&x_val);
+        y = val_to_int(&y_val);
+
+        out_val->type = BASIC_TYPE_INT;
+        out_val->fval = 0;
+        out_val->sval = 0;
+
+        if (s_screen_mode == 0) {
+            out_val->ival = -1;
+        } else {
+            int16_t max_x = (s_screen_mode == 2) ? 640 : 320;
+            int16_t max_y = 200;
+            if (x < 0 || x >= max_x || y < 0 || y >= max_y) {
+                out_val->ival = -1;
+            } else {
+                out_val->ival = (int16_t)bios_read_pixel((uint16_t)x, (uint16_t)y);
+            }
+        }
+        *pos = p;
+        return 0;
+    }
+
     /* Built-in function: INKEY$ (token 0xDE) */
     if (tok[p] == TOK_INKEY) {
         char *str = basic_alloc_temp_str();
@@ -1771,6 +2325,143 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         return 0;
     }
 
+    /* Built-in 2-byte functions with 0xFD prefix (Phase 11: Binary conversion) */
+    if (tok[p] == 0xFD) {
+        uint8_t fn = tok[p + 1];
+        p += 2;
+
+        /* CVI(S$) - 2-byte string to 16-bit signed integer */
+        if (fn == (uint8_t)(TOK_CVI & 0xFF)) {
+            basic_val_t arg;
+            int16_t iv;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            if (arg.type != BASIC_TYPE_STR || !arg.sval) {
+                return basic_error(13, "Type mismatch\n");
+            }
+            iv = (int16_t)((uint8_t)arg.sval[0] | ((uint16_t)(uint8_t)arg.sval[1] << 8));
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = iv;
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* CVS(S$) - 4-byte string to 32-bit single-precision float */
+        if (fn == (uint8_t)(TOK_CVS & 0xFF)) {
+            basic_val_t arg;
+            basic_float_t fv;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            if (arg.type != BASIC_TYPE_STR || !arg.sval) {
+                return basic_error(13, "Type mismatch\n");
+            }
+            basic_memcpy(&fv, arg.sval, 4);
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = fv;
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* CVD(S$) - 8-byte string to double / float */
+        if (fn == (uint8_t)(TOK_CVD & 0xFF)) {
+            basic_val_t arg;
+            basic_float_t fv;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            if (arg.type != BASIC_TYPE_STR || !arg.sval) {
+                return basic_error(13, "Type mismatch\n");
+            }
+            basic_memcpy(&fv, arg.sval, 4);
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = fv;
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* MKI$(X%) - 16-bit integer to 2-byte string */
+        if (fn == (uint8_t)(TOK_MKI & 0xFF)) {
+            basic_val_t arg;
+            char *str = basic_alloc_temp_str();
+            int16_t iv;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            iv = val_to_int(&arg);
+            str[0] = (char)(iv & 0xFF);
+            str[1] = (char)((iv >> 8) & 0xFF);
+            str[2] = '\0';
+            out_val->type = BASIC_TYPE_STR;
+            out_val->sval = str;
+            out_val->ival = 2;
+            out_val->fval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* MKS$(X!) - 32-bit float to 4-byte string */
+        if (fn == (uint8_t)(TOK_MKS & 0xFF)) {
+            basic_val_t arg;
+            char *str = basic_alloc_temp_str();
+            basic_float_t fv;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            fv = (arg.type == BASIC_TYPE_FLOAT) ? arg.fval : soft_from_int(val_to_int(&arg));
+            basic_memcpy(str, &fv, 4);
+            str[4] = '\0';
+            out_val->type = BASIC_TYPE_STR;
+            out_val->sval = str;
+            out_val->ival = 4;
+            out_val->fval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* MKD$(X#) - 8-byte double to 8-byte string */
+        if (fn == (uint8_t)(TOK_MKD & 0xFF)) {
+            basic_val_t arg;
+            char *str = basic_alloc_temp_str();
+            basic_float_t fv;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            fv = (arg.type == BASIC_TYPE_FLOAT) ? arg.fval : soft_from_int(val_to_int(&arg));
+            basic_memset(str, 0, 8);
+            basic_memcpy(str, &fv, 4);
+            str[8] = '\0';
+            out_val->type = BASIC_TYPE_STR;
+            out_val->sval = str;
+            out_val->ival = 8;
+            out_val->fval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* Not a recognized 0xFD function */
+        p -= 2;
+    }
+
     /* Built-in 2-byte functions with 0xFE prefix (Phase 7) */
     if (tok[p] == 0xFE) {
         uint8_t fn = tok[p + 1];
@@ -1790,6 +2481,30 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             out_val->fval = basic_float_mul(f_ticks, 0x3D60FEB3UL); /* * 0.05492549 */
             out_val->ival = 0;
             out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* DATE$ (0xFE8D) */
+        if (fn == (uint8_t)(TOK_DATE & 0xFF)) {
+            char *str = basic_alloc_temp_str();
+            basic_get_date_str(str);
+            out_val->type = BASIC_TYPE_STR;
+            out_val->sval = str;
+            out_val->ival = 0;
+            out_val->fval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* TIME$ (0xFE8E) */
+        if (fn == (uint8_t)(TOK_TIME & 0xFF)) {
+            char *str = basic_alloc_temp_str();
+            basic_get_time_str(str);
+            out_val->type = BASIC_TYPE_STR;
+            out_val->sval = str;
+            out_val->ival = 0;
+            out_val->fval = 0;
             *pos = p;
             return 0;
         }
@@ -1869,10 +2584,32 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             return 0;
         }
 
+        /* POS(dummy) */
+        if (fn == (uint8_t)(TOK_POS & 0xFF)) {
+            basic_val_t dummy;
+            uint16_t cur;
+            if (basic_eval_expr(tok, &p, &dummy) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            cur = os_get_cursor();
+            out_val->type = BASIC_TYPE_INT;
+            if (s_screen_mode == 0) {
+                out_val->ival = (int16_t)((cur & 0xFF) + 1);
+            } else {
+                out_val->ival = (int16_t)(s_gfx_col + 1);
+            }
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
         /* EOF(filenum) */
         if (fn == (uint8_t)(TOK_EOF & 0xFF)) {
             basic_val_t arg;
             uint8_t fnum;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
             if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == ')') p++;
@@ -1880,10 +2617,71 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             out_val->type = BASIC_TYPE_INT;
             if (fnum >= 1 && fnum <= BASIC_MAX_FILES && s_files[fnum - 1].is_open) {
                 basic_file_t *f = &s_files[fnum - 1];
-                int is_eof = f->eof || (f->buf_pos >= f->buf_len && f->file_pos >= f->file_len);
-                out_val->ival = is_eof ? -1 : 0;
+                if (f->mode == 'R') {
+                    out_val->ival = f->eof ? -1 : 0;
+                } else {
+                    int is_eof = f->eof || (f->buf_pos >= f->buf_len && f->file_pos >= f->file_len);
+                    out_val->ival = is_eof ? -1 : 0;
+                }
             } else {
                 out_val->ival = -1;
+            }
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* LOC(filenum) - Phase 11 */
+        if (fn == (uint8_t)(TOK_LOC & 0xFF)) {
+            basic_val_t arg;
+            uint8_t fnum;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            fnum = (uint8_t)arg.ival;
+            out_val->type = BASIC_TYPE_INT;
+            if (fnum >= 1 && fnum <= BASIC_MAX_FILES && s_files[fnum - 1].is_open) {
+                basic_file_t *f = &s_files[fnum - 1];
+                if (f->mode == 'R') {
+                    out_val->ival = (int16_t)f->current_record;
+                } else {
+                    out_val->ival = (int16_t)(f->file_pos >> 7);
+                }
+            } else {
+                out_val->ival = 0;
+            }
+            out_val->sval = 0;
+            out_val->fval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* LOF(filenum) - Phase 11 */
+        if (fn == (uint8_t)(TOK_LOF & 0xFF)) {
+            basic_val_t arg;
+            uint8_t fnum;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') p++;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            fnum = (uint8_t)arg.ival;
+            if (fnum >= 1 && fnum <= BASIC_MAX_FILES && s_files[fnum - 1].is_open) {
+                basic_file_t *f = &s_files[fnum - 1];
+                long sz = os_file_size(f->filename);
+                if (sz < 0) sz = (long)f->file_len;
+                if (sz <= 32767L) {
+                    out_val->type = BASIC_TYPE_INT;
+                    out_val->ival = (int16_t)sz;
+                } else {
+                    out_val->type = BASIC_TYPE_FLOAT;
+                    out_val->fval = soft_from_int((int32_t)sz);
+                }
+            } else {
+                out_val->type = BASIC_TYPE_INT;
+                out_val->ival = 0;
             }
             out_val->sval = 0;
             *pos = p;
@@ -2457,7 +3255,7 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             basic_var_t *var = basic_find_var(var_name);
             if (var) {
                 out_val->type = var->type;
-                out_val->ival = var->ival;
+                out_val->ival = (var->type == BASIC_TYPE_STR) ? (int16_t)var->slen : var->ival;
                 out_val->fval = var->fval;
                 out_val->sval = var->sval;
             } else {
@@ -2997,6 +3795,7 @@ static int basic_exec_open(const uint8_t __far *tok, uint16_t *pos) {
     uint8_t mode = 'I';
     char fname[32];
     uint8_t fnum = 1;
+    uint16_t reclen = 128;
     long sz;
 
     p++; /* skip TOK_OPEN */
@@ -3011,7 +3810,7 @@ static int basic_exec_open(const uint8_t __far *tok, uint16_t *pos) {
     while (tok[p] == ' ' || tok[p] == '\t') p++;
 
     if (tok[p] == ',') {
-        /* Syntax 1: OPEN "mode", #n, "filename" */
+        /* Syntax 1: OPEN "mode", #n, "filename" [, reclen] */
         basic_val_t fnum_val, fname_val;
         mode = (uint8_t)basic_toupper(arg1.sval[0]);
         p++; /* skip ',' */
@@ -3035,27 +3834,45 @@ static int basic_exec_open(const uint8_t __far *tok, uint16_t *pos) {
         }
         basic_strncpy(fname, fname_val.sval, sizeof(fname) - 1);
         fname[sizeof(fname) - 1] = '\0';
-    } else if (tok[p] == TOK_FOR) {
-        /* Syntax 2: OPEN "filename" FOR INPUT/OUTPUT/APPEND AS #n */
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            basic_val_t rlen_val;
+            p++;
+            if (basic_eval_expr(tok, &p, &rlen_val) != 0) return -1;
+            reclen = (uint16_t)val_to_int(&rlen_val);
+            if (reclen == 0) reclen = 128;
+            if (reclen > BASIC_MAX_REC_LEN) reclen = BASIC_MAX_REC_LEN;
+        }
+    } else {
+        /* Syntax 2: OPEN "filename" [FOR mode] AS #n [LEN = reclen] */
         basic_val_t fnum_val;
         basic_strncpy(fname, arg1.sval, sizeof(fname) - 1);
         fname[sizeof(fname) - 1] = '\0';
 
-        p++; /* skip TOK_FOR */
-        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == TOK_FOR) {
+            p++; /* skip TOK_FOR */
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
 
-        if (basic_strnicmp_far(&tok[p], "OUTPUT", 6) == 0) {
-            mode = 'O';
-            p += 6;
-        } else if (tok[p] == TOK_INPUT || basic_strnicmp_far(&tok[p], "INPUT", 5) == 0) {
-            mode = 'I';
-            p = (tok[p] == TOK_INPUT) ? (p + 1) : (p + 5);
-        } else if (basic_strnicmp_far(&tok[p], "APPEND", 6) == 0) {
-            mode = 'A';
-            p += 6;
+            if (basic_strnicmp_far(&tok[p], "OUTPUT", 6) == 0) {
+                mode = 'O';
+                p += 6;
+            } else if (tok[p] == TOK_INPUT || basic_strnicmp_far(&tok[p], "INPUT", 5) == 0) {
+                mode = 'I';
+                p = (tok[p] == TOK_INPUT) ? (p + 1) : (p + 5);
+            } else if (basic_strnicmp_far(&tok[p], "APPEND", 6) == 0) {
+                mode = 'A';
+                p += 6;
+            } else if (basic_strnicmp_far(&tok[p], "RANDOM", 6) == 0) {
+                mode = 'R';
+                p += 6;
+            } else {
+                os_puts("Bad file mode in OPEN\n");
+                return -1;
+            }
         } else {
-            os_puts("Bad file mode in OPEN\n");
-            return -1;
+            /* FOR omitted -> defaults to RANDOM mode in GW-BASIC */
+            mode = 'R';
         }
 
         while (tok[p] == ' ' || tok[p] == '\t') p++;
@@ -3067,9 +3884,21 @@ static int basic_exec_open(const uint8_t __far *tok, uint16_t *pos) {
 
         if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
         fnum = (uint8_t)fnum_val.ival;
-    } else {
-        os_puts("Syntax error in OPEN\n");
-        return -1;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if ((tok[p] == 0xFF && tok[p + 1] == (uint8_t)(TOK_LEN & 0xFF)) ||
+            basic_strnicmp_far(&tok[p], "LEN", 3) == 0) {
+            basic_val_t rlen_val;
+            if (tok[p] == 0xFF) p += 2;
+            else p += 3;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '=' || tok[p] == TOK_EQ) p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (basic_eval_expr(tok, &p, &rlen_val) != 0) return -1;
+            reclen = (uint16_t)val_to_int(&rlen_val);
+            if (reclen == 0) reclen = 128;
+            if (reclen > BASIC_MAX_REC_LEN) reclen = BASIC_MAX_REC_LEN;
+        }
     }
 
     if (fnum < 1 || fnum > BASIC_MAX_FILES) {
@@ -3099,6 +3928,18 @@ static int basic_exec_open(const uint8_t __far *tok, uint16_t *pos) {
             sz = os_file_size(f->filename);
             f->file_pos = (sz > 0) ? (uint32_t)sz : 0;
             f->file_len = f->file_pos;
+        } else if (mode == 'R') {
+            sz = os_file_size(f->filename);
+            if (sz < 0) {
+                os_file_write(f->filename, (const void __far *)FP_HERE(""), 0);
+                sz = 0;
+            }
+            f->file_pos = 0;
+            f->file_len = (uint32_t)sz;
+            f->record_len = reclen;
+            f->current_record = 0;
+            f->num_fields = 0;
+            basic_memset(f->rec_buf, ' ', reclen);
         } else {
             sz = os_file_size(f->filename);
             if (sz < 0) {
@@ -3135,6 +3976,7 @@ static int basic_exec_close(const uint8_t __far *tok, uint16_t *pos) {
         fnum = (uint8_t)fnum_val.ival;
         if (fnum >= 1 && fnum <= BASIC_MAX_FILES) {
             s_files[fnum - 1].is_open = 0;
+            s_files[fnum - 1].num_fields = 0;
         }
         while (tok[p] == ' ' || tok[p] == '\t') p++;
         if (tok[p] == ',') {
@@ -3142,6 +3984,312 @@ static int basic_exec_close(const uint8_t __far *tok, uint16_t *pos) {
             continue;
         }
         break;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Phase 11: Random-Access Statements (FIELD, LSET, RSET, PUT, GET)
+ * -------------------------------------------------------------------------- */
+
+static int basic_exec_field(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t fnum_val;
+    uint8_t fnum;
+    uint16_t cur_offset = 0;
+    basic_file_t *f;
+
+    p += 2; /* skip TOK_FIELD (0xFE, 0x82) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == '#') p++;
+
+    if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+    fnum = (uint8_t)fnum_val.ival;
+
+    if (fnum < 1 || fnum > BASIC_MAX_FILES || !s_files[fnum - 1].is_open || s_files[fnum - 1].mode != 'R') {
+        return basic_error(52, "Bad file number\n");
+    }
+    f = &s_files[fnum - 1];
+
+    for (;;) {
+        basic_val_t w_val;
+        uint16_t width;
+        char var_name[BASIC_MAX_VARNAME];
+        basic_var_t *var;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',') {
+            return basic_error(2, "Syntax error in FIELD\n");
+        }
+        p++; /* skip ',' */
+
+        if (basic_eval_expr(tok, &p, &w_val) != 0) return -1;
+        width = (uint16_t)val_to_int(&w_val);
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (basic_strnicmp_far(&tok[p], "AS", 2) != 0) {
+            return basic_error(2, "Syntax error in FIELD (expected AS)\n");
+        }
+        p += 2;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+            return basic_error(2, "Syntax error in FIELD variable name\n");
+        }
+
+        var = basic_get_or_create_var(var_name);
+        if (!var || var->type != BASIC_TYPE_STR) {
+            return basic_error(13, "Type mismatch in FIELD\n");
+        }
+
+        if (f->num_fields < BASIC_MAX_FIELDS) {
+            basic_field_t *fld = &f->fields[f->num_fields++];
+            basic_strncpy(fld->var_name, var_name, sizeof(fld->var_name) - 1);
+            fld->var_name[sizeof(fld->var_name) - 1] = '\0';
+            fld->offset = cur_offset;
+            fld->len = width;
+        }
+
+        if (cur_offset < f->record_len) {
+            uint16_t copylen = width;
+            if (cur_offset + copylen > f->record_len) {
+                copylen = f->record_len - cur_offset;
+            }
+            if (copylen > BASIC_MAX_STR_LEN) copylen = BASIC_MAX_STR_LEN;
+            basic_memcpy(var->sval, &f->rec_buf[cur_offset], copylen);
+            var->sval[copylen] = '\0';
+            var->slen = copylen;
+        }
+
+        cur_offset += width;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            continue;
+        }
+        break;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_lset_rset(const uint8_t __far *tok, uint16_t *pos, int is_rset) {
+    uint16_t p = *pos;
+    char var_name[BASIC_MAX_VARNAME];
+    basic_val_t val;
+    basic_var_t *var;
+    basic_file_t *f_found = 0;
+    basic_field_t *fld_found = 0;
+    uint8_t fi, fli;
+    uint16_t target_len;
+    uint16_t src_len;
+    char formatted[BASIC_MAX_REC_LEN + 1];
+
+    p += 2; /* skip TOK_LSET (0xFE, 0x85) or TOK_RSET (0xFE, 0x86) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+        return basic_error(2, "Syntax error in variable name\n");
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != TOK_EQ && tok[p] != '=') {
+        return basic_error(2, "Syntax error (expected '=')\n");
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &val) != 0) return -1;
+    if (val.type != BASIC_TYPE_STR) {
+        return basic_error(13, "Type mismatch\n");
+    }
+
+    var = basic_get_or_create_var(var_name);
+    if (!var || var->type != BASIC_TYPE_STR) {
+        return basic_error(13, "Type mismatch\n");
+    }
+
+    for (fi = 0; fi < BASIC_MAX_FILES; fi++) {
+        if (s_files[fi].is_open && s_files[fi].mode == 'R') {
+            for (fli = 0; fli < s_files[fi].num_fields; fli++) {
+                if (basic_stricmp(s_files[fi].fields[fli].var_name, var_name) == 0) {
+                    f_found = &s_files[fi];
+                    fld_found = &s_files[fi].fields[fli];
+                    break;
+                }
+            }
+            if (f_found) break;
+        }
+    }
+
+    if (fld_found) {
+        target_len = fld_found->len;
+    } else {
+        target_len = var->slen ? var->slen : basic_strlen(var->sval);
+    }
+    if (target_len > BASIC_MAX_REC_LEN) target_len = BASIC_MAX_REC_LEN;
+
+    src_len = (val.ival > 0) ? (uint16_t)val.ival : (val.sval ? basic_strlen(val.sval) : 0);
+
+    if (!is_rset) {
+        /* LSET: left-justified, padded with spaces on right */
+        uint16_t cpy = (src_len < target_len) ? src_len : target_len;
+        if (cpy > 0 && val.sval) {
+            basic_memcpy(formatted, val.sval, cpy);
+        }
+        if (target_len > cpy) {
+            basic_memset(&formatted[cpy], ' ', target_len - cpy);
+        }
+    } else {
+        /* RSET: right-justified, padded with spaces on left */
+        if (src_len >= target_len) {
+            if (val.sval) {
+                basic_memcpy(formatted, val.sval, target_len);
+            }
+        } else {
+            uint16_t pad = target_len - src_len;
+            basic_memset(formatted, ' ', pad);
+            if (src_len > 0 && val.sval) {
+                basic_memcpy(&formatted[pad], val.sval, src_len);
+            }
+        }
+    }
+    formatted[target_len] = '\0';
+
+    if (f_found && fld_found) {
+        if (fld_found->offset < f_found->record_len) {
+            uint16_t wr = target_len;
+            if (fld_found->offset + wr > f_found->record_len) {
+                wr = f_found->record_len - fld_found->offset;
+            }
+            basic_memcpy(&f_found->rec_buf[fld_found->offset], formatted, wr);
+        }
+    }
+
+    {
+        uint16_t v_copy = target_len;
+        if (v_copy > BASIC_MAX_STR_LEN) v_copy = BASIC_MAX_STR_LEN;
+        basic_memcpy(var->sval, formatted, v_copy);
+        var->sval[v_copy] = '\0';
+        var->slen = v_copy;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_put(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t fnum_val;
+    uint8_t fnum;
+    uint32_t recnum;
+    basic_file_t *f;
+    uint32_t file_offset;
+
+    p += 2; /* skip TOK_PUT (0xFE, 0x88) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == '#') p++;
+
+    if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+    fnum = (uint8_t)fnum_val.ival;
+
+    if (fnum < 1 || fnum > BASIC_MAX_FILES || !s_files[fnum - 1].is_open || s_files[fnum - 1].mode != 'R') {
+        return basic_error(52, "Bad file number\n");
+    }
+    f = &s_files[fnum - 1];
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        basic_val_t r_val;
+        p++;
+        if (basic_eval_expr(tok, &p, &r_val) != 0) return -1;
+        recnum = (uint32_t)val_to_int(&r_val);
+        if (recnum < 1) {
+            return basic_error(63, "Bad record number\n");
+        }
+    } else {
+        recnum = f->current_record + 1;
+        if (recnum == 0) recnum = 1;
+    }
+
+    file_offset = mul16((uint16_t)(recnum - 1), f->record_len);
+    os_file_write_offset(f->filename, (const void __far *)FP_HERE(f->rec_buf), f->record_len, file_offset);
+
+    f->current_record = recnum;
+    {
+        long sz = os_file_size(f->filename);
+        if (sz >= 0) f->file_len = (uint32_t)sz;
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_get(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t fnum_val;
+    uint8_t fnum;
+    uint32_t recnum;
+    basic_file_t *f;
+    uint32_t file_offset;
+    uint16_t rd;
+    uint8_t fli;
+
+    p += 2; /* skip TOK_GET (0xFE, 0x89) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == '#') p++;
+
+    if (basic_eval_expr(tok, &p, &fnum_val) != 0) return -1;
+    fnum = (uint8_t)fnum_val.ival;
+
+    if (fnum < 1 || fnum > BASIC_MAX_FILES || !s_files[fnum - 1].is_open || s_files[fnum - 1].mode != 'R') {
+        return basic_error(52, "Bad file number\n");
+    }
+    f = &s_files[fnum - 1];
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        basic_val_t r_val;
+        p++;
+        if (basic_eval_expr(tok, &p, &r_val) != 0) return -1;
+        recnum = (uint32_t)val_to_int(&r_val);
+        if (recnum < 1) {
+            return basic_error(63, "Bad record number\n");
+        }
+    } else {
+        recnum = f->current_record + 1;
+        if (recnum == 0) recnum = 1;
+    }
+
+    file_offset = mul16((uint16_t)(recnum - 1), f->record_len);
+    basic_memset(f->rec_buf, ' ', f->record_len);
+    rd = os_file_read_offset(f->filename, (void __far *)FP_HERE(f->rec_buf), f->record_len, file_offset);
+
+    f->current_record = recnum;
+    if (rd < f->record_len) {
+        f->eof = 1;
+    } else {
+        f->eof = 0;
+    }
+
+    /* Synchronize all FIELD variables bound to this channel */
+    for (fli = 0; fli < f->num_fields; fli++) {
+        basic_field_t *fld = &f->fields[fli];
+        basic_var_t *var = basic_get_or_create_var(fld->var_name);
+        if (var && var->type == BASIC_TYPE_STR) {
+            uint16_t cpy = fld->len;
+            if (fld->offset < f->record_len) {
+                if (fld->offset + cpy > f->record_len) {
+                    cpy = f->record_len - fld->offset;
+                }
+                if (cpy > BASIC_MAX_STR_LEN) cpy = BASIC_MAX_STR_LEN;
+                basic_memcpy(var->sval, &f->rec_buf[fld->offset], cpy);
+                var->sval[cpy] = '\0';
+                var->slen = cpy;
+            }
+        }
     }
 
     *pos = p;
@@ -3471,11 +4619,17 @@ static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
         if (!var) return -1;
 
         if (var->type == BASIC_TYPE_STR) {
+            uint16_t slen;
             if (val.type != BASIC_TYPE_STR) {
                 return basic_error(13, "Type mismatch\n");
             }
-            basic_strncpy(var->sval, val.sval ? val.sval : "", sizeof(var->sval) - 1);
-            var->sval[sizeof(var->sval) - 1] = '\0';
+            slen = (val.ival > 0) ? (uint16_t)val.ival : (val.sval ? basic_strlen(val.sval) : 0);
+            if (slen > BASIC_MAX_STR_LEN) slen = BASIC_MAX_STR_LEN;
+            if (val.sval && slen > 0) {
+                basic_memcpy(var->sval, val.sval, slen);
+            }
+            var->sval[slen] = '\0';
+            var->slen = slen;
         } else if (var->type == BASIC_TYPE_INT) {
             if (val.type == BASIC_TYPE_STR) {
                 return basic_error(13, "Type mismatch\n");
@@ -6235,6 +7389,442 @@ static int basic_exec_error_stmt(const uint8_t __far *tok, uint16_t *pos) {
     return basic_error((uint8_t)code, 0);
 }
 
+static int basic_exec_kill(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t f_val;
+    char fname[32];
+    p += 2; /* skip 0xFE, TOK_KILL */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_eval_expr(tok, &p, &f_val) != 0) return -1;
+    if (f_val.type != BASIC_TYPE_STR || !f_val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    basic_strncpy(fname, f_val.sval, sizeof(fname) - 1);
+    fname[sizeof(fname) - 1] = '\0';
+    if (os_file_delete(fname) != 0) {
+        return basic_error(53, "File not found\n");
+    }
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_name(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t old_val, new_val;
+    char old_name[32];
+    char new_name[32];
+    p += 2; /* skip 0xFE, TOK_NAME */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_eval_expr(tok, &p, &old_val) != 0) return -1;
+    if (old_val.type != BASIC_TYPE_STR || !old_val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    basic_strncpy(old_name, old_val.sval, sizeof(old_name) - 1);
+    old_name[sizeof(old_name) - 1] = '\0';
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_strnicmp_far(&tok[p], "AS", 2) == 0) {
+        p += 2;
+    } else {
+        return basic_error(2, "Syntax error in NAME (expected AS)\n");
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_eval_expr(tok, &p, &new_val) != 0) return -1;
+    if (new_val.type != BASIC_TYPE_STR || !new_val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    basic_strncpy(new_name, new_val.sval, sizeof(new_name) - 1);
+    new_name[sizeof(new_name) - 1] = '\0';
+
+    if (os_file_rename(old_name, (const char __far *)FP_HERE(new_name)) != 0) {
+        return basic_error(53, "File not found\n");
+    }
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_chdir(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t d_val;
+    char dname[64];
+    p += 2; /* skip 0xFE, TOK_CHDIR */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_eval_expr(tok, &p, &d_val) != 0) return -1;
+    if (d_val.type != BASIC_TYPE_STR || !d_val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    basic_strncpy(dname, d_val.sval, sizeof(dname) - 1);
+    dname[sizeof(dname) - 1] = '\0';
+    if (os_chdir(dname) != 0) {
+        return basic_error(76, "Path not found\n");
+    }
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_mkdir(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t d_val;
+    char dname[64];
+    p += 2; /* skip 0xFE, TOK_MKDIR */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_eval_expr(tok, &p, &d_val) != 0) return -1;
+    if (d_val.type != BASIC_TYPE_STR || !d_val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    basic_strncpy(dname, d_val.sval, sizeof(dname) - 1);
+    dname[sizeof(dname) - 1] = '\0';
+    if (os_mkdir(dname) != 0) {
+        return basic_error(76, "Path not found\n");
+    }
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_rmdir(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t d_val;
+    char dname[64];
+    p += 2; /* skip 0xFE, TOK_RMDIR */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_eval_expr(tok, &p, &d_val) != 0) return -1;
+    if (d_val.type != BASIC_TYPE_STR || !d_val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    basic_strncpy(dname, d_val.sval, sizeof(dname) - 1);
+    dname[sizeof(dname) - 1] = '\0';
+    if (os_rmdir(dname) != 0) {
+        return basic_error(76, "Path not found\n");
+    }
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_shell(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p += 2; /* skip 0xFE, TOK_SHELL */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == 0x00 || tok[p] == ':' || tok[p] == TOK_ELSE) {
+        os_exec("shell.exe", "");
+    } else {
+        basic_val_t c_val;
+        char cmd[64];
+        char prog[32];
+        const char *args = "";
+        int cp = 0, pp = 0;
+        if (basic_eval_expr(tok, &p, &c_val) != 0) return -1;
+        if (c_val.type != BASIC_TYPE_STR || !c_val.sval) {
+            return basic_error(13, "Type mismatch\n");
+        }
+        basic_strncpy(cmd, c_val.sval, sizeof(cmd) - 1);
+        cmd[sizeof(cmd) - 1] = '\0';
+
+        while (cmd[cp] == ' ' || cmd[cp] == '\t') cp++;
+        while (cmd[cp] != '\0' && cmd[cp] != ' ' && cmd[cp] != '\t' && pp < sizeof(prog) - 1) {
+            prog[pp++] = cmd[cp++];
+        }
+        prog[pp] = '\0';
+        while (cmd[cp] == ' ' || cmd[cp] == '\t') cp++;
+        args = &cmd[cp];
+
+        if (pp > 0) {
+            if (os_exec(prog, args) < 0) {
+                os_puts("Bad command or file name\n");
+            }
+        }
+    }
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_bsave(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t f_val, off_val, len_val;
+    char fname[32];
+    uint16_t offset;
+    uint16_t length;
+    uint8_t hdr[7];
+    uint16_t written;
+
+    p++; /* skip TOK_BSAVE (0xC2) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &f_val) != 0) return -1;
+    if (f_val.type != BASIC_TYPE_STR || !f_val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    basic_strncpy(fname, f_val.sval, sizeof(fname) - 1);
+    fname[sizeof(fname) - 1] = '\0';
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        return basic_error(2, "Syntax error in BSAVE (expected ',')\n");
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &off_val) != 0) return -1;
+    offset = (uint16_t)val_to_int(&off_val);
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        return basic_error(2, "Syntax error in BSAVE (expected ',')\n");
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &len_val) != 0) return -1;
+    length = (uint16_t)val_to_int(&len_val);
+
+    hdr[0] = 0xFD;
+    hdr[1] = (uint8_t)(s_def_seg & 0xFF);
+    hdr[2] = (uint8_t)(s_def_seg >> 8);
+    hdr[3] = (uint8_t)(offset & 0xFF);
+    hdr[4] = (uint8_t)(offset >> 8);
+    hdr[5] = (uint8_t)(length & 0xFF);
+    hdr[6] = (uint8_t)(length >> 8);
+
+    written = os_file_write(fname, FP_HERE(hdr), 7);
+    if (written < 7) {
+        return basic_error(54, "Bad file mode\n");
+    }
+
+    if (length > 0) {
+        written = os_file_append(fname, (const void __far *)MK_FP(s_def_seg, offset), length);
+        if (written < length) {
+            return basic_error(54, "Bad file mode\n");
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_bload(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t f_val;
+    char fname[32];
+    uint16_t target_offset = 0;
+    int has_offset_override = 0;
+    uint8_t hdr[7];
+    uint16_t file_off, file_len;
+    uint16_t nread;
+
+    p++; /* skip TOK_BLOAD (0xC3) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &f_val) != 0) return -1;
+    if (f_val.type != BASIC_TYPE_STR || !f_val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    basic_strncpy(fname, f_val.sval, sizeof(fname) - 1);
+    fname[sizeof(fname) - 1] = '\0';
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        basic_val_t off_val;
+        p++;
+        if (basic_eval_expr(tok, &p, &off_val) != 0) return -1;
+        target_offset = (uint16_t)val_to_int(&off_val);
+        has_offset_override = 1;
+    }
+
+    nread = os_file_read_offset(fname, FP_HERE(hdr), 7, 0);
+    if (nread < 7 || hdr[0] != 0xFD) {
+        return basic_error(54, "Bad file mode\n");
+    }
+
+    file_off = (uint16_t)hdr[3] | ((uint16_t)hdr[4] << 8);
+    file_len = (uint16_t)hdr[5] | ((uint16_t)hdr[6] << 8);
+
+    if (!has_offset_override) {
+        target_offset = file_off;
+    }
+
+    if (file_len > 0) {
+        nread = os_file_read_offset(fname, (void __far *)MK_FP(s_def_seg, target_offset), file_len, 7);
+        if (nread < file_len) {
+            return basic_error(54, "Bad file mode\n");
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_width(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t w_val;
+    int16_t cols;
+
+    p++; /* skip TOK_WIDTH (0xA0) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &w_val) != 0) return -1;
+    cols = val_to_int(&w_val);
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        basic_val_t r_val;
+        p++;
+        if (basic_eval_expr(tok, &p, &r_val) != 0) return -1;
+    }
+
+    if (cols == 40) {
+        os_gfx_set_mode(0x01);
+        s_screen_mode = 0;
+        os_cls(s_text_attr ? s_text_attr : 0x07);
+        os_set_cursor(0, 0);
+    } else if (cols == 80) {
+        os_gfx_set_mode(0x03);
+        s_screen_mode = 0;
+        os_cls(s_text_attr ? s_text_attr : 0x07);
+        os_set_cursor(0, 0);
+    } else {
+        return basic_error(5, "Illegal function call\n");
+    }
+
+    if (s_key_visible) {
+        basic_display_softkeys();
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_date_stmt(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t val;
+    p += 2; /* skip 0xFE, TOK_DATE */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != TOK_EQ && tok[p] != '=') {
+        return basic_error(2, "Syntax error in DATE$ (expected '=')\n");
+    }
+    p++;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_eval_expr(tok, &p, &val) != 0) return -1;
+    if (val.type != BASIC_TYPE_STR || !val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    if (basic_set_date_str(val.sval) != 0) return -1;
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_time_stmt(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t val;
+    p += 2; /* skip 0xFE, TOK_TIME */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != TOK_EQ && tok[p] != '=') {
+        return basic_error(2, "Syntax error in TIME$ (expected '=')\n");
+    }
+    p++;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_eval_expr(tok, &p, &val) != 0) return -1;
+    if (val.type != BASIC_TYPE_STR || !val.sval) {
+        return basic_error(13, "Type mismatch\n");
+    }
+    if (basic_set_time_str(val.sval) != 0) return -1;
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_renum(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    uint16_t new_start = 10;
+    uint16_t old_start = 0;
+    uint16_t step = 10;
+
+    p++; /* skip TOK_RENUM (0xAB) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (basic_is_digit((char)tok[p])) {
+        new_start = basic_parse_uint_far(tok, &p);
+    }
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (basic_is_digit((char)tok[p])) {
+            old_start = basic_parse_uint_far(tok, &p);
+        }
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (basic_is_digit((char)tok[p])) {
+                step = basic_parse_uint_far(tok, &p);
+            }
+        }
+    }
+
+    *pos = p;
+    return basic_cmd_renum(new_start, old_start, step);
+}
+
+static int basic_exec_delete(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    uint16_t start = 0;
+    uint16_t end = 65535;
+
+    p++; /* skip TOK_DELETE (0xA9) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == '-' || tok[p] == TOK_MINUS) {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (basic_is_digit((char)tok[p])) {
+            end = basic_parse_uint_far(tok, &p);
+        } else {
+            return basic_error(2, "Syntax error in DELETE\n");
+        }
+    } else if (basic_is_digit((char)tok[p])) {
+        start = basic_parse_uint_far(tok, &p);
+        end = start;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == '-' || tok[p] == TOK_MINUS) {
+            p++;
+            end = 65535;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (basic_is_digit((char)tok[p])) {
+                end = basic_parse_uint_far(tok, &p);
+            }
+        }
+    } else {
+        return basic_error(2, "Syntax error in DELETE\n");
+    }
+
+    *pos = p;
+    return basic_cmd_delete(start, end);
+}
+
+static int basic_exec_auto(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    uint16_t start = 10;
+    uint16_t step = 10;
+
+    p++; /* skip TOK_AUTO (0xAA) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_is_digit((char)tok[p])) {
+        start = basic_parse_uint_far(tok, &p);
+    }
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (basic_is_digit((char)tok[p])) {
+            step = basic_parse_uint_far(tok, &p);
+        }
+    }
+
+    s_auto_line = start;
+    s_auto_step = (step > 0) ? step : 10;
+    s_auto_mode = 1;
+    *pos = p;
+    return 0;
+}
+
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     uint16_t p = *pos;
 
@@ -6280,6 +7870,118 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == 0xFE && tok[p + 1] == (uint8_t)(TOK_TIMER & 0xFF)) {
         *pos = p;
         return basic_exec_timer(tok, pos);
+    }
+
+    /* TRON statement */
+    if (tok[p] == TOK_TRON) {
+        p++;
+        s_tron = 1;
+        *pos = p;
+        return 0;
+    }
+
+    /* TROFF statement */
+    if (tok[p] == TOK_TROFF) {
+        p++;
+        s_tron = 0;
+        *pos = p;
+        return 0;
+    }
+
+    /* CONT statement */
+    if (tok[p] == TOK_CONT) {
+        p++;
+        *pos = p;
+        return basic_cmd_cont();
+    }
+
+    /* DELETE statement */
+    if (tok[p] == TOK_DELETE) {
+        *pos = p;
+        return basic_exec_delete(tok, pos);
+    }
+
+    /* AUTO statement */
+    if (tok[p] == TOK_AUTO) {
+        *pos = p;
+        return basic_exec_auto(tok, pos);
+    }
+
+    /* RENUM statement */
+    if (tok[p] == TOK_RENUM) {
+        *pos = p;
+        return basic_exec_renum(tok, pos);
+    }
+
+    /* WIDTH statement */
+    if (tok[p] == TOK_WIDTH) {
+        *pos = p;
+        return basic_exec_width(tok, pos);
+    }
+
+    /* BSAVE statement */
+    if (tok[p] == TOK_BSAVE) {
+        *pos = p;
+        return basic_exec_bsave(tok, pos);
+    }
+
+    /* BLOAD statement */
+    if (tok[p] == TOK_BLOAD) {
+        *pos = p;
+        return basic_exec_bload(tok, pos);
+    }
+
+    /* Multi-byte 0xFE statements */
+    if (tok[p] == 0xFE) {
+        uint8_t fn = tok[p + 1];
+
+        /* KILL statement (0xFE87) */
+        if (fn == (uint8_t)(TOK_KILL & 0xFF)) {
+            *pos = p;
+            return basic_exec_kill(tok, pos);
+        }
+
+        /* NAME statement (0xFE84) */
+        if (fn == (uint8_t)(TOK_NAME & 0xFF)) {
+            *pos = p;
+            return basic_exec_name(tok, pos);
+        }
+
+        /* CHDIR statement (0xFE97) */
+        if (fn == (uint8_t)(TOK_CHDIR & 0xFF)) {
+            *pos = p;
+            return basic_exec_chdir(tok, pos);
+        }
+
+        /* MKDIR statement (0xFE98) */
+        if (fn == (uint8_t)(TOK_MKDIR & 0xFF)) {
+            *pos = p;
+            return basic_exec_mkdir(tok, pos);
+        }
+
+        /* RMDIR statement (0xFE99) */
+        if (fn == (uint8_t)(TOK_RMDIR & 0xFF)) {
+            *pos = p;
+            return basic_exec_rmdir(tok, pos);
+        }
+
+        /* SHELL statement (0xFE9A) */
+        if (fn == (uint8_t)(TOK_SHELL & 0xFF)) {
+            *pos = p;
+            return basic_exec_shell(tok, pos);
+        }
+
+        /* DATE$ = expr$ (0xFE8D) */
+        if (fn == (uint8_t)(TOK_DATE & 0xFF)) {
+            *pos = p;
+            return basic_exec_date_stmt(tok, pos);
+        }
+
+        /* TIME$ = expr$ (0xFE8E) */
+        if (fn == (uint8_t)(TOK_TIME & 0xFF)) {
+            *pos = p;
+            return basic_exec_time_stmt(tok, pos);
+        }
     }
 
     /* MID$(var$, start [, len]) = expr$ statement */
@@ -6329,6 +8031,40 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                     basic_file_write_data(fnum, "              ", 14);
                     newline = 0;
                     p++;
+                } else if (tok[p] == TOK_TAB) {
+                    basic_val_t t_val;
+                    int16_t target_col;
+                    int16_t cur_col;
+                    p++;
+                    while (tok[p] == ' ' || tok[p] == '\t') p++;
+                    if (basic_eval_expr(tok, &p, &t_val) != 0) return -1;
+                    while (tok[p] == ' ' || tok[p] == '\t') p++;
+                    if (tok[p] == ')') p++;
+                    target_col = val_to_int(&t_val);
+                    if (target_col < 1) target_col = 1;
+                    cur_col = (int16_t)(((uint16_t)s_files[fnum - 1].file_pos % 80U) + 1);
+                    if (target_col < cur_col) {
+                        basic_file_write_data(fnum, "\r\n", 2);
+                        cur_col = 1;
+                    }
+                    while (cur_col < target_col) {
+                        basic_file_write_data(fnum, " ", 1);
+                        cur_col++;
+                    }
+                    newline = 0;
+                } else if (tok[p] == TOK_SPC) {
+                    basic_val_t s_val;
+                    int16_t count, k;
+                    p++;
+                    while (tok[p] == ' ' || tok[p] == '\t') p++;
+                    if (basic_eval_expr(tok, &p, &s_val) != 0) return -1;
+                    while (tok[p] == ' ' || tok[p] == '\t') p++;
+                    if (tok[p] == ')') p++;
+                    count = val_to_int(&s_val);
+                    for (k = 0; k < count; k++) {
+                        basic_file_write_data(fnum, " ", 1);
+                    }
+                    newline = 0;
                 } else {
                     if (basic_eval_expr(tok, &p, &val) != 0) return -1;
                     if (val.type == BASIC_TYPE_STR) {
@@ -6406,6 +8142,42 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                 }
                 newline = 0;
                 p++;
+            } else if (tok[p] == TOK_TAB) {
+                basic_val_t t_val;
+                int16_t target_col;
+                uint8_t cur_col;
+                uint8_t max_cols = (s_screen_mode == 1) ? 40 : 80;
+                p++;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (basic_eval_expr(tok, &p, &t_val) != 0) return -1;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] == ')') p++;
+                target_col = val_to_int(&t_val);
+                if (target_col < 1) target_col = 1;
+                if (target_col > (int16_t)max_cols) target_col = (int16_t)(((target_col - 1) % max_cols) + 1);
+                cur_col = (s_screen_mode == 0) ? (uint8_t)((os_get_cursor() & 0xFF) + 1) : (uint8_t)(s_gfx_col + 1);
+                if (target_col < (int16_t)cur_col) {
+                    basic_term_putc('\n');
+                    cur_col = 1;
+                }
+                while ((int16_t)cur_col < target_col) {
+                    basic_term_putc(' ');
+                    cur_col++;
+                }
+                newline = 0;
+            } else if (tok[p] == TOK_SPC) {
+                basic_val_t s_val;
+                int16_t count, k;
+                p++;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (basic_eval_expr(tok, &p, &s_val) != 0) return -1;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] == ')') p++;
+                count = val_to_int(&s_val);
+                for (k = 0; k < count; k++) {
+                    basic_term_putc(' ');
+                }
+                newline = 0;
             } else {
                 basic_val_t val;
                 if (basic_eval_expr(tok, &p, &val) != 0) {
@@ -6565,6 +8337,10 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
             s_screen_mode = 0;
         }
         basic_close_all_files();
+        if (s_basic_seg) {
+            os_mem_free(s_basic_seg);
+            s_basic_seg = 0;
+        }
         s_running = 0;
         os_exit(0);
         return 0;
@@ -6593,6 +8369,36 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == TOK_CLOSE) {
         *pos = p;
         return basic_exec_close(tok, pos);
+    }
+
+    /* FIELD statement (2-byte token 0xFE, 0x82) - Phase 11 */
+    if (tok[p] == (uint8_t)(TOK_FIELD >> 8) && tok[p + 1] == (uint8_t)(TOK_FIELD & 0xFF)) {
+        *pos = p;
+        return basic_exec_field(tok, pos);
+    }
+
+    /* LSET statement (2-byte token 0xFE, 0x85) - Phase 11 */
+    if (tok[p] == (uint8_t)(TOK_LSET >> 8) && tok[p + 1] == (uint8_t)(TOK_LSET & 0xFF)) {
+        *pos = p;
+        return basic_exec_lset_rset(tok, pos, 0);
+    }
+
+    /* RSET statement (2-byte token 0xFE, 0x86) - Phase 11 */
+    if (tok[p] == (uint8_t)(TOK_RSET >> 8) && tok[p + 1] == (uint8_t)(TOK_RSET & 0xFF)) {
+        *pos = p;
+        return basic_exec_lset_rset(tok, pos, 1);
+    }
+
+    /* PUT statement (2-byte token 0xFE, 0x88) - Phase 11 */
+    if (tok[p] == (uint8_t)(TOK_PUT >> 8) && tok[p + 1] == (uint8_t)(TOK_PUT & 0xFF)) {
+        *pos = p;
+        return basic_exec_put(tok, pos);
+    }
+
+    /* GET statement (2-byte token 0xFE, 0x89) - Phase 11 */
+    if (tok[p] == (uint8_t)(TOK_GET >> 8) && tok[p + 1] == (uint8_t)(TOK_GET & 0xFF)) {
+        *pos = p;
+        return basic_exec_get(tok, pos);
     }
 
     /* SAVE statement */
@@ -6746,9 +8552,24 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return 0;
     }
 
-    /* END / STOP statement */
-    if (tok[p] == TOK_END || tok[p] == TOK_STOP) {
+    /* STOP statement */
+    if (tok[p] == TOK_STOP) {
         s_running = 0;
+        s_cont_line_off = s_cur_line_off;
+        s_cont_stmt_pos = s_cur_next_stmt;
+        s_can_cont = 1;
+        while (tok[p] != 0x00) p++;
+        *pos = p;
+        os_puts("Break in ");
+        basic_print_uint(s_cur_line_num);
+        os_putc('\n');
+        return 0;
+    }
+
+    /* END statement */
+    if (tok[p] == TOK_END) {
+        s_running = 0;
+        s_can_cont = 0;
         while (tok[p] != 0x00) p++;
         *pos = p;
         return 0;
@@ -6814,50 +8635,8 @@ static void basic_scan_stmt_boundary(const uint8_t __far *line_tok, uint16_t cur
     *out_next_stmt = 4;
 }
 
-static void basic_cmd_run(void) {
+static void basic_run_from_pc(void) {
     uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
-
-    basic_clear_vars();
-    basic_close_all_files();
-    s_gosub_sp = 0;
-    s_for_sp = 0;
-    s_while_sp = 0;
-    s_num_arrays = 0;
-    s_array_heap_start = (s_prog_tail + 15) & ~15;
-    s_array_heap_free  = s_array_heap_start;
-    s_data_line_off = s_prog_head;
-    s_data_stmt_pos = 0;
-    s_last_x = 0;
-    s_last_y = 0;
-    s_gfx_row = 0;
-    s_gfx_col = 0;
-    s_error_goto_line = 0;
-    s_err = 0;
-    s_erl = 0;
-    s_in_error_handler = 0;
-    s_err_reported = 0;
-    s_timer_state = 0;
-    s_timer_pending = 0;
-    s_timer_in_handler = 0;
-    s_timer_interval = 0;
-    s_timer_line = 0;
-    {
-        int k;
-        for (k = 1; k <= 14; k++) {
-            s_key_trap[k].line = 0;
-            s_key_trap[k].state = 0;
-            s_key_trap[k].pending = 0;
-            s_key_trap[k].in_handler = 0;
-        }
-    }
-    s_key_fifo_head = 0;
-    s_key_fifo_count = 0;
-    s_break_pending = 0;
-    basic_init_fkeys();
-    s_err_reported = 0;
-    s_running = 1;
-    s_pc_line = s_prog_head;
-    s_pc_stmt = 4;
 
     while (s_pc_line != 0 && s_running) {
         uint16_t next_line = (uint16_t)mem[s_pc_line] | ((uint16_t)mem[s_pc_line + 1] << 8);
@@ -6873,6 +8652,9 @@ static void basic_cmd_run(void) {
                 os_gfx_set_mode(0x03);
                 s_screen_mode = 0;
             }
+            s_cont_line_off = s_cur_line_off;
+            s_cont_stmt_pos = s_pc_stmt;
+            s_can_cont = 1;
             os_puts("\nBreak in ");
             basic_print_uint(num);
             os_putc('\n');
@@ -6881,6 +8663,12 @@ static void basic_cmd_run(void) {
         }
 
         s_jumped = 0;
+
+        if (s_tron && s_pc_stmt == 4) {
+            os_putc('[');
+            basic_print_uint(num);
+            os_putc(']');
+        }
 
         while (mem[s_cur_line_off + s_pc_stmt] != 0x00 && s_running && !s_jumped) {
             uint16_t pos = s_pc_stmt;
@@ -6936,6 +8724,70 @@ static void basic_cmd_run(void) {
     }
 
     s_running = 0;
+    if (s_pc_line == 0) {
+        s_can_cont = 0;
+    }
+}
+
+static int basic_cmd_cont(void) {
+    if (!s_can_cont || s_cont_line_off == 0) {
+        return basic_error(17, "Can't continue\n");
+    }
+    s_running = 1;
+    s_pc_line = s_cont_line_off;
+    s_pc_stmt = s_cont_stmt_pos;
+    basic_run_from_pc();
+    return 0;
+}
+
+static void basic_cmd_run(void) {
+    basic_clear_vars();
+    basic_close_all_files();
+    s_gosub_sp = 0;
+    s_for_sp = 0;
+    s_while_sp = 0;
+    s_num_arrays = 0;
+    s_array_heap_start = (s_prog_tail + 15) & ~15;
+    s_array_heap_free  = s_array_heap_start;
+    s_data_line_off = s_prog_head;
+    s_data_stmt_pos = 0;
+    s_last_x = 0;
+    s_last_y = 0;
+    s_gfx_row = 0;
+    s_gfx_col = 0;
+    s_error_goto_line = 0;
+    s_err = 0;
+    s_erl = 0;
+    s_in_error_handler = 0;
+    s_err_reported = 0;
+    s_timer_state = 0;
+    s_timer_pending = 0;
+    s_timer_in_handler = 0;
+    s_timer_interval = 0;
+    s_timer_line = 0;
+    {
+        int k;
+        for (k = 1; k <= 14; k++) {
+            s_key_trap[k].line = 0;
+            s_key_trap[k].state = 0;
+            s_key_trap[k].pending = 0;
+            s_key_trap[k].in_handler = 0;
+        }
+    }
+    s_key_fifo_head = 0;
+    s_key_fifo_count = 0;
+    s_break_pending = 0;
+    s_can_cont = 0;
+    s_auto_mode = 0;
+    s_cont_line_off = 0;
+    s_cont_stmt_pos = 4;
+    basic_init_fkeys();
+    s_err_reported = 0;
+    s_running = 1;
+    s_pc_line = s_prog_head;
+    s_pc_stmt = 4;
+
+    basic_run_from_pc();
 }
 
 /* --------------------------------------------------------------------------
@@ -7047,6 +8899,45 @@ static void basic_process_input(char *line) {
             return;
         }
 
+        if (tok_buf[0] == TOK_CONT) {
+            basic_cmd_cont();
+            os_puts(BASIC_PROMPT);
+            return;
+        }
+
+        if (tok_buf[0] == TOK_AUTO) {
+            uint16_t ap = 0;
+            basic_exec_auto((const uint8_t __far *)FP_HERE(tok_buf), &ap);
+            if (!s_auto_mode) os_puts(BASIC_PROMPT);
+            return;
+        }
+
+        if (tok_buf[0] == TOK_RENUM) {
+            uint16_t rp = 0;
+            basic_exec_renum((const uint8_t __far *)FP_HERE(tok_buf), &rp);
+            os_puts(BASIC_PROMPT);
+            return;
+        }
+
+        if (tok_buf[0] == TOK_DELETE) {
+            uint16_t dp = 0;
+            basic_exec_delete((const uint8_t __far *)FP_HERE(tok_buf), &dp);
+            os_puts(BASIC_PROMPT);
+            return;
+        }
+
+        if (tok_buf[0] == TOK_TRON) {
+            s_tron = 1;
+            os_puts(BASIC_PROMPT);
+            return;
+        }
+
+        if (tok_buf[0] == TOK_TROFF) {
+            s_tron = 0;
+            os_puts(BASIC_PROMPT);
+            return;
+        }
+
         if (tok_buf[0] == (uint8_t)(TOK_SYSTEM >> 8) && tok_buf[1] == (uint8_t)(TOK_SYSTEM & 0xFF)) {
             basic_sound_tone(0, 0);
             if (s_screen_mode != 0) {
@@ -7054,6 +8945,10 @@ static void basic_process_input(char *line) {
                 s_screen_mode = 0;
             }
             basic_close_all_files();
+            if (s_basic_seg) {
+                os_mem_free(s_basic_seg);
+                s_basic_seg = 0;
+            }
             s_running = 0;
             os_exit(0);
             return;
@@ -7141,11 +9036,67 @@ int app_main(void) {
     os_puts(BASIC_PROMPT);
 
     for (;;) {
-        uint16_t len = basic_read_line(line_buf, sizeof(line_buf));
-        if (len > 0) {
-            basic_process_input(line_buf);
-        } else {
+        uint16_t len;
+        if (s_auto_mode) {
+            char pbuf[16];
+            int pp = 0;
+            uint16_t v = s_auto_line;
+            char tmp[8];
+            int tp = 0;
+            if (basic_find_line(s_auto_line) != 0) {
+                pbuf[pp++] = '*';
+            }
+            if (v == 0) pbuf[pp++] = '0';
+            else {
+                while (v > 0) { tmp[tp++] = (char)('0' + (v % 10)); v /= 10; }
+                while (tp > 0) pbuf[pp++] = tmp[--tp];
+            }
+            pbuf[pp++] = ' ';
+            pbuf[pp] = '\0';
+            os_puts(pbuf);
+        }
+        len = basic_read_line(line_buf, sizeof(line_buf));
+        if (s_break_pending) {
+            s_break_pending = 0;
+            s_auto_mode = 0;
             os_puts(BASIC_PROMPT);
+            continue;
+        }
+        if (len > 0) {
+            if (s_auto_mode) {
+                uint16_t sp = 0;
+                while (line_buf[sp] == ' ' || line_buf[sp] == '\t') sp++;
+                if (basic_is_digit(line_buf[sp])) {
+                    basic_process_input(line_buf);
+                } else {
+                    char combined[BASIC_MAX_LINE_LEN];
+                    char num_str[8];
+                    int np = 0;
+                    uint16_t v = s_auto_line;
+                    char tmp[8];
+                    int tp = 0;
+                    if (v == 0) num_str[np++] = '0';
+                    else {
+                        while (v > 0) { tmp[tp++] = (char)('0' + (v % 10)); v /= 10; }
+                        while (tp > 0) num_str[np++] = tmp[--tp];
+                    }
+                    num_str[np++] = ' ';
+                    num_str[np] = '\0';
+                    basic_strncpy(combined, num_str, sizeof(combined) - 1);
+                    basic_strncpy(combined + np, line_buf, sizeof(combined) - 1 - np);
+                    basic_process_input(combined);
+                    s_auto_line += s_auto_step;
+                }
+            } else {
+                basic_process_input(line_buf);
+            }
+        } else {
+            if (s_auto_mode) {
+                s_auto_mode = 0;
+                os_puts(BASIC_PROMPT);
+            } else {
+                os_puts(BASIC_PROMPT);
+            }
         }
     }
 

@@ -2061,6 +2061,183 @@ int32_t fat16_write_file(const char __far *filename, const void __far *src, uint
     return (int32_t)size;
 }
 
+int32_t fat16_write_file_offset(const char __far *filename, const void __far *src, uint16_t size, uint32_t offset) {
+    os_volume_t *vol;
+    const char __far *subpath;
+    uint16_t parent_clus;
+    uint8_t name83[11];
+    fat16_dirent_t entry;
+    uint32_t dir_sec_lba = 0;
+    uint16_t dir_idx     = 0;
+    int is_new_file      = 0;
+    uint16_t first_clus  = 0;
+    uint16_t curr_clus   = 0;
+    uint16_t search_hint = 2;
+    uint16_t cluster_bytes;
+    uint16_t cluster_mask;
+    uint32_t target_end;
+    uint32_t cur_pos;
+    uint16_t written = 0;
+    const uint8_t __far *in_ptr = (const uint8_t __far *)src;
+    fat16_dirent_t *entries = (fat16_dirent_t *)io_buf;
+
+    if (vol_resolve_path(filename, &vol, &subpath) != 0) {
+        return -1;
+    }
+    vol = resolve_vol_alias(vol);
+    if (!vol || !vol->active) {
+        return -1;
+    }
+    if (vol_ensure_mounted(vol) != 0) {
+        return -3;
+    }
+    if (resolve_parent_and_leaf(vol, subpath, &parent_clus, name83, (uint8_t)(filename != subpath)) != 0) {
+        return -1;
+    }
+    if (name83[0] == '.') {
+        return -1;
+    }
+
+    if (find_dir_entry(vol, parent_clus, name83, &entry, &dir_sec_lba, &dir_idx) == 0) {
+        if (entry.attr & FAT_ATTR_DIRECTORY) {
+            return -1;
+        }
+        first_clus = entry.fst_clus_lo;
+    } else {
+        if (find_free_dir_slot(vol, parent_clus, &dir_sec_lba, &dir_idx) != 0) {
+            return -1;
+        }
+        is_new_file = 1;
+        first_clus = 0;
+        entry.file_size = 0;
+    }
+
+    if (size == 0) {
+        if (is_new_file) {
+            if (vol_rw_lba(vol, 0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+                return -1;
+            }
+            fill_dirent_meta(&entries[dir_idx], name83, FAT_ATTR_ARCHIVE, 0, 0);
+            if (vol_rw_lba(vol, 1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
+
+    cluster_bytes = (uint16_t)vol->sectors_per_cluster << 9;
+    cluster_mask  = cluster_bytes - 1;
+    target_end    = offset + (uint32_t)size;
+
+    /* If file has no clusters yet, allocate the first one */
+    if (first_clus < 2) {
+        first_clus = alloc_free_cluster(vol, search_hint);
+        if (first_clus == 0) return -1;
+        search_hint = first_clus + 1;
+        if (zero_cluster_sectors(vol, first_clus) != 0) return -1;
+    }
+
+    curr_clus = first_clus;
+    cur_pos   = 0;
+
+    /* Advance / allocate clusters until cur_pos reaches offset's cluster */
+    while (cur_pos + (uint32_t)cluster_bytes <= offset) {
+        uint16_t next = fat_get_cluster(vol, curr_clus);
+        if (next < 2 || is_eof_cluster(vol, next)) {
+            uint16_t new_c = alloc_free_cluster(vol, search_hint);
+            if (new_c == 0) return -1;
+            search_hint = new_c + 1;
+            if (zero_cluster_sectors(vol, new_c) != 0) return -1;
+            if (fat_set_cluster(vol, curr_clus, new_c) != 0) return -1;
+            curr_clus = new_c;
+        } else {
+            curr_clus = next;
+        }
+        cur_pos += (uint32_t)cluster_bytes;
+    }
+
+    /* Now curr_clus is the cluster corresponding to offset */
+    while (written < size) {
+        uint32_t cur_file_pos = offset + (uint32_t)written;
+        uint16_t off_in_clus  = (uint16_t)(cur_file_pos & (uint32_t)cluster_mask);
+        uint32_t first_lba    = cluster_to_lba(vol, curr_clus);
+        uint8_t  s            = (uint8_t)(off_in_clus >> 9);
+        uint16_t sec_off      = off_in_clus & 511;
+
+        for (; s < vol->sectors_per_cluster && written < size; s++) {
+            uint16_t avail_in_sec = 512 - sec_off;
+            uint16_t chunk = size - written;
+            uint32_t sec_lba = first_lba + s;
+            uint16_t j;
+
+            if (chunk > avail_in_sec) {
+                chunk = avail_in_sec;
+            }
+
+            if (chunk < 512) {
+                /* Partial sector: read-modify-write */
+                if (vol_rw_lba(vol, 0, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+                    return -1;
+                }
+                for (j = 0; j < chunk; j++) {
+                    io_buf[sec_off + j] = in_ptr[written + j];
+                }
+                if (vol_rw_lba(vol, 1, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+                    return -1;
+                }
+            } else {
+                /* Full sector: write directly */
+                for (j = 0; j < 512; j++) {
+                    io_buf[j] = in_ptr[written + j];
+                }
+                if (vol_rw_lba(vol, 1, sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+                    return -1;
+                }
+            }
+            written += chunk;
+            sec_off = 0;
+        }
+
+        if (written < size) {
+            uint16_t next = fat_get_cluster(vol, curr_clus);
+            if (next < 2 || is_eof_cluster(vol, next)) {
+                uint16_t new_c = alloc_free_cluster(vol, search_hint);
+                if (new_c == 0) return -1;
+                search_hint = new_c + 1;
+                if (zero_cluster_sectors(vol, new_c) != 0) return -1;
+                if (fat_set_cluster(vol, curr_clus, new_c) != 0) return -1;
+                curr_clus = new_c;
+            } else {
+                curr_clus = next;
+            }
+        }
+    }
+
+    if (fat_flush() != 0) {
+        return -1;
+    }
+
+    /* Update directory entry */
+    if (vol_rw_lba(vol, 0, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        return -1;
+    }
+    if (is_new_file) {
+        fill_dirent_meta(&entries[dir_idx], name83, FAT_ATTR_ARCHIVE, first_clus, target_end);
+    } else {
+        if (entries[dir_idx].fst_clus_lo < 2) {
+            entries[dir_idx].fst_clus_lo = first_clus;
+        }
+        if (target_end > entries[dir_idx].file_size) {
+            entries[dir_idx].file_size = target_end;
+        }
+    }
+    if (vol_rw_lba(vol, 1, dir_sec_lba, MK_FP(KERNEL_SEG, io_buf)) != 0) {
+        return -1;
+    }
+
+    return (int32_t)size;
+}
+
 int32_t fat16_append_file(const char __far *filename, const void __far *src, uint16_t size) {
     os_volume_t *vol;
     const char __far *subpath;

@@ -212,7 +212,7 @@ int      xms_rw_sector(uint16_t handle, uint32_t byte_offset, uint8_t is_write, 
 void     xms_dispatch(syscall_regs_t __far *regs);
 
 /* FAT12/FAT16 filesystem driver & Volume Manager (kernel/fat16.c) */
-#define MAX_VOLUMES 16
+#define MAX_VOLUMES 8
 
 #define FAT_TYPE_FAT12 1
 #define FAT_TYPE_FAT16 2
@@ -262,6 +262,7 @@ int32_t      fat16_read_file(const char __far *filename, void __far *dest, uint1
 int32_t      fat16_read_file_offset(const char __far *filename, void __far *dest, uint16_t max_bytes, uint32_t offset);
 int          fat16_load_executable(const char __far *filename, uint16_t dest_seg, uint32_t *out_size);
 int32_t      fat16_write_file(const char __far *filename, const void __far *src, uint16_t size);
+int32_t      fat16_write_file_offset(const char __far *filename, const void __far *src, uint16_t size, uint32_t offset);
 int32_t      fat16_append_file(const char __far *filename, const void __far *src, uint16_t size);
 int      fat16_delete_file(const char __far *filename);
 int      fat16_dir_entry(const char __far *path, uint16_t index, os_dir_entry_t __far *out_info);

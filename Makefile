@@ -6,7 +6,7 @@ PATH   := $(WATCOM)/binl64:$(PATH)
 
 86BOX  := /usr/local/bin/86Box
 IMG    := book8088/disk.img
-CFLAGS := -0 -fpi87 -ms -s -zl -ecc -zq -Iinclude -Ibuild
+CFLAGS := -0 -fpi87 -ms -s -os -zl -ecc -zq -Iinclude -Ibuild
 CFLAGS_MM := -0 -fpi87 -mm -s -os -zl -ecc -zq -Iinclude -Ibuild
 
 KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mouse.obj build/sound.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
@@ -42,7 +42,7 @@ build/%.obj: kernel/%.c include/hobbyos.h kernel/kernel.h
 	wcc $(CFLAGS) $< -fo=$@
 
 build/kernel.bin: $(KERNEL_OBJS)
-	wlink format raw bin name $@ file { $(KERNEL_OBJS) } order clname CODE clname CONST clname DATA clname BSS
+	wlink format raw bin name $@ op map=build/kernel.map file { $(KERNEL_OBJS) } order clname CODE clname CONST clname DATA clname BSS
 
 build/crt0.obj: user/crt0.asm
 	mkdir -p build
@@ -164,6 +164,10 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		basic/err.bas:/ERR.BAS \
 		basic/event.bas:/BASIC/EVENT.BAS \
 		basic/event.bas:/EVENT.BAS \
+		basic/random.bas:/BASIC/RANDOM.BAS \
+		basic/random.bas:/RANDOM.BAS \
+		basic/final.bas:/BASIC/FINAL.BAS \
+		basic/final.bas:/FINAL.BAS \
 		build/test80.com:/BIN/TEST80.COM \
 		games/zork1.z3:/GAMES/ZORK1.Z3 \
 		build/sample.cga:/PICS/SAMPLE.CGA \

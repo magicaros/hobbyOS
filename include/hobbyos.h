@@ -109,6 +109,7 @@ typedef signed long    int32_t;
 #define SYS_RAMDISK_UNMOUNT  0x29
 #define SYS_RAMDISK_STATUS   0x2A
 #define SYS_FILE_READ_OFFSET 0x2B
+#define SYS_FILE_WRITE_OFFSET 0x2C
 
 #define RAMDISK_TYPE_EMS     1
 #define RAMDISK_TYPE_XMS     2
@@ -520,6 +521,12 @@ uint16_t os_file_read(const char *filename, void __far *buf, uint16_t max_len);
 uint16_t os_file_read_offset(const char *filename, void __far *buf, uint16_t max_len, uint32_t offset);
 #pragma aux os_file_read_offset = \
     "mov ah, 0x2B" \
+    "int 0x21" \
+    parm [bx] [es di] [cx] [dx si] value [ax];
+
+uint16_t os_file_write_offset(const char *filename, const void __far *buf, uint16_t len, uint32_t offset);
+#pragma aux os_file_write_offset = \
+    "mov ah, 0x2C" \
     "int 0x21" \
     parm [bx] [es di] [cx] [dx si] value [ax];
 

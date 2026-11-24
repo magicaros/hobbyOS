@@ -26,8 +26,35 @@ _start:
     mov ds, ax
     mov es, ax
     mov ss, ax
-    mov sp, 0xFFFE
     mov [_boot_drive_num], dl
+
+    ; Read base memory size in KB from BIOS Data Area 0040:0013h
+    xor bx, bx
+    mov es, bx
+    mov ax, [es:0x0413]     ; BDA base memory in KB (e.g. 640 or 639)
+    mov bx, cs
+    mov es, bx              ; Restore ES = CS
+
+    cmp ax, 576
+    jbe .fallback_mem
+    cmp ax, 640
+    jbe .got_mem
+    mov ax, 640
+.got_mem:
+    sub ax, 576             ; KB within 0x9000 segment
+    mov cx, 1024
+    mul cx                  ; DX:AX = AX * 1024
+    sub ax, 2               ; Word-aligned top of stack
+    jmp .check_cap
+.fallback_mem:
+    mov ax, 0xFBFE          ; Safe fallback: 639 KB - 2
+.check_cap:
+    cmp ax, 0xFBFE
+    jbe .sp_ok
+    mov ax, 0xFBFE          ; Never exceed 639 KB (0xFC00) to protect XT-IDE / EBDA
+.sp_ok:
+    mov sp, ax
+    mov [_kernel_saved_sp], ax
     sti
     cld
     call _kmain
@@ -1582,7 +1609,7 @@ _xms_driver_entry:
     popf
     retf
 
-_kernel_saved_sp: dw 0xFFFE
+_kernel_saved_sp: dw 0xFBFE
 _usermode_active: dw 0
 global _ctrl_c_abort_pending
 _ctrl_c_abort_pending: dw 0

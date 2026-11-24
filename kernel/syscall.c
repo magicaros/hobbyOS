@@ -181,6 +181,8 @@ static int resolve_exec_target(const char __far *input, char out_buf[48], const 
     return -1;
 }
 
+static uint16_t s_current_proc_owner = 0;
+
 int exec_program(const char __far *filename, const char __far *args) {
     char resolved_buf[48];
     const char __far *target_name = 0;
@@ -341,12 +343,14 @@ int exec_program(const char __far *filename, const char __far *args) {
         {
             uint8_t saved_ems_slots[EMS_NUM_SLOTS];
             uint8_t saved_break_mode = kbd_get_break_mode();
+            uint16_t prev_owner = s_current_proc_owner;
             uint16_t target_cs = load_seg + mz_hdr.e_cs;
             uint16_t target_ip = mz_hdr.e_ip;
             uint16_t target_ss = load_seg + mz_hdr.e_ss;
             uint16_t target_sp = mz_hdr.e_sp;
             uint16_t target_ds_es = psp_seg;
 
+            s_current_proc_owner = base_seg;
             kbd_set_break_mode(BREAK_MODE_NORMAL);
             ctrl_c_abort_pending = 0;
             ems_save_slots(saved_ems_slots);
@@ -367,9 +371,13 @@ int exec_program(const char __far *filename, const char __far *args) {
             sound_stop();
 
             ems_free_by_owner(base_seg);
+            if (target_cs != base_seg) ems_free_by_owner(target_cs);
             ems_restore_slots(saved_ems_slots);
             xms_free_by_owner(base_seg);
+            if (target_cs != base_seg) xms_free_by_owner(target_cs);
             mem_free_by_owner(base_seg);
+            if (target_cs != base_seg) mem_free_by_owner(target_cs);
+            s_current_proc_owner = prev_owner;
         }
 
         return rc;
@@ -420,6 +428,8 @@ int exec_program(const char __far *filename, const char __far *args) {
     {
         uint8_t saved_ems_slots[EMS_NUM_SLOTS];
         uint8_t saved_break_mode = kbd_get_break_mode();
+        uint16_t prev_owner = s_current_proc_owner;
+        s_current_proc_owner = user_seg;
         kbd_set_break_mode(BREAK_MODE_NORMAL);
         ctrl_c_abort_pending = 0;
         ems_save_slots(saved_ems_slots);
@@ -451,6 +461,7 @@ int exec_program(const char __far *filename, const char __far *args) {
         ems_restore_slots(saved_ems_slots);
         xms_free_by_owner(user_seg);
         mem_free_by_owner(user_seg);
+        s_current_proc_owner = prev_owner;
     }
 
     return rc;
@@ -915,9 +926,20 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         break;
     }
 
-    case SYS_MEM_ALLOC:
-        regs->ax = mem_alloc(regs->bx, regs->cs);
+    case SYS_FILE_WRITE_OFFSET: {
+        const char __far *fname = (const char __far *)MK_FP(regs->ds, regs->bx);
+        const void __far *src   = MK_FP(regs->es, regs->di);
+        uint32_t offset         = ((uint32_t)regs->dx << 16) | regs->si;
+        int32_t res = fat16_write_file_offset(fname, src, regs->cx, offset);
+        regs->ax = (res < 0) ? 0xFFFF : (uint16_t)res;
         break;
+    }
+
+    case SYS_MEM_ALLOC: {
+        uint16_t owner = (s_current_proc_owner != 0) ? s_current_proc_owner : regs->cs;
+        regs->ax = mem_alloc(regs->bx, owner);
+        break;
+    }
 
     case SYS_MEM_FREE:
         regs->ax = (mem_free(regs->bx) == 0) ? 0 : 0xFFFF;
@@ -928,7 +950,8 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         break;
 
     case SYS_EMS_ALLOC: {
-        int page = ems_alloc_page(regs->cs);
+        uint16_t owner = (s_current_proc_owner != 0) ? s_current_proc_owner : regs->cs;
+        int page = ems_alloc_page(owner);
         regs->ax = (page < 0) ? 0xFFFF : (uint16_t)page;
         break;
     }
@@ -947,7 +970,8 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         break;
 
     case SYS_XMS_ALLOC: {
-        uint16_t h = xms_alloc(regs->bx, regs->cs);
+        uint16_t owner = (s_current_proc_owner != 0) ? s_current_proc_owner : regs->cs;
+        uint16_t h = xms_alloc(regs->bx, owner);
         regs->ax = (h == 0) ? 0xFFFF : h;
         break;
     }

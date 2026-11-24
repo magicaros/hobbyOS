@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/24 14:56:43
+# 86Box v7.0 logfile, created 2026/11/24 18:56:29
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -58,7 +58,7 @@ Line 2 appended via SYS_FILE_APPEND
 [USER APP] AmigaDOS device paths (SYS: & HD0A:) verified OK
 [USER APP] RAM disk multi-cluster subdirectory (25 files in RAM:/TESTDIR) verified OK
 [USER APP] FAT16 Root Directory:
-  - KERNEL.BIN (47169 bytes)
+  - KERNEL.BIN (48437 bytes)
   - BIN/ <DIR>
   - BASIC/ <DIR>
   - MATH.BAS (2106 bytes)
@@ -69,6 +69,8 @@ Line 2 appended via SYS_FILE_APPEND
   - STR.BAS (4402 bytes)
   - ERR.BAS (3452 bytes)
   - EVENT.BAS (3095 bytes)
+  - RANDOM.BAS (4262 bytes)
+  - FINAL.BAS (3556 bytes)
   - GAMES/ <DIR>
   - PICS/ <DIR>
   - MODELS/ <DIR>
@@ -81,37 +83,41 @@ Keyboard layout set to FR (/KEYMAPS/FR.MAP)
 Running /BOOT.SH...
 hobbyOS BASIC Version 1.0 (GW-BASIC Compatible)
 61440 Bytes free
-BASIC: args='/event.bas'
-BASIC: loading '/EVENT.BAS'
-BASIC: bytes read=3095
-[2J[HhobbyOS BASIC Event Trapping Test
-=================================
+[2J[HhobbyOS BASIC Phase 12 Feature Test
+===================================
 
---- 1. KEY STATEMENT & SOFTKEYS ---
-1LIST  2RUN   3LOAD" 4SAVE" 5CONT  6,"LPT 7TRON  8TROFF 9KEY   10SCREE                                                                               KEY ON/OFF & DEFINITIONS: PASSED
+--- 1. DATE$ & TIME$ (READ/WRITE) ---
+DATE$ FORMAT:             PASSED
+TIME$ FORMAT:             PASSED
+DATE$ WRITE:              PASSED
+DBG: BEFORE TIME$
+DBG: AFTER TIME$ WRITE
+TIME$ WRITE:              PASSED
+DBG: AFTER TIME$ READ
 
---- 2. KEY TRAP SYNTAX & VALIDATION ---
-KEY VALIDATION:           PASSED
+--- 2. CSRLIN, POS, TAB, SPC ---
+CSRLIN & POS(0):          PASSED
+                   X          Y
+TAB & SPC COLUMN METRICS: PASSED
 
---- 3. RETURN WITH TARGET LINE ---
-RETURN TARGET:            PASSED
+--- 3. BSAVE & BLOAD ---
+BLOAD DEFAULT OFFSET:     PASSED
+BLOAD OVERRIDE OFFSET:    PASSED
 
---- 4. TIMER EVENT TRAPPING ---
-Waiting for 2 timer events...
-Timer ticks received:  2 
-TIMER ON TRAPPING:        PASSED
+--- 4. FILE & DIR MANAGEMENT ---
+NAME AS (RENAME):         PASSED
+KILL (DELETE):            PASSED
+MKDIR/CHDIR/RMDIR:        PASSED
 
---- 5. TIMER STOP & PENDING FIRED ---
-Before STOP:  2  During STOP:  2  After ON:  3 
-TIMER STOP / PENDING:     PASSED
+--- 5. GRAPHICS POINT(x, y) ---
+[2J[HPOINT(x, y):              PASSED
 
---- 6. TIMER OFF DEACTIVATION ---
-At OFF:  3  After 1.3s:  3 
-TIMER OFF:                PASSED
+--- 6. TRON / TROFF ---
+[710][720][730]TRON / TROFF:             PASSED
 
-=================================
-ALL EVENT TRAPPING TESTS PASSED!
-=================================
+=================================================
+ALL PHASE 12 GW-BASIC FEATURES TESTED OK!
+=================================================
 System ready.
 
 hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.

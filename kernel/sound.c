@@ -503,8 +503,6 @@ uint16_t sound_get_channels(void) {
     return s_sound_channels;
 }
 
-#define PCM_DMA_BUF_SIZE 4096
-static uint8_t  s_pcm_dma_buf[PCM_DMA_BUF_SIZE];
 static uint8_t  s_pcm_playing = 0;
 
 static uint8_t calc_time_constant(uint16_t rate) {
@@ -548,22 +546,21 @@ static int dma1_is_done(void) {
 }
 
 int16_t sound_pcm_play(uint16_t rate_hz, uint16_t len, const uint8_t __far *samples) {
-    uint16_t i;
     uint8_t tc;
     uint32_t phys;
 
     if (s_sb_type == SB_TYPE_NONE || !s_sb_base) return -1;
-    if (len == 0 || len > PCM_DMA_BUF_SIZE) return -2;
+    if (len == 0 || !samples) return -2;
 
-    /* Copy samples into kernel DMA buffer */
-    for (i = 0; i < len; i++) {
-        s_pcm_dma_buf[i] = samples[i];
-    }
+    /* Compute physical address of caller's buffer */
+    phys = ((uint32_t)FP_SEG(samples) << 4) + FP_OFF(samples);
+
+    /* 8237A DMA Channel 1 cannot cross a 64KB physical page boundary */
+    if ((phys & 0xFFFF) + (uint32_t)len > 0x10000) return -3;
 
     tc = calc_time_constant(rate_hz);
 
-    /* Setup DMA Channel 1 */
-    phys = ((uint32_t)KERNEL_SEG << 4) + (uint16_t)(void *)s_pcm_dma_buf;
+    /* Setup DMA Channel 1 directly with caller's buffer */
     dma1_setup(phys, len);
 
     /* Enable speaker */

@@ -167,6 +167,53 @@
     - **Memory Layout & 64 KB Segment Confinement**:
       - Adjusted BSS symbol tables and runtime arrays (`BASIC_MAX_VARS = 48`, `BASIC_MAX_STR_LEN = 64`, `BASIC_NUM_TEMP_STRS = 6`, `BASIC_MAX_ARRAYS = 16`, `BASIC_MAX_GOSUB = 16`, `BASIC_MAX_FOR_NEST = 8`, `BASIC_MAX_WHILE_NEST = 8`) to keep total executable footprint at 62,008 bytes (`0xF238`), ensuring full flat 64 KB segment safety with 3.5 KB stack headroom below `0xFEFE`.
     - **Target Event Trapping Verification Suite (`/BASIC/EVENT.BAS`, `/EVENT.BAS`)**: Comprehensive verification suite covering softkey management (`KEY ON/OFF`, `KEY 1, "..."`), key trap syntax & validation (`ON KEY(1) GOSUB`, `KEY(0)` out of bounds error trapping), `RETURN <linenum>` redirection, recurring `TIMER ON` event delivery, `TIMER STOP` event buffering and pending firing upon `TIMER ON`, and `TIMER OFF` deactivation. Verified 100% passed on target Book8088 emulator.
+  - **Phase 11: Random-Access File I/O & Binary Field Buffering (`OPEN "R"`, `FIELD`, `LSET`/`RSET`, `PUT`/`GET`, `LOC`, `LOF`, `MKI$`/`CVI`, `MKS$`/`CVS`, `MKD$`/`CVD`, `SYS_FILE_WRITE_OFFSET`)**:
+    - **Kernel Random-Access File Offset Write (`SYS_FILE_WRITE_OFFSET` `0x2C`, `fat16_write_file_offset` in `kernel/fat16.c`, `kernel/syscall.c`, `include/hobbyos.h`)**:
+      - Added new system call `SYS_FILE_WRITE_OFFSET` (AH=0x2C) taking filename, far buffer pointer, byte length, and 32-bit seek offset (`DX:SI`).
+      - Implemented `fat16_write_file_offset()` with FAT cluster chain traversal, dynamic cluster allocation, zero-filling unallocated intermediate gap clusters (`zero_cluster_sectors`), read-modify-write on boundary sectors, and direct directory entry `file_size` synchronization.
+    - **Random-Access File Mode & Syntax (`OPEN ... AS #n [LEN = reclen]`)**:
+      - Supported both Syntax 1 (`OPEN "R", #n, "filespec" [, reclen]`) and Syntax 2 (`OPEN "filespec" [FOR RANDOM] AS #n [LEN = reclen]`), defaulting record length to 128 bytes (up to 512 bytes).
+      - Parsed tokenized `TOK_LEN` (`0xFF96`) as well as ASCII `LEN` clauses, and defaulted mode to `'R'` (Random) when `FOR` is omitted.
+    - **Binary Conversion Functions (`0xFD` Token Prefix)**:
+      - `MKI$(int)` (`TOK_MKI` `0xFD84`) & `CVI(str$)` (`TOK_CVI` `0xFD81`): 2-byte 16-bit integer packing/unpacking (little-endian).
+      - `MKS$(sng)` (`TOK_MKS` `0xFD85`) & `CVS(str$)` (`TOK_CVS` `0xFD82`): 4-byte 32-bit single-precision float packing/unpacking.
+      - `MKD$(dbl)` (`TOK_MKD` `0xFD86`) & `CVD(str$)` (`TOK_CVD` `0xFD83`): 8-byte double-precision float packing/unpacking (zero-padded 32-bit IEEE-754 mantissa).
+      - Binary transparency: Added explicit length tracking (`slen` in `basic_var_t`) ensuring binary strings containing embedded `0x00` null bytes are preserved with zero corruption across assignments, conversions, and buffer transfers.
+    - **Buffer Field Mapping & Record Navigation (`FIELD`, `LSET`, `RSET`, `PUT`, `GET`, `LOC`, `LOF`)**:
+      - `FIELD #n, width AS var$ [, ...]`: Maps string variables to fixed-width slices within channel $n$'s record buffer (`rec_buf[512]`).
+      - `LSET var$ = expr$` & `RSET var$ = expr$`: Formats data into a FIELD variable buffer, left-justifying or right-justifying with space padding or truncation.
+      - `PUT [#]n [, recnum]`: Copies FIELD variables into channel $n$'s record buffer and writes record `recnum` (1-based, defaulting to `current_record + 1`) to disk at 32-bit offset $(recnum - 1) \times record\_len$ via `mul16` without runtime helper dependencies.
+      - `GET [#]n [, recnum]`: Reads record `recnum` from disk into channel $n$'s record buffer via `os_file_read_offset` and automatically synchronizes all mapped FIELD variables.
+      - `LOC(n)`: Returns the current 1-based record number for channel $n$.
+      - `LOF(n)`: Returns the total file size in bytes for channel $n$.
+    - **Tokenizer Keyword vs Variable Sigil Resolution (`basic_tokenize`)**:
+      - Fixed keyword tokenization boundary guard to check for variable type sigils (`$`, `%`, `!`, `#`). Variables starting with statement keywords (e.g. `NAME$` vs `TOK_NAME`) are now correctly recognized as variable identifiers rather than broken into keywords.
+    - **Target Random-Access Verification Suite (`/BASIC/RANDOM.BAS`, `/RANDOM.BAS`)**: Comprehensive verification suite covering binary packing round-trips (`MKI$`/`CVI`, `MKS$`/`CVS`), `OPEN "R"`, `FIELD`, `LSET`/`RSET`, non-sequential random write (record 5), non-sequential random read, sequential default `PUT`/`GET` (record 6), `LOC`, `LOF`, `CLOSE`, and persistence across reopen. Verified 100% passed on target Book8088 emulator.
+  - **Phase 12: OS Commands, Binary Memory Transfer, Console Metrics, Clock & Debugging Tools (`KILL`, `NAME`, `CHDIR`, `MKDIR`, `RMDIR`, `SHELL`, `BSAVE`, `BLOAD`, `CSRLIN`, `POS`, `TAB`, `SPC`, `POINT`, `WIDTH`, `AUTO`, `RENUM`, `DELETE`, `TRON`/`TROFF`, `CONT`, `DATE$`, `TIME$`)**:
+    - **OS, Directory & File Management**:
+      - `KILL "filespec"`: Deletes specified file via `os_file_delete`.
+      - `NAME "old" AS "new"`: Renames file via `os_file_rename`.
+      - `CHDIR "dir"`, `MKDIR "dir"`, `RMDIR "dir"`: Directory navigation, creation, and removal via `os_chdir`, `os_mkdir`, `os_rmdir`.
+      - `SHELL [cmd$]`: Spawns an interactive subshell or executes command strings via `os_exec`.
+    - **Binary Memory Transfer (`BSAVE`, `BLOAD`)**:
+      - `BSAVE "file", offset, length`: Writes raw memory bytes with standard GW-BASIC 7-byte binary header (`0xFD`, 16-bit segment from `DEF SEG`, 16-bit offset, 16-bit length).
+      - `BLOAD "file" [, offset]`: Reads and validates `0xFD` header, restoring binary memory to original segment:offset or a user-specified override offset via `os_file_read_offset`.
+    - **Console Metrics & Screen Functions**:
+      - `CSRLIN` (`0xDB`): Built-in function returning the 1-based cursor row (1..25) via `os_get_cursor()`.
+      - `POS(dummy)` (`0xFF91`): Built-in function returning the 1-based cursor column (1..80).
+      - `TAB(n)` & `SPC(n)`: Integrated into console `PRINT` and file `PRINT #n`, advancing to 1-based column `n` or printing `n` space characters.
+      - `POINT(x, y)` (`0xDC`): Reads pixel color in graphics modes via BIOS `INT 10h, AH=0Dh` (returns -1 if coordinates are out of bounds or in text mode).
+      - `WIDTH 40` / `WIDTH 80`: Adjusts text console column width via `os_gfx_set_mode`.
+    - **Interactive Program Utilities & Debugging**:
+      - `TRON` / `TROFF`: Traces program execution by printing `[line_num]` before each statement executes.
+      - `STOP` / `CONT`: `STOP` displays `Break in <line>`, preserves statement execution position, and arms `CONT` state; `CONT` resumes program execution seamlessly without resetting variables or arrays.
+      - `DELETE [start] [- [end]]`: Deletes individual lines or line ranges (`start-end`, `-end`, `start-`).
+      - `AUTO [start] [, [step]]`: Automates numbered line entry in the interactive REPL.
+      - `RENUM [new_start] [, [old_start] [, [step]]]`: Renumbers program lines and rewrites internal branch targets (`GOTO`, `GOSUB`, `THEN`, `ELSE`, `RESTORE`, `RUN`, `RESUME`, `RETURN`).
+    - **System Clock (`DATE$`, `TIME$`)**:
+      - `DATE$`: Reads date formatted as `"MM-DD-YYYY"`; sets date via `DATE$ = "MM-DD-YYYY"`.
+      - `TIME$`: Reads time formatted as `"HH:MM:SS"`; sets system timer ticks via `TIME$ = "HH:MM:SS"` using universal BIOS `INT 1Ah, AH=01h` and BIOS Data Area `0040:006C`.
+    - **Target Verification Suite (`/BASIC/FINAL.BAS`, `/FINAL.BAS`)**: Comprehensive verification suite covering `DATE$`, `TIME$`, `CSRLIN`, `POS`, `TAB`, `SPC`, `BSAVE`, `BLOAD`, `NAME AS`, `KILL`, `MKDIR`, `CHDIR`, `RMDIR`, `POINT`, and `TRON`/`TROFF`. Verified 100% passed on target Book8088 emulator.
 - **MS-DOS 16-bit MZ Executable Support & Medium Model Toolchain (`kernel/syscall.c`, `kernel/entry.asm`, `user/crt0_mz.asm`, `Makefile`)**:
   - **MS-DOS Relocatable MZ Header & Image Loader (`exec_program` in `kernel/syscall.c`)**:
     - Implemented a standard MS-DOS 16-bit MZ executable loader (`0x5A4D` / `0x4D5A`) into the kernel `SYS_EXEC` subsystem, eliminating the 64 KB single-segment memory limitation for user-space applications.
@@ -181,6 +228,34 @@
   - **Binary Resolution & Build System (`Makefile`, `kernel/syscall.c`)**:
     - Extended PATH and direct binary resolution (`resolve_exec_target` in `kernel/syscall.c`) to auto-probe `.EXE` binaries in addition to `.BIN`.
     - Added Open Watcom `-mm` Medium Model compilation rules (`CFLAGS_MM`) and `wlink format dos` executable linking.
+- **Kernel Memory Footprint Optimization & EBDA / XT-IDE AT Stack Protection (`kernel/entry.asm`, `kernel/sound.c`, `kernel/kernel.h`, `Makefile`)**:
+  - **XT-IDE AT / EBDA 1 KB Memory Conflict Diagnosis**:
+    - Traced hang observed on 86Box 286 (`ibmatpx`) and 386 (`asus3863364k`) VMs to XT-IDE Universal BIOS running in 16-bit AT mode (`xtide_at`), which reserves 1 KB of RAM at the top of conventional memory (`0x9FC0:0000..0x9FFF:0000`, 639 KB–640 KB) and decrements BDA word `0040:0013h` to 639 KB.
+    - Initial kernel stack in `kernel/entry.asm` previously initialized `SP = 0xFFFE` (physical `0x9FFFE`), placing the kernel stack inside XT-IDE's controller data structure. As `HELLO.BIN` executed, nested stack frames stomped the XT-IDE IDE port address, causing XT-IDE to spin in an 8.5-minute timeout loop on the subsequent `exec_program("/BIN/SHELL.BIN")` disk read.
+  - **Direct Application PCM DMA Buffer & Buffer Elimination (`kernel/sound.c`)**:
+    - Completely eliminated the static 4,096-byte `s_pcm_dma_buf` bounce buffer from kernel `_BSS`.
+    - `sound_pcm_play` now directly configures 8237A DMA Channel 1 with the physical address of the user application's buffer (`phys = (FP_SEG(samples) << 4) + FP_OFF(samples)`), validating that the transfer does not cross a 64 KB DMA physical page boundary.
+  - **Volume Descriptor Trimming (`kernel/kernel.h`)**:
+    - Reduced `MAX_VOLUMES` from 16 to 8 (each `os_volume_t` is 244 bytes), reclaiming 1,952 bytes of static BSS.
+  - **Size Optimization (`Makefile`)**:
+    - Enabled `-os` in `CFLAGS` for kernel compilation, instructing Open Watcom to favor code size.
+    - Reduced overall kernel memory footprint from `0xF444` (62,532 bytes) down to `0xE098` (57,496 bytes), saving 5,036 bytes.
+  - **Dynamic Kernel Stack & EBDA Protection (`kernel/entry.asm`)**:
+    - Replaced hardcoded `SP = 0xFFFE` with dynamic calculation reading BDA base memory size in KB (`0040:0013h`).
+    - Caps initial `SP` and `_kernel_saved_sp` at `0xFBFE` (`0x9000:0xFBFE`, 639 KB - 2), strictly protecting any 1 KB EBDA / XT-IDE memory reservation at `0xFC00..0xFFFF`.
+    - Preserved `DL` boot drive number before stack calculation, avoiding register clobbering from `mul cx`.
+    - Provides >7 KB of clean stack headroom between kernel BSS end (`0xE098`) and XT-IDE boundary (`0xFC00`) while preserving `KERNEL_SEG = 0x9000` and the 574.5 KB conventional MCB arena (`0x0060..0x8FFF`).
+  - **86Box Multi-Machine Verification**: Verified 100% clean boot across the full test matrix: Book8088 (V20/XT), 286 (AT PX), 386 (ASUS 386/33), and 486 (PCI).
+- **Process Memory Ownership & MZ Executable Lifecycle Reclaim (`kernel/syscall.c`, `user/basic.c`)**:
+  - **Process Ownership Tracking (`s_current_proc_owner` in `kernel/syscall.c`)**:
+    - Resolved a 64 KB memory leak when running multi-segment MS-DOS MZ executables (e.g. `BASIC.EXE`).
+    - The kernel allocators (`SYS_MEM_ALLOC`, `SYS_EMS_ALLOC`, `SYS_XMS_ALLOC`) previously tagged dynamic allocations with `regs->cs` (`0x1072`), while the executable process image and child termination cleanup in `exec_program` operated on the process's PSP base segment `base_seg` (`0x1062`). As a result, dynamically allocated segments (such as BASIC's 64 KB heap `s_basic_seg`) were orphaned upon process exit.
+    - Implemented `s_current_proc_owner` in `kernel/syscall.c` tracking the active process's PSP/base segment across nested execution frames.
+    - Updated `SYS_MEM_ALLOC`, `SYS_EMS_ALLOC`, and `SYS_XMS_ALLOC` to attribute owner to `s_current_proc_owner`.
+    - Added dual-segment cleanup on process exit: `mem_free_by_owner`, `ems_free_by_owner`, and `xms_free_by_owner` now reclaim blocks owned by both `base_seg` and `target_cs`.
+  - **Explicit Cleanup on BASIC `SYSTEM` Exit (`user/basic.c`)**:
+    - Added explicit `os_mem_free(s_basic_seg)` in both `TOK_SYSTEM` statement execution and immediate mode REPL prompt handlers before calling `os_exit(0)`.
+    - Verified zero memory leak across multiple consecutive interactive BASIC runs (conventional free memory remains constant at 446 KB before, between, and after execution).
     - Migrated `/BIN/BASIC.EXE` to Medium Model DOS executable format, removing the 64 KB ceiling for all future BASIC enhancements. Fully verified in 86Box emulation on target Book8088.
 
 ## Revision 1.0.2 (2026-11-21)
