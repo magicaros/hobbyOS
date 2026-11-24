@@ -106,7 +106,7 @@ build/sample.vga: tools/gen_vga.py
 	mkdir -p build
 	python3 tools/gen_vga.py $@
 
-$(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(MUSIC_FILES) build/sample.cga build/sample.pcx build/sample.vga games/zork1.z3 boot.sh tools/fat16.py build/test80.com
+$(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(MUSIC_FILES) build/sample.cga build/sample.pcx build/sample.vga games/zork1.z3 boot.sh tools/fat16.py build/test80.com $(wildcard basic/*.bas)
 	dd if=/dev/zero of=$@ bs=512 count=20808 status=none
 	/usr/sbin/mkfs.fat -a -F 16 -s 4 -R 1 -f 2 -r 512 -g 4/17 -M 0xF8 -D 0x80 -n "HOBBYOS" $@ >/dev/null
 	python3 tools/fat16.py $@ build/boot.bin \
@@ -135,6 +135,16 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		build/fm.bin:/BIN/FM.BIN \
 		build/cpm.bin:/BIN/CPM.BIN \
 		build/basic.bin:/BIN/BASIC.BIN \
+		basic/math.bas:/BASIC/MATH.BAS \
+		basic/math.bas:/MATH.BAS \
+		basic/sys.bas:/BASIC/SYS.BAS \
+		basic/sys.bas:/SYS.BAS \
+		basic/test1.bas:/BASIC/TEST1.BAS \
+		basic/test1.bas:/TEST1.BAS \
+		basic/test2.bas:/BASIC/TEST2.BAS \
+		basic/test2.bas:/TEST2.BAS \
+		basic/test3.bas:/BASIC/TEST3.BAS \
+		basic/test3.bas:/TEST3.BAS \
 		build/test80.com:/BIN/TEST80.COM \
 		games/zork1.z3:/GAMES/ZORK1.Z3 \
 		build/sample.cga:/PICS/SAMPLE.CGA \

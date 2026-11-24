@@ -9,6 +9,7 @@
 
 #include "hobbyos.h"
 #include "basic_tokens.h"
+#include "basic_math.h"
 
 #define FP_HERE(ptr)        ((void __far *)(((unsigned long)get_ds() << 16) | (uint16_t)(ptr)))
 #define BASIC_SEG_PARAS     4096    /* 64 KB program segment */
@@ -31,6 +32,8 @@
 
 #define BASIC_TYPE_INT      1
 #define BASIC_TYPE_STR      2
+#define BASIC_TYPE_UINT     3
+#define BASIC_TYPE_FLOAT    4
 
 /* Operator comparison codes */
 #define OP_CMP_NONE         0
@@ -43,17 +46,19 @@
 
 /* Value structure for expressions */
 typedef struct {
-    uint8_t type;       /* BASIC_TYPE_INT or BASIC_TYPE_STR */
-    int16_t ival;       /* Integer value */
-    char    *sval;      /* Pointer to string (in DS) */
+    uint8_t       type;       /* BASIC_TYPE_INT, BASIC_TYPE_STR, BASIC_TYPE_UINT, BASIC_TYPE_FLOAT */
+    int16_t       ival;       /* Integer value */
+    basic_float_t fval;       /* 32-bit float value */
+    char          *sval;      /* Pointer to string (in DS) */
 } basic_val_t;
 
 /* Variable structure */
 typedef struct {
-    char    name[BASIC_MAX_VARNAME];
-    uint8_t type;
-    int16_t ival;
-    char    sval[BASIC_MAX_STR_LEN + 1];
+    char          name[BASIC_MAX_VARNAME];
+    uint8_t       type;
+    int16_t       ival;
+    basic_float_t fval;
+    char          sval[BASIC_MAX_STR_LEN + 1];
 } basic_var_t;
 
 /* Array descriptor structure */
@@ -150,6 +155,24 @@ static basic_file_t s_files[BASIC_MAX_FILES];
 
 /* Random number seed */
 static uint16_t s_rnd_seed          = 0x1234;
+
+/* Active memory segment for PEEK/POKE/DEF SEG (Phase 7) */
+static uint16_t s_def_seg           = 0;
+
+#ifdef __WATCOMC__
+static uint8_t inb(uint16_t port);
+#pragma aux inb = \
+    "in al, dx" \
+    parm [dx] value [al] modify [];
+
+static void outb(uint16_t port, uint8_t val);
+#pragma aux outb = \
+    "out dx, al" \
+    parm [dx] [al] modify [];
+#else
+static uint8_t inb(uint16_t port) { (void)port; return 0; }
+static void outb(uint16_t port, uint8_t val) { (void)port; (void)val; }
+#endif
 
 /* Graphics and Sound state (Phase 5) */
 static uint8_t  s_screen_mode       = 0;    /* 0 = text 80x25, 1 = CGA 320x200, 2 = CGA 640x200 */
@@ -257,6 +280,17 @@ static int basic_strnicmp(const char *s1, const char *s2, uint16_t n) {
     uint16_t i;
     for (i = 0; i < n; i++) {
         char c1 = basic_toupper(s1[i]);
+        char c2 = basic_toupper(s2[i]);
+        if (c1 != c2) return (int)(uint8_t)c1 - (int)(uint8_t)c2;
+        if (c1 == '\0') break;
+    }
+    return 0;
+}
+
+static int basic_strnicmp_far(const uint8_t __far *s1, const char *s2, uint16_t n) {
+    uint16_t i;
+    for (i = 0; i < n; i++) {
+        char c1 = basic_toupper((char)s1[i]);
         char c2 = basic_toupper(s2[i]);
         if (c1 != c2) return (int)(uint8_t)c1 - (int)(uint8_t)c2;
         if (c1 == '\0') break;
@@ -415,9 +449,16 @@ static basic_var_t *basic_get_or_create_var(const char *name) {
         v->type = BASIC_TYPE_STR;
         v->sval[0] = '\0';
         v->ival = 0;
-    } else {
+        v->fval = 0;
+    } else if (len > 0 && v->name[len - 1] == '%') {
         v->type = BASIC_TYPE_INT;
         v->ival = 0;
+        v->fval = 0;
+        v->sval[0] = '\0';
+    } else {
+        v->type = BASIC_TYPE_FLOAT;
+        v->ival = 0;
+        v->fval = 0;
         v->sval[0] = '\0';
     }
     return v;
@@ -465,12 +506,24 @@ static basic_array_t *basic_create_default_array(const char *name, uint8_t num_d
     uint16_t dim2 = (num_dims == 2) ? 11 : 1;
     uint16_t total_elems = (num_dims == 1) ? dim1 : (dim1 * dim2);
     uint16_t len = basic_strlen(name);
-    uint8_t type = (len > 0 && name[len - 1] == '$') ? BASIC_TYPE_STR : BASIC_TYPE_INT;
-    uint16_t elem_size = (type == BASIC_TYPE_STR) ? BASIC_STR_ELEM_LEN : 2;
-    uint16_t bytes = total_elems * elem_size;
+    uint8_t type;
+    uint16_t elem_size;
+    uint16_t bytes;
     basic_array_t *arr;
     uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
     uint16_t b;
+
+    if (len > 0 && name[len - 1] == '$') {
+        type = BASIC_TYPE_STR;
+        elem_size = BASIC_STR_ELEM_LEN;
+    } else if (len > 0 && name[len - 1] == '%') {
+        type = BASIC_TYPE_INT;
+        elem_size = 2;
+    } else {
+        type = BASIC_TYPE_FLOAT;
+        elem_size = 4;
+    }
+    bytes = total_elems * elem_size;
 
     if (s_num_arrays >= BASIC_MAX_ARRAYS) {
         os_puts("Out of array space\n");
@@ -517,6 +570,14 @@ static int basic_read_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, bas
         off = arr->data_off + linear_idx * 2;
         out_val->type = BASIC_TYPE_INT;
         out_val->ival = (int16_t)((uint16_t)mem[off] | ((uint16_t)mem[off + 1] << 8));
+        out_val->fval = 0;
+        out_val->sval = 0;
+    } else if (arr->type == BASIC_TYPE_FLOAT) {
+        off = arr->data_off + linear_idx * 4;
+        out_val->type = BASIC_TYPE_FLOAT;
+        out_val->fval = (uint32_t)mem[off] | ((uint32_t)mem[off + 1] << 8) |
+                        ((uint32_t)mem[off + 2] << 16) | ((uint32_t)mem[off + 3] << 24);
+        out_val->ival = 0;
         out_val->sval = 0;
     } else {
         char *str = basic_alloc_temp_str();
@@ -529,6 +590,7 @@ static int basic_read_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, bas
         out_val->type = BASIC_TYPE_STR;
         out_val->sval = str;
         out_val->ival = 0;
+        out_val->fval = 0;
     }
     return 0;
 }
@@ -550,13 +612,30 @@ static int basic_write_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, co
     linear_idx = (arr->num_dims == 1) ? (uint16_t)i1 : ((uint16_t)i1 * arr->dim2 + (uint16_t)i2);
 
     if (arr->type == BASIC_TYPE_INT) {
-        if (val->type != BASIC_TYPE_INT) {
+        if (val->type != BASIC_TYPE_INT && val->type != BASIC_TYPE_UINT) {
             os_puts("Type mismatch\n");
             return -1;
         }
         off = arr->data_off + linear_idx * 2;
         mem[off] = (uint8_t)(val->ival & 0xFF);
         mem[off + 1] = (uint8_t)(val->ival >> 8);
+    } else if (arr->type == BASIC_TYPE_FLOAT) {
+        basic_float_t fv;
+        if (val->type == BASIC_TYPE_FLOAT) {
+            fv = val->fval;
+        } else if (val->type == BASIC_TYPE_INT) {
+            fv = soft_from_int(val->ival);
+        } else if (val->type == BASIC_TYPE_UINT) {
+            fv = soft_from_uint((uint16_t)val->ival);
+        } else {
+            os_puts("Type mismatch\n");
+            return -1;
+        }
+        off = arr->data_off + linear_idx * 4;
+        mem[off]     = (uint8_t)(fv & 0xFF);
+        mem[off + 1] = (uint8_t)((fv >> 8) & 0xFF);
+        mem[off + 2] = (uint8_t)((fv >> 16) & 0xFF);
+        mem[off + 3] = (uint8_t)((fv >> 24) & 0xFF);
     } else {
         uint16_t k;
         if (val->type != BASIC_TYPE_STR) {
@@ -808,10 +887,26 @@ static void basic_new(void) {
     s_array_heap_free  = 16;
     s_data_line_off = 0;
     s_data_stmt_pos = 0;
+    s_def_seg = (uint16_t)get_ds();
     if (s_basic_seg) {
         uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
         mem[0] = 0; mem[1] = 0; mem[2] = 0; mem[3] = 0;
     }
+}
+
+static uint16_t basic_get_free_mem(void) {
+    uint16_t used;
+    if (s_num_arrays > 0) {
+        used = s_array_heap_free;
+    } else if (s_prog_head != 0) {
+        used = (s_prog_tail + 15) & ~15;
+    } else {
+        used = 0;
+    }
+    if (used < 61440U) {
+        return 61440U - used;
+    }
+    return 0;
 }
 
 static uint16_t basic_find_line(uint16_t line_num) {
@@ -976,6 +1071,17 @@ static int basic_match_cmp_op(const uint8_t __far *tok, uint16_t *pos) {
     return OP_CMP_NONE;
 }
 
+static basic_float_t val_to_float(const basic_val_t *v) {
+    if (v->type == BASIC_TYPE_FLOAT) return v->fval;
+    if (v->type == BASIC_TYPE_UINT)  return soft_from_uint((uint16_t)v->ival);
+    return soft_from_int(v->ival);
+}
+
+static int16_t val_to_int(const basic_val_t *v) {
+    if (v->type == BASIC_TYPE_FLOAT) return soft_to_int(v->fval);
+    return v->ival;
+}
+
 static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val) {
     uint16_t p = *pos;
     while (tok[p] == ' ' || tok[p] == '\t') p++;
@@ -1042,17 +1148,45 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         return 0;
     }
 
-    /* Decimal number literal */
-    if (basic_is_digit((char)tok[p])) {
-        int16_t val = 0;
-        while (basic_is_digit((char)tok[p])) {
-            val = (val * 10) + (int16_t)(tok[p++] - '0');
+    /* Decimal or Floating Point number literal */
+    if (basic_is_digit((char)tok[p]) || (tok[p] == '.' && basic_is_digit((char)tok[p + 1]))) {
+        uint16_t scan = p;
+        int has_fp = 0;
+        while (basic_is_digit((char)tok[scan])) scan++;
+        if (tok[scan] == '.') {
+            has_fp = 1;
+            scan++;
+            while (basic_is_digit((char)tok[scan])) scan++;
         }
-        out_val->type = BASIC_TYPE_INT;
-        out_val->ival = val;
-        out_val->sval = 0;
-        *pos = p;
-        return 0;
+        if (tok[scan] == 'E' || tok[scan] == 'e' || tok[scan] == 'D' || tok[scan] == 'd') {
+            has_fp = 1;
+        }
+
+        if (has_fp) {
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_parse_float_far(tok, &p);
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        } else {
+            uint32_t val = 0;
+            while (basic_is_digit((char)tok[p])) {
+                val = (val << 3) + (val << 1) + (uint32_t)(tok[p++] - '0');
+            }
+            if (val > 32767) {
+                out_val->type = BASIC_TYPE_FLOAT;
+                out_val->fval = soft_from_uint((uint16_t)val);
+                out_val->ival = 0;
+            } else {
+                out_val->type = BASIC_TYPE_INT;
+                out_val->ival = (int16_t)val;
+                out_val->fval = 0;
+            }
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
     }
 
     /* Built-in function: INKEY$ (token 0xDE) */
@@ -1130,6 +1264,33 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         return 0;
     }
 
+    /* Built-in 2-byte functions with 0xFE prefix (Phase 7) */
+    if (tok[p] == 0xFE) {
+        uint8_t fn = tok[p + 1];
+        p += 2;
+
+        /* TIMER (0xFE94) */
+        if (fn == (uint8_t)(TOK_TIMER & 0xFF)) {
+            uint32_t ticks = *((const uint32_t __far *)0x0040006CUL);
+            basic_float_t f_ticks = soft_from_uint32(ticks);
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') {
+                p++;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] == ')') p++;
+            }
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_mul(f_ticks, 0x3D60FEB3UL); /* * 0.05492549 */
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* Not a recognized 0xFE function */
+        p -= 2;
+    }
+
     /* Built-in 2-byte functions with 0xFF prefix */
     if (tok[p] == 0xFF) {
         uint8_t fn = tok[p + 1];
@@ -1141,12 +1302,18 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             if (tok[p] == '(') {
                 basic_val_t dummy;
                 p++;
-                basic_eval_expr(tok, &p, &dummy);
+                if (basic_eval_expr(tok, &p, &dummy) != 0) return -1;
                 while (tok[p] == ' ' || tok[p] == '\t') p++;
                 if (tok[p] == ')') p++;
+                if (dummy.type == BASIC_TYPE_FLOAT && (dummy.fval & 0x80000000UL)) {
+                    s_rnd_seed = (uint16_t)soft_to_int(dummy.fval);
+                } else if (dummy.type == BASIC_TYPE_INT && dummy.ival < 0) {
+                    s_rnd_seed = (uint16_t)dummy.ival;
+                }
             }
-            out_val->type = BASIC_TYPE_INT;
-            out_val->ival = basic_rand();
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_div(soft_from_uint((uint16_t)basic_rand()), soft_from_uint(32768U));
+            out_val->ival = 0;
             out_val->sval = 0;
             *pos = p;
             return 0;
@@ -1158,6 +1325,42 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             return -1;
         }
         p++;
+
+        /* PEEK(addr) */
+        if (fn == (uint8_t)(TOK_PEEK & 0xFF)) {
+            basic_val_t arg;
+            uint16_t addr;
+            uint8_t val;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            addr = (uint16_t)val_to_int(&arg);
+            val = *((const uint8_t __far *)MK_FP(s_def_seg, addr));
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = (int16_t)val;
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* INP(port) */
+        if (fn == (uint8_t)(TOK_INP & 0xFF)) {
+            basic_val_t arg;
+            uint16_t port;
+            uint8_t val;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            port = (uint16_t)val_to_int(&arg);
+            val = inb(port);
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = (int16_t)val;
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
 
         /* EOF(filenum) */
         if (fn == (uint8_t)(TOK_EOF & 0xFF)) {
@@ -1228,8 +1431,29 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == ')') p++;
-            out_val->type = BASIC_TYPE_INT;
-            out_val->ival = basic_atoi(arg.sval);
+            if (arg.sval) {
+                uint16_t sp = 0;
+                int has_dot = 0;
+                while (arg.sval[sp] == ' ' || arg.sval[sp] == '\t') sp++;
+                while (arg.sval[sp] != '\0') {
+                    if (arg.sval[sp] == '.' || arg.sval[sp] == 'E' || arg.sval[sp] == 'e') has_dot = 1;
+                    sp++;
+                }
+                sp = 0;
+                if (has_dot) {
+                    out_val->type = BASIC_TYPE_FLOAT;
+                    out_val->fval = basic_parse_float_str(arg.sval, &sp);
+                    out_val->ival = 0;
+                } else {
+                    out_val->type = BASIC_TYPE_INT;
+                    out_val->ival = basic_atoi(arg.sval);
+                    out_val->fval = 0;
+                }
+            } else {
+                out_val->type = BASIC_TYPE_INT;
+                out_val->ival = 0;
+                out_val->fval = 0;
+            }
             out_val->sval = 0;
             *pos = p;
             return 0;
@@ -1248,28 +1472,48 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == ')') p++;
 
-            v = arg.ival;
-            if (v >= 0) {
+            if (arg.type == BASIC_TYPE_FLOAT) {
+                basic_format_float(arg.fval, str, BASIC_MAX_STR_LEN);
+            } else if (arg.type == BASIC_TYPE_UINT) {
+                uint16_t uv = (uint16_t)arg.ival;
                 str[sp++] = ' ';
-            } else {
-                str[sp++] = '-';
-                v = -v;
-            }
-            if (v == 0) {
-                str[sp++] = '0';
-            } else {
-                while (v > 0) {
-                    buf[bp++] = (char)('0' + (v % 10));
-                    v /= 10;
+                if (uv == 0) {
+                    str[sp++] = '0';
+                } else {
+                    while (uv > 0) {
+                        buf[bp++] = (char)('0' + (uv % 10));
+                        uv /= 10;
+                    }
+                    while (bp > 0) {
+                        str[sp++] = buf[--bp];
+                    }
                 }
-                while (bp > 0) {
-                    str[sp++] = buf[--bp];
+                str[sp] = '\0';
+            } else {
+                v = arg.ival;
+                if (v >= 0) {
+                    str[sp++] = ' ';
+                } else {
+                    str[sp++] = '-';
+                    v = -v;
                 }
+                if (v == 0) {
+                    str[sp++] = '0';
+                } else {
+                    while (v > 0) {
+                        buf[bp++] = (char)('0' + (v % 10));
+                        v /= 10;
+                    }
+                    while (bp > 0) {
+                        str[sp++] = buf[--bp];
+                    }
+                }
+                str[sp] = '\0';
             }
-            str[sp] = '\0';
             out_val->type = BASIC_TYPE_STR;
             out_val->sval = str;
             out_val->ival = 0;
+            out_val->fval = 0;
             *pos = p;
             return 0;
         }
@@ -1280,8 +1524,15 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == ')') p++;
-            out_val->type = BASIC_TYPE_INT;
-            out_val->ival = (arg.ival < 0) ? -arg.ival : arg.ival;
+            if (arg.type == BASIC_TYPE_FLOAT) {
+                out_val->type = BASIC_TYPE_FLOAT;
+                out_val->fval = arg.fval & 0x7FFFFFFFUL;
+                out_val->ival = 0;
+            } else {
+                out_val->type = BASIC_TYPE_INT;
+                out_val->ival = (arg.ival < 0) ? -arg.ival : arg.ival;
+                out_val->fval = 0;
+            }
             out_val->sval = 0;
             *pos = p;
             return 0;
@@ -1294,7 +1545,193 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == ')') p++;
             out_val->type = BASIC_TYPE_INT;
-            out_val->ival = (arg.ival > 0) ? 1 : ((arg.ival < 0) ? -1 : 0);
+            if (arg.type == BASIC_TYPE_FLOAT) {
+                out_val->ival = (arg.fval == 0 || (arg.fval & 0x7FFFFFFFUL) == 0) ? 0 :
+                                ((arg.fval & 0x80000000UL) ? -1 : 1);
+            } else {
+                out_val->ival = (arg.ival > 0) ? 1 : ((arg.ival < 0) ? -1 : 0);
+            }
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* SQR(X) */
+        if (fn == (uint8_t)(TOK_SQR & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_sqr(val_to_float(&arg));
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* SIN(X) */
+        if (fn == (uint8_t)(TOK_SIN & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_sin(val_to_float(&arg));
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* COS(X) */
+        if (fn == (uint8_t)(TOK_COS & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_cos(val_to_float(&arg));
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* TAN(X) */
+        if (fn == (uint8_t)(TOK_TAN & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_tan(val_to_float(&arg));
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* ATN(X) */
+        if (fn == (uint8_t)(TOK_ATN & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_atn(val_to_float(&arg));
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* LOG(X) */
+        if (fn == (uint8_t)(TOK_LOG & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_log(val_to_float(&arg));
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* EXP(X) */
+        if (fn == (uint8_t)(TOK_EXP & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_exp(val_to_float(&arg));
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* INT(X) */
+        if (fn == (uint8_t)(TOK_INT & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            if (arg.type == BASIC_TYPE_FLOAT) {
+                int16_t iv = soft_to_int(arg.fval);
+                basic_float_t f_iv = soft_from_int(iv);
+                if (basic_float_cmp(arg.fval, f_iv) < 0) iv--;
+                out_val->type = BASIC_TYPE_INT;
+                out_val->ival = iv;
+                out_val->fval = 0;
+            } else {
+                out_val->type = BASIC_TYPE_INT;
+                out_val->ival = arg.ival;
+                out_val->fval = 0;
+            }
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* FIX(X) */
+        if (fn == (uint8_t)(TOK_FIX & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = val_to_int(&arg);
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* CINT(X) */
+        if (fn == (uint8_t)(TOK_CINT & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = val_to_int(&arg);
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* CSNG(X) */
+        if (fn == (uint8_t)(TOK_CSNG & 0xFF)) {
+            basic_val_t arg;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = val_to_float(&arg);
+            out_val->ival = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* FRE(X) or FRE(X$) */
+        if (fn == (uint8_t)(TOK_FRE & 0xFF)) {
+            basic_val_t arg;
+            uint16_t free_bytes;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+
+            free_bytes = basic_get_free_mem();
+
+            out_val->type = BASIC_TYPE_UINT;
+            out_val->ival = (int16_t)free_bytes;
             out_val->sval = 0;
             *pos = p;
             return 0;
@@ -1430,6 +1867,7 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             if (var) {
                 out_val->type = var->type;
                 out_val->ival = var->ival;
+                out_val->fval = var->fval;
                 out_val->sval = var->sval;
             } else {
                 uint16_t len = basic_strlen(var_name);
@@ -1438,9 +1876,16 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
                     out_val->type = BASIC_TYPE_STR;
                     out_val->sval = str;
                     out_val->ival = 0;
-                } else {
+                    out_val->fval = 0;
+                } else if (len > 0 && var_name[len - 1] == '%') {
                     out_val->type = BASIC_TYPE_INT;
                     out_val->ival = 0;
+                    out_val->fval = 0;
+                    out_val->sval = 0;
+                } else {
+                    out_val->type = BASIC_TYPE_FLOAT;
+                    out_val->ival = 0;
+                    out_val->fval = 0;
                     out_val->sval = 0;
                 }
             }
@@ -1461,7 +1906,11 @@ static int eval_unary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_
         p++;
         *pos = p;
         if (eval_unary(tok, pos, out_val) != 0) return -1;
-        out_val->ival = -out_val->ival;
+        if (out_val->type == BASIC_TYPE_FLOAT) {
+            out_val->fval ^= 0x80000000UL;
+        } else {
+            out_val->ival = -out_val->ival;
+        }
         return 0;
     }
     if (tok[p] == TOK_PLUS || tok[p] == '+') {
@@ -1472,13 +1921,38 @@ static int eval_unary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_
     return eval_primary(tok, pos, out_val);
 }
 
-static int eval_mul(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val) {
+static int eval_power(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val) {
     if (eval_unary(tok, pos, out_val) != 0) return -1;
+
+    for (;;) {
+        uint16_t p = *pos;
+        basic_val_t right;
+        basic_float_t lf, rf;
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != TOK_CARET && tok[p] != '^') break;
+
+        p++;
+        *pos = p;
+        if (eval_unary(tok, pos, &right) != 0) return -1;
+
+        lf = val_to_float(out_val);
+        rf = val_to_float(&right);
+        out_val->type = BASIC_TYPE_FLOAT;
+        out_val->fval = basic_float_pow(lf, rf);
+        out_val->ival = 0;
+    }
+    return 0;
+}
+
+static int eval_mul(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val) {
+    if (eval_power(tok, pos, out_val) != 0) return -1;
 
     for (;;) {
         uint16_t p = *pos;
         uint8_t op;
         basic_val_t right;
+        basic_float_t lf, rf;
 
         while (tok[p] == ' ' || tok[p] == '\t') p++;
         op = tok[p];
@@ -1490,22 +1964,46 @@ static int eval_mul(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_va
 
         p++;
         *pos = p;
-        if (eval_unary(tok, pos, &right) != 0) return -1;
+        if (eval_power(tok, pos, &right) != 0) return -1;
 
-        if (op == TOK_TIMES || op == '*') {
-            out_val->ival = out_val->ival * right.ival;
-        } else if (op == TOK_DIV || op == '/' || op == TOK_INTDIV || op == '\\') {
-            if (right.ival == 0) {
+        if (op == TOK_DIV || op == '/') {
+            lf = val_to_float(out_val);
+            rf = val_to_float(&right);
+            if (rf == 0) {
                 os_puts("Division by zero\n");
                 return -1;
             }
-            out_val->ival = out_val->ival / right.ival;
+            out_val->type = BASIC_TYPE_FLOAT;
+            out_val->fval = basic_float_div(lf, rf);
+            out_val->ival = 0;
+        } else if (op == TOK_TIMES || op == '*') {
+            if (out_val->type == BASIC_TYPE_FLOAT || right.type == BASIC_TYPE_FLOAT) {
+                lf = val_to_float(out_val);
+                rf = val_to_float(&right);
+                out_val->type = BASIC_TYPE_FLOAT;
+                out_val->fval = basic_float_mul(lf, rf);
+                out_val->ival = 0;
+            } else {
+                out_val->ival = out_val->ival * right.ival;
+            }
+        } else if (op == TOK_INTDIV || op == '\\') {
+            int16_t ri = val_to_int(&right);
+            if (ri == 0) {
+                os_puts("Division by zero\n");
+                return -1;
+            }
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = val_to_int(out_val) / ri;
+            out_val->fval = 0;
         } else if (op == TOK_MOD) {
-            if (right.ival == 0) {
+            int16_t ri = val_to_int(&right);
+            if (ri == 0) {
                 os_puts("Division by zero\n");
                 return -1;
             }
-            out_val->ival = out_val->ival % right.ival;
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = val_to_int(out_val) % ri;
+            out_val->fval = 0;
         }
     }
     return 0;
@@ -1518,6 +2016,7 @@ static int eval_add(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_va
         uint16_t p = *pos;
         uint8_t op;
         basic_val_t right;
+        basic_float_t lf, rf;
 
         while (tok[p] == ' ' || tok[p] == '\t') p++;
         op = tok[p];
@@ -1536,12 +2035,91 @@ static int eval_add(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_va
                 basic_strcpy(new_str, out_val->sval);
                 basic_strcat(new_str, right.sval, BASIC_MAX_STR_LEN);
                 out_val->sval = new_str;
+            } else if (out_val->type == BASIC_TYPE_FLOAT || right.type == BASIC_TYPE_FLOAT) {
+                lf = val_to_float(out_val);
+                rf = val_to_float(&right);
+                out_val->type = BASIC_TYPE_FLOAT;
+                out_val->fval = basic_float_add(lf, rf);
+                out_val->ival = 0;
+            } else if (out_val->type == BASIC_TYPE_UINT || right.type == BASIC_TYPE_UINT) {
+                out_val->type = BASIC_TYPE_UINT;
+                out_val->ival = out_val->ival + right.ival;
             } else {
                 out_val->ival = out_val->ival + right.ival;
             }
         } else {
-            out_val->ival = out_val->ival - right.ival;
+            if (out_val->type == BASIC_TYPE_FLOAT || right.type == BASIC_TYPE_FLOAT) {
+                lf = val_to_float(out_val);
+                rf = val_to_float(&right);
+                out_val->type = BASIC_TYPE_FLOAT;
+                out_val->fval = basic_float_sub(lf, rf);
+                out_val->ival = 0;
+            } else {
+                out_val->ival = out_val->ival - right.ival;
+            }
         }
+    }
+    return 0;
+}
+
+static int eval_rel(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val) {
+    if (eval_add(tok, pos, out_val) != 0) return -1;
+
+    for (;;) {
+        int cmp_op = basic_match_cmp_op(tok, pos);
+        basic_val_t right;
+        int cond = 0;
+
+        if (cmp_op == OP_CMP_NONE) break;
+
+        if (eval_add(tok, pos, &right) != 0) return -1;
+
+        if (out_val->type == BASIC_TYPE_STR && right.type == BASIC_TYPE_STR) {
+            int cmp = basic_strcmp(out_val->sval, right.sval);
+            switch (cmp_op) {
+                case OP_CMP_EQ: cond = (cmp == 0); break;
+                case OP_CMP_NE: cond = (cmp != 0); break;
+                case OP_CMP_LT: cond = (cmp < 0); break;
+                case OP_CMP_GT: cond = (cmp > 0); break;
+                case OP_CMP_LE: cond = (cmp <= 0); break;
+                case OP_CMP_GE: cond = (cmp >= 0); break;
+            }
+        } else if (out_val->type == BASIC_TYPE_FLOAT || right.type == BASIC_TYPE_FLOAT) {
+            int cmp = basic_float_cmp(val_to_float(out_val), val_to_float(&right));
+            switch (cmp_op) {
+                case OP_CMP_EQ: cond = (cmp == 0); break;
+                case OP_CMP_NE: cond = (cmp != 0); break;
+                case OP_CMP_LT: cond = (cmp < 0); break;
+                case OP_CMP_GT: cond = (cmp > 0); break;
+                case OP_CMP_LE: cond = (cmp <= 0); break;
+                case OP_CMP_GE: cond = (cmp >= 0); break;
+            }
+        } else if (out_val->type == BASIC_TYPE_UINT || right.type == BASIC_TYPE_UINT) {
+            uint16_t u1 = (uint16_t)out_val->ival;
+            uint16_t u2 = (uint16_t)right.ival;
+            switch (cmp_op) {
+                case OP_CMP_EQ: cond = (u1 == u2); break;
+                case OP_CMP_NE: cond = (u1 != u2); break;
+                case OP_CMP_LT: cond = (u1 < u2); break;
+                case OP_CMP_GT: cond = (u1 > u2); break;
+                case OP_CMP_LE: cond = (u1 <= u2); break;
+                case OP_CMP_GE: cond = (u1 >= u2); break;
+            }
+        } else {
+            switch (cmp_op) {
+                case OP_CMP_EQ: cond = (out_val->ival == right.ival); break;
+                case OP_CMP_NE: cond = (out_val->ival != right.ival); break;
+                case OP_CMP_LT: cond = (out_val->ival < right.ival); break;
+                case OP_CMP_GT: cond = (out_val->ival > right.ival); break;
+                case OP_CMP_LE: cond = (out_val->ival <= right.ival); break;
+                case OP_CMP_GE: cond = (out_val->ival >= right.ival); break;
+            }
+        }
+
+        out_val->type = BASIC_TYPE_INT;
+        out_val->ival = cond ? -1 : 0;
+        out_val->fval = 0;
+        out_val->sval = 0;
     }
     return 0;
 }
@@ -1554,10 +2132,13 @@ static int eval_not(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_va
         p++;
         *pos = p;
         if (eval_not(tok, pos, out_val) != 0) return -1;
-        out_val->ival = ~out_val->ival;
+        out_val->ival = ~val_to_int(out_val);
+        out_val->type = BASIC_TYPE_INT;
+        out_val->fval = 0;
+        out_val->sval = 0;
         return 0;
     }
-    return eval_add(tok, pos, out_val);
+    return eval_rel(tok, pos, out_val);
 }
 
 static int eval_and(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val) {
@@ -1573,7 +2154,10 @@ static int eval_and(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_va
         p++;
         *pos = p;
         if (eval_not(tok, pos, &right) != 0) return -1;
-        out_val->ival = out_val->ival & right.ival;
+        out_val->ival = val_to_int(out_val) & val_to_int(&right);
+        out_val->type = BASIC_TYPE_INT;
+        out_val->fval = 0;
+        out_val->sval = 0;
     }
     return 0;
 }
@@ -1595,52 +2179,19 @@ static int eval_or(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val
         if (eval_and(tok, pos, &right) != 0) return -1;
 
         if (op == TOK_OR) {
-            out_val->ival = out_val->ival | right.ival;
+            out_val->ival = val_to_int(out_val) | val_to_int(&right);
         } else {
-            out_val->ival = out_val->ival ^ right.ival;
+            out_val->ival = val_to_int(out_val) ^ val_to_int(&right);
         }
+        out_val->type = BASIC_TYPE_INT;
+        out_val->fval = 0;
+        out_val->sval = 0;
     }
     return 0;
 }
 
 static int basic_eval_expr(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val) {
-    if (eval_or(tok, pos, out_val) != 0) return -1;
-
-    for (;;) {
-        int cmp_op = basic_match_cmp_op(tok, pos);
-        basic_val_t right;
-        int cond = 0;
-
-        if (cmp_op == OP_CMP_NONE) break;
-
-        if (eval_or(tok, pos, &right) != 0) return -1;
-
-        if (out_val->type == BASIC_TYPE_STR && right.type == BASIC_TYPE_STR) {
-            int cmp = basic_strcmp(out_val->sval, right.sval);
-            switch (cmp_op) {
-                case OP_CMP_EQ: cond = (cmp == 0); break;
-                case OP_CMP_NE: cond = (cmp != 0); break;
-                case OP_CMP_LT: cond = (cmp < 0); break;
-                case OP_CMP_GT: cond = (cmp > 0); break;
-                case OP_CMP_LE: cond = (cmp <= 0); break;
-                case OP_CMP_GE: cond = (cmp >= 0); break;
-            }
-        } else {
-            switch (cmp_op) {
-                case OP_CMP_EQ: cond = (out_val->ival == right.ival); break;
-                case OP_CMP_NE: cond = (out_val->ival != right.ival); break;
-                case OP_CMP_LT: cond = (out_val->ival < right.ival); break;
-                case OP_CMP_GT: cond = (out_val->ival > right.ival); break;
-                case OP_CMP_LE: cond = (out_val->ival <= right.ival); break;
-                case OP_CMP_GE: cond = (out_val->ival >= right.ival); break;
-            }
-        }
-
-        out_val->type = BASIC_TYPE_INT;
-        out_val->ival = cond ? -1 : 0;
-        out_val->sval = 0;
-    }
-    return 0;
+    return eval_or(tok, pos, out_val);
 }
 
 /* --------------------------------------------------------------------------
@@ -1905,13 +2456,13 @@ static int basic_exec_open(const uint8_t __far *tok, uint16_t *pos) {
         p++; /* skip TOK_FOR */
         while (tok[p] == ' ' || tok[p] == '\t') p++;
 
-        if (basic_strnicmp((const char *)&tok[p], "OUTPUT", 6) == 0) {
+        if (basic_strnicmp_far(&tok[p], "OUTPUT", 6) == 0) {
             mode = 'O';
             p += 6;
-        } else if (tok[p] == TOK_INPUT || basic_strnicmp((const char *)&tok[p], "INPUT", 5) == 0) {
+        } else if (tok[p] == TOK_INPUT || basic_strnicmp_far(&tok[p], "INPUT", 5) == 0) {
             mode = 'I';
             p = (tok[p] == TOK_INPUT) ? (p + 1) : (p + 5);
-        } else if (basic_strnicmp((const char *)&tok[p], "APPEND", 6) == 0) {
+        } else if (basic_strnicmp_far(&tok[p], "APPEND", 6) == 0) {
             mode = 'A';
             p += 6;
         } else {
@@ -1920,7 +2471,7 @@ static int basic_exec_open(const uint8_t __far *tok, uint16_t *pos) {
         }
 
         while (tok[p] == ' ' || tok[p] == '\t') p++;
-        if (basic_strnicmp((const char *)&tok[p], "AS", 2) == 0) {
+        if (basic_strnicmp_far(&tok[p], "AS", 2) == 0) {
             p += 2;
         }
         while (tok[p] == ' ' || tok[p] == '\t') p++;
@@ -2055,6 +2606,29 @@ static int basic_exec_write_file(const uint8_t __far *tok, uint16_t *pos) {
                     basic_file_write_data(fnum, val.sval, basic_strlen(val.sval));
                 }
                 basic_file_write_data(fnum, "\"", 1);
+            } else if (val.type == BASIC_TYPE_FLOAT) {
+                char fbuf[24];
+                uint16_t flen = basic_format_float(val.fval, fbuf, sizeof(fbuf));
+                if (fbuf[0] == ' ') {
+                    basic_file_write_data(fnum, fbuf + 1, flen - 1);
+                } else {
+                    basic_file_write_data(fnum, fbuf, flen);
+                }
+            } else if (val.type == BASIC_TYPE_UINT) {
+                uint16_t uv = (uint16_t)val.ival;
+                int np = 0;
+                if (uv == 0) {
+                    num_buf[np++] = '0';
+                } else {
+                    char tmp[8];
+                    int tp = 0;
+                    while (uv > 0) {
+                        tmp[tp++] = (char)('0' + (uv % 10));
+                        uv /= 10;
+                    }
+                    while (tp > 0) num_buf[np++] = tmp[--tp];
+                }
+                basic_file_write_data(fnum, num_buf, (uint16_t)np);
             } else {
                 int16_t v = val.ival;
                 int np = 0;
@@ -2314,12 +2888,21 @@ static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
             }
             basic_strncpy(var->sval, val.sval ? val.sval : "", sizeof(var->sval) - 1);
             var->sval[sizeof(var->sval) - 1] = '\0';
-        } else {
-            if (val.type != BASIC_TYPE_INT) {
+        } else if (var->type == BASIC_TYPE_INT) {
+            if (val.type == BASIC_TYPE_STR) {
                 os_puts("Type mismatch\n");
                 return -1;
             }
+            var->ival = (val.type == BASIC_TYPE_FLOAT) ? soft_to_int(val.fval) : val.ival;
+            var->fval = 0;
+        } else {
+            if (val.type == BASIC_TYPE_STR) {
+                os_puts("Type mismatch\n");
+                return -1;
+            }
+            var->type = val.type;
             var->ival = val.ival;
+            var->fval = val.fval;
         }
     }
 
@@ -2387,10 +2970,18 @@ static int basic_exec_dim(const uint8_t __far *tok, uint16_t *pos) {
         }
 
         len = basic_strlen(var_name);
-        type = (len > 0 && var_name[len - 1] == '$') ? BASIC_TYPE_STR : BASIC_TYPE_INT;
+        if (len > 0 && var_name[len - 1] == '$') {
+            type = BASIC_TYPE_STR;
+            elem_size = BASIC_STR_ELEM_LEN;
+        } else if (len > 0 && var_name[len - 1] == '%') {
+            type = BASIC_TYPE_INT;
+            elem_size = 2;
+        } else {
+            type = BASIC_TYPE_FLOAT;
+            elem_size = 4;
+        }
 
         total_elems = (num_dims == 1) ? dim1 : (dim1 * dim2);
-        elem_size = (type == BASIC_TYPE_STR) ? BASIC_STR_ELEM_LEN : 2;
         bytes = total_elems * elem_size;
 
         if ((uint32_t)s_array_heap_free + bytes >= 65000L) {
@@ -2519,12 +3110,15 @@ static int basic_exec_for(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == TOK_STEP) {
         p++;
         if (basic_eval_expr(tok, &p, &step_val) != 0) return -1;
-        step = step_val.ival;
+        step = (step_val.type == BASIC_TYPE_FLOAT) ? soft_to_int(step_val.fval) : step_val.ival;
     }
 
     var = basic_get_or_create_var(var_name);
     if (!var) return -1;
-    var->ival = start_val.ival;
+    var->ival = (start_val.type == BASIC_TYPE_FLOAT) ? soft_to_int(start_val.fval) : start_val.ival;
+    if (var->type == BASIC_TYPE_FLOAT) {
+        var->fval = (start_val.type == BASIC_TYPE_FLOAT) ? start_val.fval : soft_from_int(start_val.ival);
+    }
 
     for (i = 0; i < s_for_sp; i++) {
         if (basic_stricmp(s_for_stack[i].var_name, var_name) == 0) {
@@ -2541,12 +3135,12 @@ static int basic_exec_for(const uint8_t __far *tok, uint16_t *pos) {
     }
 
     basic_strcpy(s_for_stack[slot].var_name, var_name);
-    s_for_stack[slot].end_val  = end_val.ival;
+    s_for_stack[slot].end_val  = (end_val.type == BASIC_TYPE_FLOAT) ? soft_to_int(end_val.fval) : end_val.ival;
     s_for_stack[slot].step_val = step;
     s_for_stack[slot].line_off = s_cur_line_off;
     s_for_stack[slot].stmt_pos = p;
 
-    if ((step > 0 && var->ival > end_val.ival) || (step < 0 && var->ival < end_val.ival)) {
+    if ((step > 0 && var->ival > s_for_stack[slot].end_val) || (step < 0 && var->ival < s_for_stack[slot].end_val)) {
         return basic_skip_to_next(tok, &p, var_name);
     }
 
@@ -2596,6 +3190,9 @@ static int basic_exec_next(const uint8_t __far *tok, uint16_t *pos) {
         if (!var) return -1;
 
         var->ival += s_for_stack[slot].step_val;
+        if (var->type == BASIC_TYPE_FLOAT) {
+            var->fval = soft_from_int(var->ival);
+        }
 
         if (s_for_stack[slot].step_val > 0) {
             if (var->ival > s_for_stack[slot].end_val) done = 1;
@@ -2811,6 +3408,8 @@ static int basic_exec_read(const uint8_t __far *tok, uint16_t *pos) {
         if (var->type == BASIC_TYPE_STR) {
             basic_strncpy(var->sval, data_str, sizeof(var->sval) - 1);
             var->sval[sizeof(var->sval) - 1] = '\0';
+        } else if (var->type == BASIC_TYPE_FLOAT) {
+            var->fval = basic_atof(data_str);
         } else {
             var->ival = basic_atoi(data_str);
         }
@@ -2914,15 +3513,21 @@ static int basic_exec_swap(const uint8_t __far *tok, uint16_t *pos) {
         return -1;
     }
 
-    if (v1->type == BASIC_TYPE_INT) {
-        int16_t tmp = v1->ival;
-        v1->ival = v2->ival;
-        v2->ival = tmp;
-    } else {
+    if (v1->type == BASIC_TYPE_STR) {
         char tmp_str[BASIC_MAX_STR_LEN + 1];
         basic_strcpy(tmp_str, v1->sval);
         basic_strcpy(v1->sval, v2->sval);
         basic_strcpy(v2->sval, tmp_str);
+    } else {
+        int16_t tmp_i = v1->ival;
+        basic_float_t tmp_f = v1->fval;
+        uint8_t tmp_t = v1->type;
+        v1->ival = v2->ival;
+        v1->fval = v2->fval;
+        v1->type = v2->type;
+        v2->ival = tmp_i;
+        v2->fval = tmp_f;
+        v2->type = tmp_t;
     }
 
     *pos = p;
@@ -3145,6 +3750,8 @@ static int basic_exec_input(const uint8_t __far *tok, uint16_t *pos) {
 
             if (var->type == BASIC_TYPE_STR) {
                 basic_strcpy(var->sval, val_str);
+            } else if (var->type == BASIC_TYPE_FLOAT) {
+                var->fval = basic_atof(val_str);
             } else {
                 var->ival = basic_atoi(val_str);
             }
@@ -3235,6 +3842,9 @@ static int basic_exec_input(const uint8_t __far *tok, uint16_t *pos) {
                         }
                     }
                     var->sval[sp] = '\0';
+                } else if (var->type == BASIC_TYPE_FLOAT) {
+                    var->fval = basic_atof(&in_buf[ip]);
+                    while (in_buf[ip] != '\0' && in_buf[ip] != ',') ip++;
                 } else {
                     var->ival = basic_atoi(&in_buf[ip]);
                     while (in_buf[ip] != '\0' && in_buf[ip] != ',') ip++;
@@ -4004,6 +4614,111 @@ static int basic_exec_play(const uint8_t __far *tok, uint16_t *pos) {
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * System, Memory & Hardware Statements (Phase 7)
+ * -------------------------------------------------------------------------- */
+
+static int basic_exec_poke(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t addr_val, val_val;
+    uint16_t addr;
+    uint8_t val;
+
+    p++; /* skip TOK_POKE */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &addr_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in POKE (expected ',')\n");
+        return -1;
+    }
+    p++;
+    if (basic_eval_expr(tok, &p, &val_val) != 0) return -1;
+
+    addr = (uint16_t)val_to_int(&addr_val);
+    val = (uint8_t)(val_to_int(&val_val) & 0xFF);
+    *((uint8_t __far *)MK_FP(s_def_seg, addr)) = val;
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_out(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t port_val, val_val;
+    uint16_t port;
+    uint8_t val;
+
+    p++; /* skip TOK_OUT */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &port_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in OUT (expected ',')\n");
+        return -1;
+    }
+    p++;
+    if (basic_eval_expr(tok, &p, &val_val) != 0) return -1;
+
+    port = (uint16_t)val_to_int(&port_val);
+    val = (uint8_t)(val_to_int(&val_val) & 0xFF);
+    outb(port, val);
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_def(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_DEF */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    /* DEF SEG [= segment] */
+    if (basic_strnicmp_far(&tok[p], "SEG", 3) == 0) {
+        p += 3;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == TOK_EQ || tok[p] == '=') {
+            basic_val_t seg_val;
+            p++;
+            if (basic_eval_expr(tok, &p, &seg_val) != 0) return -1;
+            s_def_seg = (uint16_t)val_to_int(&seg_val);
+        } else if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != TOK_ELSE) {
+            basic_val_t seg_val;
+            if (basic_eval_expr(tok, &p, &seg_val) != 0) return -1;
+            s_def_seg = (uint16_t)val_to_int(&seg_val);
+        } else {
+            s_def_seg = (uint16_t)get_ds();
+        }
+        *pos = p;
+        return 0;
+    }
+
+    os_puts("Syntax error in DEF\n");
+    return -1;
+}
+
+static int basic_exec_randomize(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_RANDOMIZE */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != TOK_ELSE) {
+        basic_val_t seed_val;
+        if (basic_eval_expr(tok, &p, &seed_val) != 0) return -1;
+        s_rnd_seed = (uint16_t)val_to_int(&seed_val);
+    } else {
+        char rbuf[32];
+        os_puts("Random number seed (-32768 to 32767)? ");
+        basic_read_line(rbuf, sizeof(rbuf));
+        s_rnd_seed = (uint16_t)basic_atoi(rbuf);
+    }
+
+    *pos = p;
+    return 0;
+}
+
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     uint16_t p = *pos;
 
@@ -4058,6 +4773,25 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                     if (basic_eval_expr(tok, &p, &val) != 0) return -1;
                     if (val.type == BASIC_TYPE_STR) {
                         if (val.sval) basic_file_write_data(fnum, val.sval, basic_strlen(val.sval));
+                    } else if (val.type == BASIC_TYPE_FLOAT) {
+                        char fbuf[24];
+                        int flen = basic_format_float(val.fval, fbuf, sizeof(fbuf));
+                        fbuf[flen++] = ' ';
+                        basic_file_write_data(fnum, fbuf, (uint16_t)flen);
+                    } else if (val.type == BASIC_TYPE_UINT) {
+                        char nbuf[16];
+                        uint16_t uv = (uint16_t)val.ival;
+                        int np = 0;
+                        nbuf[np++] = ' ';
+                        if (uv == 0) nbuf[np++] = '0';
+                        else {
+                            char tmp[8];
+                            int tp = 0;
+                            while (uv > 0) { tmp[tp++] = (char)('0' + (uv % 10)); uv /= 10; }
+                            while (tp > 0) nbuf[np++] = tmp[--tp];
+                        }
+                        nbuf[np++] = ' ';
+                        basic_file_write_data(fnum, nbuf, (uint16_t)np);
                     } else {
                         char nbuf[16];
                         int16_t v = val.ival;
@@ -4113,6 +4847,28 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
                 }
                 if (val.type == BASIC_TYPE_STR) {
                     basic_term_puts(val.sval ? val.sval : "");
+                } else if (val.type == BASIC_TYPE_FLOAT) {
+                    char fbuf[24];
+                    basic_format_float(val.fval, fbuf, sizeof(fbuf));
+                    basic_term_puts(fbuf);
+                    basic_term_putc(' ');
+                } else if (val.type == BASIC_TYPE_UINT) {
+                    basic_term_putc(' ');
+                    {
+                        char nbuf[8];
+                        uint16_t uv = (uint16_t)val.ival;
+                        int np = 0;
+                        if (uv == 0) {
+                            basic_term_putc('0');
+                        } else {
+                            while (uv > 0) {
+                                nbuf[np++] = (char)('0' + (uv % 10));
+                                uv /= 10;
+                            }
+                            while (np > 0) basic_term_putc(nbuf[--np]);
+                        }
+                    }
+                    basic_term_putc(' ');
                 } else {
                     if (val.ival >= 0) basic_term_putc(' ');
                     {
@@ -4209,6 +4965,30 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == (uint8_t)(TOK_PLAY >> 8) && tok[p + 1] == (uint8_t)(TOK_PLAY & 0xFF)) {
         *pos = p;
         return basic_exec_play(tok, pos);
+    }
+
+    /* POKE statement (Phase 7) */
+    if (tok[p] == TOK_POKE) {
+        *pos = p;
+        return basic_exec_poke(tok, pos);
+    }
+
+    /* OUT statement (Phase 7) */
+    if (tok[p] == TOK_OUT) {
+        *pos = p;
+        return basic_exec_out(tok, pos);
+    }
+
+    /* DEF statement (DEF SEG) (Phase 7) */
+    if (tok[p] == TOK_DEF) {
+        *pos = p;
+        return basic_exec_def(tok, pos);
+    }
+
+    /* RANDOMIZE statement (Phase 7) */
+    if (tok[p] == TOK_RANDOMIZE) {
+        *pos = p;
+        return basic_exec_randomize(tok, pos);
     }
 
     /* SYSTEM statement in program (2-byte token 0xFE, 0x83) */
@@ -4659,11 +5439,48 @@ int app_main(void) {
     }
 
     basic_new();
+    basic_math_init();
     basic_sound_init_opl();
     basic_sound_tone(0, 0);
 
     os_puts("hobbyOS BASIC Version 1.0 (GW-BASIC Compatible)\n");
-    os_puts("61440 Bytes free\n");
+    {
+        char nbuf[8];
+        uint16_t fmem = basic_get_free_mem();
+        int np = 0;
+        if (fmem == 0) {
+            os_putc('0');
+        } else {
+            while (fmem > 0) {
+                nbuf[np++] = (char)('0' + (fmem % 10));
+                fmem /= 10;
+            }
+            while (np > 0) os_putc(nbuf[--np]);
+        }
+        os_puts(" Bytes free\n");
+    }
+
+    {
+        const char *args = os_get_args();
+        if (args) {
+            while (*args == ' ' || *args == '\t') args++;
+            if (*args != '\0') {
+                char cmd[80];
+                int cp = 0;
+                cmd[cp++] = 'L'; cmd[cp++] = 'O'; cmd[cp++] = 'A'; cmd[cp++] = 'D'; cmd[cp++] = ' ';
+                cmd[cp++] = '"';
+                while (*args != '\0' && *args != ' ' && *args != '\t' && cp < 60) {
+                    cmd[cp++] = *args++;
+                }
+                cmd[cp++] = '"';
+                cmd[cp++] = ',';
+                cmd[cp++] = 'R';
+                cmd[cp] = '\0';
+                basic_process_input(cmd);
+            }
+        }
+    }
+
     os_puts(BASIC_PROMPT);
 
     for (;;) {

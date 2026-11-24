@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/23 18:00:36
+# 86Box v7.0 logfile, created 2026/11/24 11:32:57
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -60,20 +60,49 @@ Line 2 appended via SYS_FILE_APPEND
 [USER APP] FAT16 Root Directory:
   - KERNEL.BIN (46099 bytes)
   - BIN/ <DIR>
+  - BASIC/ <DIR>
+  - MATH.BAS (2106 bytes)
+  - SYS.BAS (2370 bytes)
   - GAMES/ <DIR>
   - PICS/ <DIR>
   - MODELS/ <DIR>
   - MUSIC/ <DIR>
-  - BOOT.SH (92 bytes)
+  - BOOT.SH (107 bytes)
   - KEYMAPS/ <DIR>
-  - TEST1.BAS (113 bytes)
-  - TEST2.BAS (225 bytes)
-  - TEST3.BAS (113 bytes)
   - DOCS/ <DIR>
 [EXEC] /BIN/HELLO.BIN exited with code 0
 Keyboard layout set to FR (/KEYMAPS/FR.MAP)
 Running /BOOT.SH...
-System ready.
+hobbyOS BASIC Version 1.0 (GW-BASIC Compatible)
+61440 Bytes free
+[2J[HhobbyOS BASIC System & Hardware Test Suite
+==========================================
 
-hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.
-SYS:/> corrupted double-linked list
+--- 1. DEF SEG & PEEK ---
+BDA Video Mode (&H40:&H49):  3  (expected 3)
+BIOS Machine ID (&HF000:&HFFFE):  254  (expected 254 or 255)
+
+--- 2. DEF SEG & POKE ---
+Poked VRAM Character: Z (code  90 ) Attr:  30 
+Restored VRAM successfully
+
+--- 3. Port I/O (INP & OUT) ---
+CGA Status Port &H3DA: &H 5  (read OK)
+AdLib Status Port &H388: &H 0  (read OK)
+
+--- 4. TIMER Function ---
+Start Time (sec since midnight):  27.9046 
+End Time after loop:              29.3878 
+Elapsed seconds:                  1.48312  (positive: -1 )
+
+--- 5. RANDOMIZE & RND ---
+Seed 42 -> R1:  0.687836   R2:  0.310547 
+Seed 42 -> R3:  0.687836   R4:  0.310547 
+PRNG Repeatability: PASSED
+RND Range [0, 1):   PASSED
+
+==========================================
+ALL SYSTEM & HARDWARE TESTS COMPLETED!
+==========================================
+Ok
+Ok

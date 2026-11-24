@@ -69,6 +69,48 @@
       - `BEEP`: Standard 800 Hz alert chime for ~150 ms.
       - `SOUND freq, duration`: Emits tone at `freq` Hz (37..32767) for `duration` clock ticks (~18.2 ticks/second) using pure 16-bit timing math.
       - `PLAY "MML..."`: Music Macro Language interpreter supporting note names (`A`..`G`, `#`/`+`/`-`), octaves (`O0`..`O6`, `>`, `<`), note lengths (`L1`..`L64`), tempos (`T32`..`T255`), articulation styles (`MN` normal, `ML` legato, `MS` staccato), and rests (`P1`..`P64`).
+  - **Memory Reporting & Unsigned Arithmetic Subsystem (`FRE`, `BASIC_TYPE_UINT`)**:
+    - `FRE(x)` and `FRE("")`: Implemented memory reporting function returning the dynamic number of free bytes available in the 64 KB interpreter segment (`61440U - used_heap`, reserving 4,096 bytes for stack and buffer overhead). Dynamically shared between `FRE` and the startup banner so both report an exact, consistent `61440 Bytes free` on a fresh start. Supports numeric dummy arguments `FRE(0)` and string dummy arguments `FRE("")` (which simulates string compaction in accordance with GW-BASIC standards).
+    - `BASIC_TYPE_UINT`: Introduced unsigned 16-bit value representation for expressions and variables to seamlessly format and print large memory values (`61440`) without negative signed 16-bit wrap (`-4096`), with support in `PRINT`, `PRINT #`, `WRITE #`, `STR$`, `LET`, and unsigned relational comparisons.
+  - **Phase 6: Dual-Path Floating-Point & Math Engine (`user/basic_math.h`, `user/basic.c`)**:
+    - **Dual-Path Architecture**: Seamlessly targets Intel 8088 / 8086 processors with hardware Intel 8087 FPU acceleration when present (`os_fpu_present() == 1`), and automatic fallback to a pure 16-bit integer soft-float IEEE-754 32-bit single-precision math engine when no coprocessor is installed.
+    - **Freestanding 8086 Assembly Primitives (`user/basic_math.h`)**: Pure freestanding implementation compiled with `-0 -fpi87 -zl` without runtime C library (`wlibc`) dependencies. Eliminates undefined compiler helper references (`__U4M`, `__U4D`, `__I4D`) via hardware 16-bit `mul16` (`mul dx` pragma returning `DX:AX`), binary shift sequences (`(x << 3) + (x << 1)` for decimal multiplication), and `u32_div10`.
+    - **Hardware 8087 Inline Assembly Pragmas**: Accelerated 8087 FPU instructions via `#pragma aux`: `fpu_hw_init` (`fninit`), `fpu_hw_add`, `fpu_hw_sub`, `fpu_hw_mul`, `fpu_hw_div`, `fpu_hw_sqr`, `fpu_hw_tan` (`fptan` + `fdivp`), `fpu_hw_atn` (`fpatan`).
+    - **Freestanding Software IEEE-754 32-bit Engine**:
+      - `soft_from_int`, `soft_from_uint`, `soft_to_int`, `soft_to_uint32`, `basic_float_cmp`.
+      - Addition & Subtraction (`soft_add_sub`): Mantissa alignment, sign arbitration, normalization.
+      - Multiplication (`soft_mul`): 24x24 mantissa multiply partitioned into 12-bit cross-multiplications using 16-bit hardware `mul16`.
+      - Division (`soft_div`): 24-step restoring division with pre-normalization and exact quotient alignment.
+      - Square Root (`soft_sqr`): Newton-Raphson iteration seeded with IEEE-754 exponent-halved initial guess (`(a >> 1) + 0x1FC00000UL`) delivering exact single-precision roots in 4 iterations.
+    - **Transcendental Functions**:
+      - Trigonometric: `SIN` and `COS` via accurate Taylor/minimax polynomial with range reduction mod $2\pi$ and reduction to $[0, \pi/4]$, `TAN` via $\sin/\cos$ (or 8087 `fptan`), and `ATN` via Abramowitz & Stegun range-reduced minimax approximation ($\arctan(x) = \pi/4 + \arctan(\frac{x-1}{x+1})$) delivering $< 6 \times 10^{-5}$ error across all quadrants.
+      - Exponential & Logarithmic: `EXP` via Taylor series, `LOG` via argument-reduced $\ln((1+y)/(1-y))$ series, and Power operator `^` (`TOK_CARET`) via $a^b = \exp(b \ln(a))$ with exact integer fast path.
+      - Number functions: `INT`, `FIX`, `CINT`, `CSNG`, float `ABS`, float `SGN`, `VAL`, `STR$`.
+    - **Interpreter Integration & Bug Fixes**:
+      - Unsuffixed variables default to single-precision float (`BASIC_TYPE_FLOAT`) in conformance with GW-BASIC / BASICA.
+      - Real literal parsing (decimals and scientific notation `E`/`D`), float array support (`DIM A(10)` with 4-byte float elements).
+      - Fixed left-hand operand type clobbering in `eval_mul`, `eval_power`, and `eval_add` where `out_val->type = BASIC_TYPE_FLOAT` was erroneously assigned before converting the left operand (`val_to_float(out_val)`), which had caused integer operands to read as zero in float division (`10 / 4 = 0`) and exponentiation (`2 ^ 10 = 0`).
+      - Implemented 32-bit integer float converter `soft_from_uint32` and updated `basic_parse_float_far` so fractional mantissas and divisors are converted with full 32-bit precision, fixing 16-bit truncation that previously distorted floating literals (e.g. `3.141593` becoming `3.6203`).
+      - Resolved 8087 FPU lockup on NEC V20 configurations during `ATN`: The Intel 8087 coprocessor specification requires $|ST(1)| < ST(0)$ for `FPATAN`, causing 86Box's NEC V20 FPU emulation to enter an infinite loop on boundary inputs like $ATN(1.0)$. Replaced raw `FPATAN` with the domain-unrestricted range-reduced minimax polynomial (which internally uses 8087 hardware acceleration for all additions, subtractions, multiplications, and divisions), restoring rock-solid stability across both Intel 8088 and NEC V20 hardware.
+      - Seamless promotion across mixed integer/float arithmetic in expressions, `/` floating division, `\` integer division, and float relational comparisons.
+      - Floating point support in `PRINT`, `PRINT #`, `WRITE #`, `INPUT`, `INPUT #`, `READ`, and `FOR ... NEXT`.
+      - **Target Math Verification Test Suite (`/BASIC/MATH.BAS`, `/MATH.BAS`)**: Created comprehensive math verification test suite covering 12 test sections (arithmetic `/`, `\`, `MOD`, `*`, `+`, `-`, powers `2^10`, `3^3`, `9^0.5`, roots `SQR(2)`, `SQR(64)`, transcendentals `SIN`, `COS`, `TAN`, `ATN`, `EXP`, `LOG`, conversions `INT`, `FIX`, `ABS`, `SGN`, float arrays & loops). Verified 100% pass on target Book8088 emulator. Added CLI argument auto-run in `BASIC.BIN` (`basic /math.bas` or `basic math.bas`).
+  - **Phase 7: System, Memory & Hardware Access (`DEF SEG`, `PEEK`, `POKE`, `INP`, `OUT`, `TIMER`, `RANDOMIZE`, `RND`)**:
+    - **Memory Segment Control (`DEF SEG`)**: Maintained active evaluation segment `s_def_seg` (defaulting to interpreter DS via `get_ds()`). Bare `DEF SEG` restores to DS; `DEF SEG = expr` evaluates segment addresses (e.g. `DEF SEG = &H0040` for BIOS Data Area, `DEF SEG = &HB800` for CGA VRAM, `DEF SEG = &HF000` for ROM BIOS).
+    - **Memory Access Functions (`PEEK`, `POKE`)**:
+      - `PEEK(addr)`: Reads 8-bit unsigned byte from `MK_FP(s_def_seg, addr)`.
+      - `POKE addr, val`: Writes low 8 bits of `val` to `MK_FP(s_def_seg, addr)`.
+    - **Hardware Port I/O (`INP`, `OUT`)**:
+      - Direct hardware port access via freestanding 8086 `#pragma aux` inline assembly routines `inb(port)` (`in al, dx`) and `outb(port, val)` (`out dx, al`).
+      - `INP(port)`: Reads 8-bit value from 16-bit I/O port address.
+      - `OUT port, val`: Sends 8-bit byte value to 16-bit I/O port address.
+    - **Time Subsystem (`TIMER`)**: Reads 32-bit tick count from BIOS Data Area `0x0040:0x006C` (updated at 18.206482 Hz), scales by `0.05492549` via the floating-point math engine, and returns elapsed seconds since midnight with sub-second precision.
+    - **PRNG Subsystem (`RANDOMIZE`, `RND`)**:
+      - `RANDOMIZE [seed]`: Re-seeds the 16-bit linear congruential generator seed `s_rnd_seed` (`seed * 214013 + 2531011`). Prompts for user input if no argument is supplied.
+      - `RND [(expr)]`: Returns single-precision float strictly in $[0.0, 1.0)$. Negative argument seeds the PRNG; zero returns the previous random float; positive or omitted advances the PRNG sequence.
+    - **Expression Grammar Precedence Correction**: Corrected operator precedence order in `basic_eval_expr` by placing relational comparisons (`eval_rel`: `=`, `<>`, `<`, `>`, `<=`, `>=`) at Level 4 between additive arithmetic (`eval_add`) and logical NOT (`eval_not`), AND (`eval_and`), and OR/XOR (`eval_or`), ensuring relational expressions like `R1 = R3 AND R2 = R4` correctly evaluate as `(R1 = R3) AND (R2 = R4)` rather than improperly binding logical `AND` before relational equality.
+    - **Far Token Case-Insensitive String Matcher (`basic_strnicmp_far`)**: Implemented segmented far pointer comparison to avoid DS truncation when matching keywords and tokens in `s_basic_seg`.
+    - **Target System Verification Suite (`/BASIC/SYS.BAS`, `/SYS.BAS`)**: Comprehensive hardware verification test suite validating BDA video mode read (Mode 3), ROM BIOS machine ID (`0xFE` IBM PC/XT), CGA VRAM poke and restore, live CGA status port `&H3DA` and OPL status `&H388` reads, real-time `TIMER` benchmarking, and PRNG repeatability. Verified 100% passed on target Book8088 emulator.
 
 ## Revision 1.0.2 (2026-11-21)
 
