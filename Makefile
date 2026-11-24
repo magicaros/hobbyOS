@@ -147,6 +147,8 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		basic/test3.bas:/TEST3.BAS \
 		basic/str.bas:/BASIC/STR.BAS \
 		basic/str.bas:/STR.BAS \
+		basic/err.bas:/BASIC/ERR.BAS \
+		basic/err.bas:/ERR.BAS \
 		build/test80.com:/BIN/TEST80.COM \
 		games/zork1.z3:/GAMES/ZORK1.Z3 \
 		build/sample.cga:/PICS/SAMPLE.CGA \

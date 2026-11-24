@@ -120,6 +120,20 @@ static uint16_t s_pc_line           = 0;
 static uint16_t s_pc_stmt           = 0;
 static int      s_jumped            = 0;
 
+/* Error handling state (Phase 9) */
+static uint16_t s_error_goto_line   = 0;
+static int16_t  s_err               = 0;
+static uint16_t s_erl               = 0;
+static int      s_in_error_handler  = 0;
+static int      s_err_reported      = 0;
+static uint16_t s_err_line_off      = 0;
+static uint16_t s_err_stmt_pos      = 0;
+static uint16_t s_err_next_line     = 0;
+static uint16_t s_err_next_stmt     = 0;
+static uint16_t s_cur_stmt_pos      = 0;
+static uint16_t s_cur_next_line     = 0;
+static uint16_t s_cur_next_stmt     = 0;
+
 /* Variable table */
 static basic_var_t s_vars[BASIC_MAX_VARS];
 static uint16_t    s_num_vars       = 0;
@@ -194,6 +208,8 @@ static uint8_t  s_play_style        = 0;    /* 0 = normal (7/8), 1 = legato (8/8
 static int basic_eval_expr(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val);
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos);
 static int basic_exec_mid_stmt(const uint8_t __far *tok, uint16_t *pos);
+static int basic_error(uint8_t code, const char *msg);
+static uint16_t basic_find_line(uint16_t line_num);
 static int basic_skip_to_next(const uint8_t __far *tok, uint16_t *pos, const char *var_name);
 static int basic_skip_to_wend(const uint8_t __far *tok, uint16_t *pos);
 static void basic_close_all_files(void);
@@ -557,12 +573,10 @@ static int basic_read_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, bas
     uint16_t off;
 
     if (i1 < 0 || (uint16_t)i1 >= arr->dim1) {
-        os_puts("Subscript out of range\n");
-        return -1;
+        return basic_error(9, "Subscript out of range\n");
     }
     if (arr->num_dims == 2 && (i2 < 0 || (uint16_t)i2 >= arr->dim2)) {
-        os_puts("Subscript out of range\n");
-        return -1;
+        return basic_error(9, "Subscript out of range\n");
     }
 
     linear_idx = (arr->num_dims == 1) ? (uint16_t)i1 : ((uint16_t)i1 * arr->dim2 + (uint16_t)i2);
@@ -602,20 +616,17 @@ static int basic_write_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, co
     uint16_t off;
 
     if (i1 < 0 || (uint16_t)i1 >= arr->dim1) {
-        os_puts("Subscript out of range\n");
-        return -1;
+        return basic_error(9, "Subscript out of range\n");
     }
     if (arr->num_dims == 2 && (i2 < 0 || (uint16_t)i2 >= arr->dim2)) {
-        os_puts("Subscript out of range\n");
-        return -1;
+        return basic_error(9, "Subscript out of range\n");
     }
 
     linear_idx = (arr->num_dims == 1) ? (uint16_t)i1 : ((uint16_t)i1 * arr->dim2 + (uint16_t)i2);
 
     if (arr->type == BASIC_TYPE_INT) {
         if (val->type != BASIC_TYPE_INT && val->type != BASIC_TYPE_UINT) {
-            os_puts("Type mismatch\n");
-            return -1;
+            return basic_error(13, "Type mismatch\n");
         }
         off = arr->data_off + linear_idx * 2;
         mem[off] = (uint8_t)(val->ival & 0xFF);
@@ -629,8 +640,7 @@ static int basic_write_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, co
         } else if (val->type == BASIC_TYPE_UINT) {
             fv = soft_from_uint((uint16_t)val->ival);
         } else {
-            os_puts("Type mismatch\n");
-            return -1;
+            return basic_error(13, "Type mismatch\n");
         }
         off = arr->data_off + linear_idx * 4;
         mem[off]     = (uint8_t)(fv & 0xFF);
@@ -640,8 +650,7 @@ static int basic_write_array_elem(basic_array_t *arr, int16_t i1, int16_t i2, co
     } else {
         uint16_t k;
         if (val->type != BASIC_TYPE_STR) {
-            os_puts("Type mismatch\n");
-            return -1;
+            return basic_error(13, "Type mismatch\n");
         }
         off = arr->data_off + linear_idx * BASIC_STR_ELEM_LEN;
         for (k = 0; k < BASIC_STR_ELEM_LEN - 1 && val->sval && val->sval[k] != 0; k++) {
@@ -889,6 +898,11 @@ static void basic_new(void) {
     s_data_line_off = 0;
     s_data_stmt_pos = 0;
     s_def_seg = (uint16_t)get_ds();
+    s_error_goto_line = 0;
+    s_err = 0;
+    s_erl = 0;
+    s_in_error_handler = 0;
+    s_err_reported = 0;
     if (s_basic_seg) {
         uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
         mem[0] = 0; mem[1] = 0; mem[2] = 0; mem[3] = 0;
@@ -921,6 +935,78 @@ static uint16_t basic_find_line(uint16_t line_num) {
         cur = next;
     }
     return 0;
+}
+
+static void basic_print_error_name(uint8_t code) {
+    switch (code) {
+        case 1:  os_puts("NEXT without FOR"); break;
+        case 2:  os_puts("Syntax error"); break;
+        case 3:  os_puts("RETURN without GOSUB"); break;
+        case 4:  os_puts("Out of DATA"); break;
+        case 5:  os_puts("Illegal function call"); break;
+        case 6:  os_puts("Overflow"); break;
+        case 7:  os_puts("Out of memory"); break;
+        case 8:  os_puts("Undefined line number"); break;
+        case 9:  os_puts("Subscript out of range"); break;
+        case 10: os_puts("Duplicate Definition"); break;
+        case 11: os_puts("Division by zero"); break;
+        case 13: os_puts("Type mismatch"); break;
+        case 14: os_puts("Out of string space"); break;
+        case 20: os_puts("RESUME without error"); break;
+        case 30: os_puts("WEND without WHILE"); break;
+        case 52: os_puts("Bad file number"); break;
+        case 53: os_puts("File not found"); break;
+        case 54: os_puts("Bad file mode"); break;
+        case 55: os_puts("File already open"); break;
+        default: os_puts("Unprintable error"); break;
+    }
+}
+
+static void basic_puts_no_nl(const char *s) {
+    if (!s) return;
+    while (*s) {
+        if (*s == '\n' && *(s + 1) == '\0') break;
+        os_putc(*s++);
+    }
+}
+
+static int basic_error(uint8_t code, const char *msg) {
+    s_err = (int16_t)code;
+    s_erl = s_cur_line_num;
+
+    if (s_error_goto_line != 0 && !s_in_error_handler && s_cur_line_num != 0) {
+        uint16_t target_off = basic_find_line(s_error_goto_line);
+        if (!target_off) {
+            os_puts("Undefined line number in ON ERROR GOTO\n");
+            s_running = 0;
+            return -1;
+        }
+        s_in_error_handler = 1;
+        s_err_line_off  = s_cur_line_off;
+        s_err_stmt_pos  = s_cur_stmt_pos;
+        s_err_next_line = s_cur_next_line;
+        s_err_next_stmt = s_cur_next_stmt;
+
+        s_pc_line = target_off;
+        s_pc_stmt = 4;
+        s_jumped = 1;
+        return -1;
+    }
+
+    if (msg) {
+        if (s_cur_line_num != 0) {
+            basic_puts_no_nl(msg);
+        } else {
+            os_puts(msg);
+            if (msg[basic_strlen(msg) - 1] != '\n') os_putc('\n');
+        }
+    } else {
+        basic_print_error_name(code);
+        if (s_cur_line_num == 0) os_putc('\n');
+    }
+
+    s_running = 0;
+    return -1;
 }
 
 static void basic_delete_line(uint16_t line_num) {
@@ -1188,6 +1274,28 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             *pos = p;
             return 0;
         }
+    }
+
+    /* Built-in variable/function: ERR (token 0xD5) */
+    if (tok[p] == TOK_ERR) {
+        p++;
+        out_val->type = BASIC_TYPE_INT;
+        out_val->ival = s_err;
+        out_val->fval = 0;
+        out_val->sval = 0;
+        *pos = p;
+        return 0;
+    }
+
+    /* Built-in variable/function: ERL (token 0xD4) */
+    if (tok[p] == TOK_ERL) {
+        p++;
+        out_val->type = BASIC_TYPE_INT;
+        out_val->ival = (int16_t)s_erl;
+        out_val->fval = 0;
+        out_val->sval = 0;
+        *pos = p;
+        return 0;
     }
 
     /* Built-in function: INKEY$ (token 0xDE) */
@@ -2181,8 +2289,7 @@ static int eval_mul(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_va
             lf = val_to_float(out_val);
             rf = val_to_float(&right);
             if (rf == 0) {
-                os_puts("Division by zero\n");
-                return -1;
+                return basic_error(11, "Division by zero\n");
             }
             out_val->type = BASIC_TYPE_FLOAT;
             out_val->fval = basic_float_div(lf, rf);
@@ -2200,8 +2307,7 @@ static int eval_mul(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_va
         } else if (op == TOK_INTDIV || op == '\\') {
             int16_t ri = val_to_int(&right);
             if (ri == 0) {
-                os_puts("Division by zero\n");
-                return -1;
+                return basic_error(11, "Division by zero\n");
             }
             out_val->type = BASIC_TYPE_INT;
             out_val->ival = val_to_int(out_val) / ri;
@@ -2209,8 +2315,7 @@ static int eval_mul(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_va
         } else if (op == TOK_MOD) {
             int16_t ri = val_to_int(&right);
             if (ri == 0) {
-                os_puts("Division by zero\n");
-                return -1;
+                return basic_error(11, "Division by zero\n");
             }
             out_val->type = BASIC_TYPE_INT;
             out_val->ival = val_to_int(out_val) % ri;
@@ -3002,10 +3107,7 @@ static int basic_skip_to_else(const uint8_t __far *tok, uint16_t *pos) {
                 uint16_t target_line = basic_parse_uint_far(tok, &p);
                 uint16_t target_off = basic_find_line(target_line);
                 if (target_off == 0) {
-                    os_puts("Undefined line number ");
-                    basic_print_uint(target_line);
-                    os_putc('\n');
-                    return -1;
+                    return basic_error(8, "Undefined line number\n");
                 }
                 s_pc_line = target_off;
                 s_pc_stmt = 4;
@@ -3098,22 +3200,19 @@ static int basic_exec_let(const uint8_t __far *tok, uint16_t *pos) {
 
         if (var->type == BASIC_TYPE_STR) {
             if (val.type != BASIC_TYPE_STR) {
-                os_puts("Type mismatch\n");
-                return -1;
+                return basic_error(13, "Type mismatch\n");
             }
             basic_strncpy(var->sval, val.sval ? val.sval : "", sizeof(var->sval) - 1);
             var->sval[sizeof(var->sval) - 1] = '\0';
         } else if (var->type == BASIC_TYPE_INT) {
             if (val.type == BASIC_TYPE_STR) {
-                os_puts("Type mismatch\n");
-                return -1;
+                return basic_error(13, "Type mismatch\n");
             }
             var->ival = (val.type == BASIC_TYPE_FLOAT) ? soft_to_int(val.fval) : val.ival;
             var->fval = 0;
         } else {
             if (val.type == BASIC_TYPE_STR) {
-                os_puts("Type mismatch\n");
-                return -1;
+                return basic_error(13, "Type mismatch\n");
             }
             var->type = val.type;
             var->ival = val.ival;
@@ -3381,8 +3480,7 @@ static int basic_exec_next(const uint8_t __far *tok, uint16_t *pos) {
         }
 
         if (s_for_sp == 0) {
-            os_puts("NEXT without FOR\n");
-            return -1;
+            return basic_error(1, "NEXT without FOR\n");
         }
 
         if (has_var) {
@@ -3394,8 +3492,7 @@ static int basic_exec_next(const uint8_t __far *tok, uint16_t *pos) {
                 }
             }
             if (slot == -1) {
-                os_puts("NEXT without FOR\n");
-                return -1;
+                return basic_error(1, "NEXT without FOR\n");
             }
         } else {
             slot = (int)s_for_sp - 1;
@@ -3520,8 +3617,7 @@ static int basic_exec_wend(const uint8_t __far *tok, uint16_t *pos) {
     p++; /* skip TOK_WEND */
 
     if (s_while_sp == 0) {
-        os_puts("WEND without WHILE\n");
-        return -1;
+        return basic_error(30, "WEND without WHILE\n");
     }
 
     s_pc_line = s_while_stack[s_while_sp - 1].while_line_off;
@@ -3536,8 +3632,7 @@ static int basic_read_next_data_item(char *out_buf, uint16_t max_len) {
 
     for (;;) {
         if (s_data_line_off == 0) {
-            os_puts("Out of DATA\n");
-            return -1;
+            return basic_error(4, "Out of DATA\n");
         }
 
         if (s_data_stmt_pos == 0) {
@@ -3765,10 +3860,7 @@ static int basic_exec_goto(const uint8_t __far *tok, uint16_t *pos) {
 
     target_off = basic_find_line(target_line);
     if (target_off == 0) {
-        os_puts("Undefined line number ");
-        basic_print_uint(target_line);
-        os_putc('\n');
-        return -1;
+        return basic_error(8, "Undefined line number\n");
     }
 
     s_pc_line = target_off;
@@ -3794,15 +3886,11 @@ static int basic_exec_gosub(const uint8_t __far *tok, uint16_t *pos) {
 
     target_off = basic_find_line(target_line);
     if (target_off == 0) {
-        os_puts("Undefined line number ");
-        basic_print_uint(target_line);
-        os_putc('\n');
-        return -1;
+        return basic_error(8, "Undefined line number\n");
     }
 
     if (s_gosub_sp >= BASIC_MAX_GOSUB) {
-        os_puts("Out of memory (GOSUB overflow)\n");
-        return -1;
+        return basic_error(7, "Out of memory\n");
     }
 
     while (tok[p] == ' ' || tok[p] == '\t') p++;
@@ -3824,8 +3912,7 @@ static int basic_exec_return(const uint8_t __far *tok, uint16_t *pos) {
     p++;
 
     if (s_gosub_sp == 0) {
-        os_puts("RETURN without GOSUB\n");
-        return -1;
+        return basic_error(3, "RETURN without GOSUB\n");
     }
 
     s_gosub_sp--;
@@ -3865,10 +3952,7 @@ static int basic_exec_if(const uint8_t __far *tok, uint16_t *pos) {
                 uint16_t target_line = basic_parse_uint_far(tok, &p);
                 uint16_t target_off = basic_find_line(target_line);
                 if (target_off == 0) {
-                    os_puts("Undefined line number ");
-                    basic_print_uint(target_line);
-                    os_putc('\n');
-                    return -1;
+                    return basic_error(8, "Undefined line number\n");
                 }
                 s_pc_line = target_off;
                 s_pc_stmt = 4;
@@ -5458,6 +5542,188 @@ static int basic_exec_mid_stmt(const uint8_t __far *tok, uint16_t *pos) {
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Phase 9: Structured Error Handling (ON ERROR GOTO, RESUME, ERROR)
+ * -------------------------------------------------------------------------- */
+
+static int basic_exec_on(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_ON */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    /* ON ERROR GOTO <linenum> */
+    if (tok[p] == TOK_ERROR) {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != TOK_GOTO) {
+            return basic_error(2, "Syntax error in ON ERROR\n");
+        }
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+        {
+            basic_val_t line_val;
+            uint16_t target_line;
+            if (basic_eval_expr(tok, &p, &line_val) != 0) return -1;
+            target_line = (uint16_t)val_to_int(&line_val);
+            s_error_goto_line = target_line;
+
+            if (target_line == 0 && s_in_error_handler) {
+                /* ON ERROR GOTO 0 inside error handler disables handler and re-raises error */
+                s_in_error_handler = 0;
+                s_err_reported = 1;
+                s_running = 0;
+                basic_print_error_name((uint8_t)s_err);
+                os_puts(" in ");
+                basic_print_uint(s_erl);
+                os_putc('\n');
+                return -1;
+            }
+        }
+        *pos = p;
+        return 0;
+    }
+
+    /* Computed ON <expr> GOTO/GOSUB <line1>, <line2>, ... */
+    {
+        basic_val_t expr_val;
+        int16_t idx;
+        int is_gosub = 0;
+        uint16_t cur_idx = 1;
+        uint16_t target_line = 0;
+
+        if (basic_eval_expr(tok, &p, &expr_val) != 0) return -1;
+        idx = val_to_int(&expr_val);
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == TOK_GOTO) {
+            is_gosub = 0;
+        } else if (tok[p] == TOK_GOSUB) {
+            is_gosub = 1;
+        } else {
+            return basic_error(2, "Syntax error in ON\n");
+        }
+        p++;
+
+        while (tok[p] != 0x00 && tok[p] != ':' && tok[p] != TOK_ELSE) {
+            basic_val_t line_val;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ',') p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == 0x00 || tok[p] == ':' || tok[p] == TOK_ELSE) break;
+
+            if (basic_eval_expr(tok, &p, &line_val) != 0) return -1;
+            if (cur_idx == (uint16_t)idx) {
+                target_line = (uint16_t)val_to_int(&line_val);
+            }
+            cur_idx++;
+
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] != ',') break;
+        }
+
+        if (target_line != 0) {
+            uint16_t target_off = basic_find_line(target_line);
+            if (!target_off) {
+                return basic_error(8, "Undefined line number\n");
+            }
+            if (is_gosub) {
+                if (s_gosub_sp >= BASIC_MAX_GOSUB) {
+                    return basic_error(7, "Out of memory\n");
+                }
+                s_gosub_stack[s_gosub_sp].line_off = s_cur_line_off;
+                s_gosub_stack[s_gosub_sp].stmt_pos = p;
+                s_gosub_sp++;
+            }
+            s_pc_line = target_off;
+            s_pc_stmt = 4;
+            s_jumped = 1;
+        }
+
+        *pos = p;
+        return 0;
+    }
+}
+
+static int basic_exec_resume(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    p++; /* skip TOK_RESUME */
+
+    if (!s_in_error_handler) {
+        return basic_error(20, "RESUME without error\n");
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == TOK_NEXT) {
+        /* RESUME NEXT */
+        p++;
+        s_in_error_handler = 0;
+        if (s_err_next_line == 0) {
+            /* Past the end of program */
+            s_running = 0;
+        } else {
+            s_pc_line = s_err_next_line;
+            s_pc_stmt = s_err_next_stmt;
+            s_jumped = 1;
+        }
+        *pos = p;
+        return 0;
+    }
+
+    if (tok[p] != 0x00 && tok[p] != ':' && tok[p] != TOK_ELSE) {
+        /* RESUME <linenum> or RESUME 0 */
+        basic_val_t line_val;
+        uint16_t target_line;
+        if (basic_eval_expr(tok, &p, &line_val) != 0) return -1;
+        target_line = (uint16_t)val_to_int(&line_val);
+        if (target_line == 0) {
+            /* RESUME 0 -> retry faulting statement */
+            s_in_error_handler = 0;
+            s_pc_line = s_err_line_off;
+            s_pc_stmt = s_err_stmt_pos;
+            s_jumped = 1;
+        } else {
+            uint16_t target_off = basic_find_line(target_line);
+            if (!target_off) {
+                return basic_error(8, "Undefined line number\n");
+            }
+            s_in_error_handler = 0;
+            s_pc_line = target_off;
+            s_pc_stmt = 4;
+            s_jumped = 1;
+        }
+        *pos = p;
+        return 0;
+    }
+
+    /* Bare RESUME -> retry faulting statement */
+    s_in_error_handler = 0;
+    s_pc_line = s_err_line_off;
+    s_pc_stmt = s_err_stmt_pos;
+    s_jumped = 1;
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_error_stmt(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t code_val;
+    int16_t code;
+
+    p++; /* skip TOK_ERROR */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &code_val) != 0) return -1;
+    code = val_to_int(&code_val);
+    if (code < 1 || code > 255) {
+        return basic_error(5, "Illegal function call\n");
+    }
+
+    *pos = p;
+    return basic_error((uint8_t)code, 0);
+}
+
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     uint16_t p = *pos;
 
@@ -5474,6 +5740,26 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         *pos = p;
         return 0;
     }
+
+    /* ON statement (ON ERROR GOTO, ON expr GOTO/GOSUB) */
+    if (tok[p] == TOK_ON) {
+        *pos = p;
+        return basic_exec_on(tok, pos);
+    }
+
+    /* RESUME statement */
+    if (tok[p] == TOK_RESUME) {
+        *pos = p;
+        return basic_exec_resume(tok, pos);
+    }
+
+    /* ERROR statement */
+    if (tok[p] == TOK_ERROR) {
+        *pos = p;
+        return basic_exec_error_stmt(tok, pos);
+    }
+
+    /* MID$(var$, start [, len]) = expr$ statement */
 
     /* MID$(var$, start [, len]) = expr$ statement */
     if (tok[p] == 0xFF && tok[p + 1] == (uint8_t)(TOK_MID & 0xFF)) {
@@ -5972,6 +6258,36 @@ static int basic_exec_line(const uint8_t __far *tok) {
     return 0;
 }
 
+static void basic_scan_stmt_boundary(const uint8_t __far *line_tok, uint16_t cur_pos,
+                                     uint16_t next_line,
+                                     uint16_t *out_next_line, uint16_t *out_next_stmt) {
+    uint16_t p = cur_pos;
+    while (line_tok[p] != 0x00) {
+        if (line_tok[p] == '"') {
+            p++;
+            while (line_tok[p] != 0x00 && line_tok[p] != '"') p++;
+            if (line_tok[p] == '"') p++;
+            continue;
+        }
+        if (line_tok[p] == TOK_REM || line_tok[p] == TOK_SQUOTE) {
+            break;
+        }
+        if (line_tok[p] == ':') {
+            p++;
+            while (line_tok[p] == ' ' || line_tok[p] == '\t') p++;
+            *out_next_line = s_cur_line_off;
+            *out_next_stmt = p;
+            return;
+        }
+        if (line_tok[p] == TOK_ELSE) {
+            break;
+        }
+        p++;
+    }
+    *out_next_line = next_line;
+    *out_next_stmt = 4;
+}
+
 static void basic_cmd_run(void) {
     uint8_t __far *mem = (uint8_t __far *)MK_FP(s_basic_seg, 0);
 
@@ -5989,6 +6305,12 @@ static void basic_cmd_run(void) {
     s_last_y = 0;
     s_gfx_row = 0;
     s_gfx_col = 0;
+    s_error_goto_line = 0;
+    s_err = 0;
+    s_erl = 0;
+    s_in_error_handler = 0;
+    s_err_reported = 0;
+    s_err_reported = 0;
     s_running = 1;
     s_pc_line = s_prog_head;
     s_pc_stmt = 4;
@@ -6017,7 +6339,20 @@ static void basic_cmd_run(void) {
 
         while (mem[s_cur_line_off + s_pc_stmt] != 0x00 && s_running && !s_jumped) {
             uint16_t pos = s_pc_stmt;
+            s_cur_stmt_pos = s_pc_stmt;
+            basic_scan_stmt_boundary(&mem[s_cur_line_off], s_pc_stmt, next_line,
+                                     &s_cur_next_line, &s_cur_next_stmt);
+
             if (basic_exec_statement(&mem[s_cur_line_off], &pos) != 0) {
+                if (s_jumped) {
+                    /* Trapped by ON ERROR GOTO */
+                    break;
+                }
+                if (s_err_reported) {
+                    s_err_reported = 0;
+                    s_running = 0;
+                    break;
+                }
                 if (s_screen_mode != 0) {
                     os_gfx_set_mode(0x03);
                     s_screen_mode = 0;

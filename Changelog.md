@@ -129,6 +129,22 @@
       - Literal escaping: Underline `_` escapes the following character as a literal text character; format string automatically wraps across multiple arguments and handles trailing format literals.
       - Freestanding arithmetic: Formatter operates using 16-bit integer and soft-float scaling without invoking Watcom runtime library division helpers (`__U4D`/`__I4D`).
     - **Target String Verification Suite (`/BASIC/STR.BAS`, `/STR.BAS`)**: Comprehensive test suite covering all 6 functional areas (STRING$, SPACE$, HEX$, OCT$, INSTR, MID$=, PRINT USING, and PRINT # USING). Verified 100% passed on target Book8088 emulator.
+  - **Phase 9: Structured Error Handling (`ON ERROR GOTO`, `RESUME`, `ERR`, `ERL`, `ERROR`, Computed `ON...GOTO/GOSUB`)**:
+    - **Error Trapping Engine (`ON ERROR GOTO`)**:
+      - `ON ERROR GOTO <linenum>`: Activates runtime error trapping redirecting control flow to the specified line number upon any runtime error (division by zero, overflow, subscript out of range, syntax error, undefined line, type mismatch, etc.).
+      - `ON ERROR GOTO 0`: When executed outside an error handler, disables error trapping. When executed inside an active error handler, disables trapping and immediately re-raises the active error as an untrapped fatal error at `s_erl` in accordance with GW-BASIC standards.
+      - Error variables `ERR` (`TOK_ERR` `0x00D5`) returning the error code (1..55) and `ERL` (`TOK_ERL` `0x00D4`) returning the line number where the error occurred.
+    - **Resume & Statement Recovery (`RESUME`)**:
+      - `RESUME` / `RESUME 0`: Clears error handling state and retries the exact faulting statement after variable or state correction.
+      - `RESUME NEXT`: Clears error handling state and resumes execution at the statement immediately following the faulting statement on the same line (separated by `:`), or advances to the beginning of the subsequent line if the error occurred on the final statement of a line. Implemented statement boundary scanning (`basic_scan_stmt_boundary`) skipping quoted strings and comments (`REM`, `'`).
+      - `RESUME <linenum>`: Clears error handling state and branches execution directly to the specified target line number.
+      - Traps `RESUME without error` (Error 20) when `RESUME` is executed outside an active error handler.
+    - **User Error Generation (`ERROR`)**:
+      - `ERROR <expr>` (`TOK_ERROR` `0x00A7`): Simulates or raises runtime error code $1 \le \text{code} \le 255$, routing to the active error handler or terminating with standard error message.
+    - **Computed Branching (`ON <expr> GOTO/GOSUB`)**:
+      - `ON <expr> GOTO <line1>, <line2>, ...`: Jumps to the $n$-th line number in the list based on 1-based integer expression value; falls through if index is out of list bounds.
+      - `ON <expr> GOSUB <line1>, <line2>, ...`: Calls the $n$-th line number subroutine in the list, pushing return line and statement position to the GOSUB call stack.
+    - **Target Error Handling Verification Suite (`/BASIC/ERR.BAS`, `/ERR.BAS`)**: Comprehensive verification test suite covering 6 test sections: division by zero trap with `ERR`/`ERL` verification and `RESUME NEXT`; statement retry via `RESUME 0` repairing divisor; custom error code generation with `ERROR 55` and `RESUME <line>`; multi-branch computed `ON...GOTO`; multi-branch computed `ON...GOSUB`; and multi-statement line recovery via `RESUME NEXT`. Verified 100% passed on target Book8088 emulator.
 
 ## Revision 1.0.2 (2026-11-21)
 
