@@ -171,6 +171,14 @@ static basic_event_trap_t s_key_trap[BASIC_MAX_TRAP_KEYS];
 static char               s_fkey_strings[11][16];
 static uint8_t            s_key_visible       = 0;
 
+/* Gameport / Joystick State (Phase 16) */
+#define GAMEPORT_IO_PORT    0x201
+#define GAMEPORT_MAX_CYCLES 2000
+static uint16_t           s_stick_cache[4]    = {0, 0, 0, 0};
+static uint8_t            s_strig_latched[4]  = {0, 0, 0, 0};
+static uint8_t            s_strig_enabled     = 0;
+static basic_event_trap_t s_strig_trap[8];
+
 #define BASIC_KEY_FIFO_SIZE 64
 static uint8_t            s_key_fifo[BASIC_KEY_FIFO_SIZE];
 static uint8_t            s_key_fifo_head     = 0;
@@ -320,6 +328,13 @@ static int basic_exec_paint(const uint8_t __far *tok, uint16_t *pos);
 static int basic_exec_get_gfx(const uint8_t __far *tok, uint16_t *pos);
 static int basic_exec_put_gfx(const uint8_t __far *tok, uint16_t *pos);
 static int basic_exec_draw(const uint8_t __far *tok, uint16_t *pos);
+
+/* Phase 15 Forward Declarations */
+static int basic_exec_call(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_wait(const uint8_t __far *tok, uint16_t *pos);
+
+/* Phase 16 Forward Declarations */
+static int basic_exec_strig(const uint8_t __far *tok, uint16_t *pos);
 
 /* --------------------------------------------------------------------------
  * Helper String & Math Functions
@@ -1115,6 +1130,37 @@ static uint8_t bios_read_pixel(uint16_t x, uint16_t y) { (void)x; (void)y; retur
 static void bios_set_timer_ticks(uint16_t hi, uint16_t lo) { (void)hi; (void)lo; }
 #endif
 
+#ifdef __WATCOMC__
+static void basic_call_far_raw(const uint16_t *target, uint16_t num_args, const uint16_t *args);
+#pragma aux basic_call_far_raw = \
+    "push bp" \
+    "push ds" \
+    "push es" \
+    "push si" \
+    "push di" \
+    "mov bp, sp" \
+    "jcxz do_call" \
+"push_loop:" \
+    "lodsw" \
+    "push ax" \
+    "loop push_loop" \
+"do_call:" \
+    "mov ax, ds" \
+    "mov es, ax" \
+    "call dword ptr [bx]" \
+    "mov sp, bp" \
+    "pop di" \
+    "pop si" \
+    "pop es" \
+    "pop ds" \
+    "pop bp" \
+    parm [bx] [cx] [si] modify [ax bx cx dx];
+#else
+static void basic_call_far_raw(const uint16_t *target, uint16_t num_args, const uint16_t *args) {
+    (void)target; (void)num_args; (void)args;
+}
+#endif
+
 static void basic_get_date_str(char *buf) {
     uint8_t m = s_date_month;
     uint8_t d = s_date_day;
@@ -1651,6 +1697,53 @@ static uint16_t basic_getc(void) {
     return 0;
 }
 
+static int basic_joy_btn_is_down(uint8_t btn_idx) {
+    /* btn_idx 0 = Joy A Btn 1 (bit 4)
+     * btn_idx 1 = Joy B Btn 1 (bit 6)
+     * btn_idx 2 = Joy A Btn 2 (bit 5)
+     * btn_idx 3 = Joy B Btn 2 (bit 7)
+     */
+    static const uint8_t bit_mask[4] = { 0x10, 0x40, 0x20, 0x80 };
+    uint8_t status;
+    if (btn_idx >= 4) return 0;
+    status = inb(GAMEPORT_IO_PORT);
+    return !(status & bit_mask[btn_idx]);
+}
+
+static void basic_joy_sample_axes(void) {
+    uint16_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    uint16_t loop_count = 0;
+    uint8_t status;
+
+    /* Trigger the monostable multivibrators */
+    outb(GAMEPORT_IO_PORT, 0);
+
+    while (loop_count < 400) {
+        status = inb(GAMEPORT_IO_PORT);
+        if (!(status & 0x0F)) break;
+        if (status & 0x01) c0++;
+        if (status & 0x02) c1++;
+        if (status & 0x04) c2++;
+        if (status & 0x08) c3++;
+        loop_count++;
+    }
+
+    /* If all 4 axes timed out, no gameport is present or no joysticks connected */
+    if (c0 >= 380 && c1 >= 380 && c2 >= 380 && c3 >= 380) {
+        s_stick_cache[0] = 0;
+        s_stick_cache[1] = 0;
+        s_stick_cache[2] = 0;
+        s_stick_cache[3] = 0;
+        return;
+    }
+
+    /* For each axis: if it timed out, that axis is not connected (0) */
+    s_stick_cache[0] = (c0 >= 380) ? 0 : (c0 ? c0 : 1);
+    s_stick_cache[1] = (c1 >= 380) ? 0 : (c1 ? c1 : 1);
+    s_stick_cache[2] = (c2 >= 380) ? 0 : (c2 ? c2 : 1);
+    s_stick_cache[3] = (c3 >= 380) ? 0 : (c3 ? c3 : 1);
+}
+
 static void basic_poll_events(void) {
     uint32_t now;
 
@@ -1718,6 +1811,38 @@ static void basic_poll_events(void) {
             }
         }
     }
+
+    /* 3. Joystick button event checking (Phase 16) */
+    if (s_strig_enabled) {
+        int b;
+        for (b = 0; b < 4; b++) {
+            if (basic_joy_btn_is_down((uint8_t)b)) {
+                s_strig_latched[b] = 1;
+                if (s_strig_trap[b * 2].state == 1) {
+                    s_strig_trap[b * 2].pending = 1;
+                }
+                if (s_strig_trap[b * 2 + 1].state == 1) {
+                    s_strig_trap[b * 2 + 1].pending = 1;
+                }
+            }
+        }
+        for (b = 0; b < 8; b++) {
+            if (s_strig_trap[b].state == 1 && s_strig_trap[b].pending && !s_strig_trap[b].in_handler) {
+                uint16_t target_off = basic_find_line(s_strig_trap[b].line);
+                if (target_off != 0 && s_gosub_sp < BASIC_MAX_GOSUB) {
+                    s_strig_trap[b].pending = 0;
+                    s_strig_trap[b].in_handler = 1;
+                    s_gosub_stack[s_gosub_sp].line_off = s_cur_line_off;
+                    s_gosub_stack[s_gosub_sp].stmt_pos = s_pc_stmt;
+                    s_gosub_sp++;
+                    s_pc_line = target_off;
+                    s_pc_stmt = 4;
+                    s_jumped = 1;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /* --------------------------------------------------------------------------
@@ -1756,6 +1881,17 @@ static void basic_new(void) {
             s_key_trap[k].pending = 0;
             s_key_trap[k].in_handler = 0;
         }
+        for (k = 0; k < 8; k++) {
+            s_strig_trap[k].line = 0;
+            s_strig_trap[k].state = 0;
+            s_strig_trap[k].pending = 0;
+            s_strig_trap[k].in_handler = 0;
+        }
+        for (k = 0; k < 4; k++) {
+            s_stick_cache[k] = 0;
+            s_strig_latched[k] = 0;
+        }
+        s_strig_enabled = 0;
     }
     s_key_fifo_head = 0;
     s_key_fifo_count = 0;
@@ -2037,6 +2173,11 @@ static int16_t val_to_int(const basic_val_t *v) {
     return v->ival;
 }
 
+static uint16_t val_to_uint(const basic_val_t *v) {
+    if (v->type == BASIC_TYPE_FLOAT) return (uint16_t)soft_to_uint32(v->fval);
+    return (uint16_t)v->ival;
+}
+
 static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *out_val) {
     uint16_t p = *pos;
     while (tok[p] == ' ' || tok[p] == '\t') p++;
@@ -2220,6 +2361,118 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         }
         *pos = p;
         return 0;
+    }
+
+    /* Built-in function: VARPTR(var | #f) (token 0xDA) - Phase 15 */
+    if (tok[p] == TOK_VARPTR) {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') {
+            os_puts("Syntax error in VARPTR (expected '(')\n");
+            return -1;
+        }
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+        if (tok[p] == '#') {
+            /* VARPTR(#f) */
+            basic_val_t f_val;
+            uint8_t fnum;
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (basic_eval_expr(tok, &p, &f_val) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            fnum = (uint8_t)val_to_int(&f_val);
+            if (fnum < 1 || fnum > BASIC_MAX_FILES) {
+                return basic_error(52, "Bad file number\n");
+            }
+            out_val->type = BASIC_TYPE_UINT;
+            out_val->ival = (int16_t)(uint16_t)&s_files[fnum - 1];
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* Variable or Array element */
+        if (basic_is_alpha((char)tok[p])) {
+            char var_name[BASIC_MAX_VARNAME];
+            if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+                os_puts("Syntax error in VARPTR\n");
+                return -1;
+            }
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') {
+                /* Array element: A%(idx1 [, idx2]) */
+                basic_val_t i1_val, i2_val;
+                basic_array_t *arr;
+                uint16_t linear_idx;
+                uint16_t elem_size;
+                p++;
+                if (basic_eval_expr(tok, &p, &i1_val) != 0) return -1;
+                i2_val.ival = 0;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] == ',') {
+                    p++;
+                    if (basic_eval_expr(tok, &p, &i2_val) != 0) return -1;
+                    while (tok[p] == ' ' || tok[p] == '\t') p++;
+                }
+                if (tok[p] != ')') {
+                    os_puts("Syntax error in VARPTR (expected ')')\n");
+                    return -1;
+                }
+                p++; /* skip inner ')' of array */
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] == ')') p++; /* skip outer ')' of VARPTR */
+
+                arr = basic_find_array(var_name);
+                if (!arr) {
+                    os_puts("Array not dimensioned\n");
+                    return -1;
+                }
+                if (i1_val.ival < 0 || (uint16_t)i1_val.ival >= arr->dim1) {
+                    return basic_error(9, "Subscript out of range\n");
+                }
+                if (arr->num_dims == 2 && (i2_val.ival < 0 || (uint16_t)i2_val.ival >= arr->dim2)) {
+                    return basic_error(9, "Subscript out of range\n");
+                }
+                linear_idx = (arr->num_dims == 1) ? (uint16_t)i1_val.ival :
+                             ((uint16_t)i1_val.ival * arr->dim2 + (uint16_t)i2_val.ival);
+                elem_size = (arr->type == BASIC_TYPE_STR) ? BASIC_STR_ELEM_LEN :
+                            ((arr->type == BASIC_TYPE_INT) ? 2 : 4);
+
+                out_val->type = BASIC_TYPE_UINT;
+                out_val->ival = (int16_t)(arr->data_off + linear_idx * elem_size);
+                out_val->fval = 0;
+                out_val->sval = 0;
+                *pos = p;
+                return 0;
+            } else {
+                /* Scalar variable */
+                basic_var_t *var = basic_get_or_create_var(var_name);
+                uint16_t ptr;
+                if (!var) return -1;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                if (tok[p] == ')') p++;
+                if (var->type == BASIC_TYPE_STR) {
+                    ptr = (uint16_t)var->sval;
+                } else if (var->type == BASIC_TYPE_INT) {
+                    ptr = (uint16_t)&var->ival;
+                } else {
+                    ptr = (uint16_t)&var->fval;
+                }
+                out_val->type = BASIC_TYPE_UINT;
+                out_val->ival = (int16_t)ptr;
+                out_val->fval = 0;
+                out_val->sval = 0;
+                *pos = p;
+                return 0;
+            }
+        }
+
+        os_puts("Syntax error in VARPTR\n");
+        return -1;
     }
 
     /* Built-in function: INKEY$ (token 0xDE) */
@@ -2680,6 +2933,51 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             val = inb(port);
             out_val->type = BASIC_TYPE_INT;
             out_val->ival = (int16_t)val;
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* STICK(n) - Phase 16 */
+        if (fn == (uint8_t)(TOK_STICK & 0xFF)) {
+            basic_val_t arg;
+            int16_t n;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            n = val_to_int(&arg);
+            if (n < 0 || n > 3) return basic_error(5, "Illegal function call\n");
+            if (n == 0) basic_joy_sample_axes();
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = (int16_t)s_stick_cache[n];
+            out_val->fval = 0;
+            out_val->sval = 0;
+            *pos = p;
+            return 0;
+        }
+
+        /* STRIG(n) - Phase 16 */
+        if (fn == (uint8_t)(TOK_STRIG & 0xFF)) {
+            basic_val_t arg;
+            int16_t n;
+            int res = 0;
+            if (basic_eval_expr(tok, &p, &arg) != 0) return -1;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ')') p++;
+            n = val_to_int(&arg);
+            if (n < 0 || n > 7) return basic_error(5, "Illegal function call\n");
+            {
+                uint8_t btn = (uint8_t)(n / 2);
+                if (n % 2 == 1) {
+                    res = basic_joy_btn_is_down(btn) ? -1 : 0;
+                } else {
+                    res = (s_strig_latched[btn] || basic_joy_btn_is_down(btn)) ? -1 : 0;
+                    s_strig_latched[btn] = 0;
+                }
+            }
+            out_val->type = BASIC_TYPE_INT;
+            out_val->ival = (int16_t)res;
             out_val->fval = 0;
             out_val->sval = 0;
             *pos = p;
@@ -5465,6 +5763,11 @@ static int basic_exec_return(const uint8_t __far *tok, uint16_t *pos) {
                 s_key_trap[k].in_handler = 0;
             }
         }
+        for (k = 0; k < 8; k++) {
+            if (s_strig_trap[k].in_handler) {
+                s_strig_trap[k].in_handler = 0;
+            }
+        }
     }
 
     while (tok[p] == ' ' || tok[p] == '\t') p++;
@@ -7983,6 +8286,36 @@ static int basic_exec_on(const uint8_t __far *tok, uint16_t *pos) {
         return 0;
     }
 
+    /* ON STRIG(n) GOSUB <linenum> (Phase 16) */
+    if (tok[p] == 0xFF && tok[p + 1] == (uint8_t)(TOK_STRIG & 0xFF)) {
+        basic_val_t strig_val;
+        int16_t sn;
+        p += 2;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != '(') return basic_error(2, "Syntax error in ON STRIG\n");
+        p++;
+        if (basic_eval_expr(tok, &p, &strig_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+        sn = val_to_int(&strig_val);
+        if (sn < 0 || sn > 7) return basic_error(5, "Illegal function call\n");
+
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != TOK_GOSUB) return basic_error(2, "Syntax error in ON STRIG\n");
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+        {
+            basic_val_t line_val;
+            if (basic_eval_expr(tok, &p, &line_val) != 0) return -1;
+            s_strig_trap[sn].line = (uint16_t)val_to_int(&line_val);
+            s_strig_trap[sn].pending = 0;
+            s_strig_trap[sn].in_handler = 0;
+        }
+        *pos = p;
+        return 0;
+    }
+
     /* Computed ON <expr> GOTO/GOSUB <line1>, <line2>, ... */
     {
         basic_val_t expr_val;
@@ -8199,6 +8532,63 @@ static int basic_exec_key(const uint8_t __far *tok, uint16_t *pos) {
         *pos = p;
         return 0;
     }
+}
+
+static int basic_exec_strig(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    int16_t n = -1; /* -1 means generic STRIG ON/OFF */
+    p += 2; /* skip 0xFF, TOK_STRIG */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    /* STRIG(n) ON / OFF / STOP */
+    if (tok[p] == '(') {
+        basic_val_t n_val;
+        p++;
+        if (basic_eval_expr(tok, &p, &n_val) != 0) return -1;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ')') p++;
+        n = val_to_int(&n_val);
+        if (n < 0 || n > 7) {
+            return basic_error(5, "Illegal function call\n");
+        }
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == TOK_ON) {
+        p++;
+        if (n >= 0 && n <= 7) {
+            s_strig_trap[n].state = 1;
+        }
+        s_strig_enabled = 1;
+        *pos = p;
+        return 0;
+    }
+    if (tok[p] == TOK_OFF) {
+        p++;
+        if (n >= 0 && n <= 7) {
+            s_strig_trap[n].state = 0;
+            s_strig_trap[n].pending = 0;
+        } else {
+            int k;
+            s_strig_enabled = 0;
+            for (k = 0; k < 8; k++) {
+                s_strig_trap[k].state = 0;
+                s_strig_trap[k].pending = 0;
+            }
+        }
+        *pos = p;
+        return 0;
+    }
+    if (tok[p] == TOK_STOP) {
+        p++;
+        if (n >= 0 && n <= 7) {
+            s_strig_trap[n].state = 2;
+        }
+        *pos = p;
+        return 0;
+    }
+
+    return basic_error(2, "Syntax error in STRIG\n");
 }
 
 static int basic_exec_resume(const uint8_t __far *tok, uint16_t *pos) {
@@ -8719,6 +9109,243 @@ static int basic_exec_auto(const uint8_t __far *tok, uint16_t *pos) {
     return 0;
 }
 
+/* --------------------------------------------------------------------------
+ * Phase 15: Machine Code & Low-Level Interop (CALL, WAIT)
+ * -------------------------------------------------------------------------- */
+
+static uint16_t basic_var_to_uint(const basic_var_t *v) {
+    if (!v) return 0;
+    if (v->type == BASIC_TYPE_INT || v->type == BASIC_TYPE_UINT) return (uint16_t)v->ival;
+    if (v->type == BASIC_TYPE_FLOAT) return (uint16_t)soft_to_uint32(v->fval);
+    return (uint16_t)v->ival;
+}
+
+typedef struct {
+    basic_array_t *arr;
+    int16_t        i1;
+    int16_t        i2;
+    int            arg_idx;
+} basic_call_sync_t;
+
+static int basic_exec_call(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    uint16_t target_offset = 0;
+    uint16_t num_args = 0;
+    static uint16_t s_call_args[8];
+    static int16_t  s_call_temps[8];
+    static basic_call_sync_t s_call_sync[8];
+    uint16_t num_sync = 0;
+    uint16_t fptr[2];
+    uint16_t i;
+
+    p++; /* skip TOK_CALL */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    /* Check if target is a simple identifier or expression */
+    if (basic_is_alpha((char)tok[p])) {
+        char var_name[BASIC_MAX_VARNAME];
+        uint16_t save_p = p;
+        if (basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == '(') {
+                basic_array_t *arr = basic_find_array(var_name);
+                if (arr) {
+                    /* Array lookup evaluates target offset */
+                    p = save_p;
+                    {
+                        basic_val_t t_val;
+                        if (basic_eval_expr(tok, &p, &t_val) != 0) return -1;
+                        target_offset = val_to_uint(&t_val);
+                    }
+                } else {
+                    /* Scalar variable holding offset; '(' starts argument list */
+                    basic_var_t *v = basic_find_var(var_name);
+                    target_offset = basic_var_to_uint(v);
+                }
+            } else {
+                /* Scalar variable holding offset; no arguments or '(' later */
+                basic_var_t *v = basic_find_var(var_name);
+                target_offset = basic_var_to_uint(v);
+            }
+        } else {
+            p = save_p;
+            {
+                basic_val_t t_val;
+                if (basic_eval_expr(tok, &p, &t_val) != 0) return -1;
+                target_offset = val_to_uint(&t_val);
+            }
+        }
+    } else {
+        /* Expression target (e.g. VARPTR(...), &H1000, etc.) */
+        basic_val_t t_val;
+        if (basic_eval_expr(tok, &p, &t_val) != 0) return -1;
+        target_offset = val_to_uint(&t_val);
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    /* Parse optional argument list: (arg1 [, arg2 ...]) */
+    if (tok[p] == '(') {
+        p++; /* skip '(' */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+        while (tok[p] != ')' && tok[p] != 0x00 && tok[p] != ':' && tok[p] != TOK_ELSE) {
+            uint16_t arg_off = 0;
+            if (num_args >= 8) {
+                os_puts("Too many arguments to CALL\n");
+                return -1;
+            }
+
+            if (basic_is_alpha((char)tok[p])) {
+                char aname[BASIC_MAX_VARNAME];
+                uint16_t save_ap = p;
+                if (basic_parse_var_name(tok, &p, aname, sizeof(aname))) {
+                    while (tok[p] == ' ' || tok[p] == '\t') p++;
+                    if (tok[p] == '(') {
+                        basic_array_t *arr = basic_find_array(aname);
+                        if (arr) {
+                            /* Array element argument */
+                            basic_val_t i1_v, i2_v, elem_v;
+                            p++;
+                            if (basic_eval_expr(tok, &p, &i1_v) != 0) return -1;
+                            i2_v.ival = 0;
+                            while (tok[p] == ' ' || tok[p] == '\t') p++;
+                            if (tok[p] == ',') {
+                                p++;
+                                if (basic_eval_expr(tok, &p, &i2_v) != 0) return -1;
+                                while (tok[p] == ' ' || tok[p] == '\t') p++;
+                            }
+                            if (tok[p] == ')') p++;
+
+                            if (basic_read_array_elem(arr, i1_v.ival, i2_v.ival, &elem_v) != 0) {
+                                return -1;
+                            }
+                            s_call_temps[num_args] = val_to_int(&elem_v);
+                            arg_off = (uint16_t)&s_call_temps[num_args];
+
+                            s_call_sync[num_sync].arr = arr;
+                            s_call_sync[num_sync].i1 = i1_v.ival;
+                            s_call_sync[num_sync].i2 = i2_v.ival;
+                            s_call_sync[num_sync].arg_idx = (int)num_args;
+                            num_sync++;
+                        } else {
+                            /* Not an array: re-parse as general expression */
+                            p = save_ap;
+                            {
+                                basic_val_t ev;
+                                if (basic_eval_expr(tok, &p, &ev) != 0) return -1;
+                                s_call_temps[num_args] = val_to_int(&ev);
+                                arg_off = (uint16_t)&s_call_temps[num_args];
+                            }
+                        }
+                    } else {
+                        /* Scalar variable */
+                        basic_var_t *v = basic_get_or_create_var(aname);
+                        if (!v) return -1;
+                        if (v->type == BASIC_TYPE_STR) {
+                            arg_off = (uint16_t)v->sval;
+                        } else if (v->type == BASIC_TYPE_INT) {
+                            arg_off = (uint16_t)&v->ival;
+                        } else {
+                            arg_off = (uint16_t)&v->fval;
+                        }
+                    }
+                } else {
+                    p = save_ap;
+                    {
+                        basic_val_t ev;
+                        if (basic_eval_expr(tok, &p, &ev) != 0) return -1;
+                        s_call_temps[num_args] = val_to_int(&ev);
+                        arg_off = (uint16_t)&s_call_temps[num_args];
+                    }
+                }
+            } else {
+                /* Non-alpha expression argument */
+                basic_val_t ev;
+                if (basic_eval_expr(tok, &p, &ev) != 0) return -1;
+                s_call_temps[num_args] = val_to_int(&ev);
+                arg_off = (uint16_t)&s_call_temps[num_args];
+            }
+
+            s_call_args[num_args++] = arg_off;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] == ',') {
+                p++;
+                while (tok[p] == ' ' || tok[p] == '\t') p++;
+            }
+        }
+        if (tok[p] == ')') p++;
+    }
+
+    fptr[0] = target_offset;
+    fptr[1] = s_def_seg;
+    basic_call_far_raw(fptr, num_args, s_call_args);
+
+    /* Write back modified array arguments */
+    for (i = 0; i < num_sync; i++) {
+        basic_val_t wb;
+        int idx = s_call_sync[i].arg_idx;
+        wb.type = s_call_sync[i].arr->type;
+        wb.ival = s_call_temps[idx];
+        wb.fval = soft_from_int(s_call_temps[idx]);
+        wb.sval = 0;
+        basic_write_array_elem(s_call_sync[i].arr, s_call_sync[i].i1, s_call_sync[i].i2, &wb);
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_wait(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t port_val, and_val, xor_val;
+    uint16_t port;
+    uint8_t and_mask;
+    uint8_t xor_mask = 0;
+
+    p++; /* skip TOK_WAIT */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &port_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        os_puts("Syntax error in WAIT (expected ',')\n");
+        return -1;
+    }
+    p++; /* skip ',' */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &and_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == ',') {
+        p++; /* skip ',' */
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (basic_eval_expr(tok, &p, &xor_val) != 0) return -1;
+        xor_mask = (uint8_t)val_to_int(&xor_val);
+    }
+
+    port = (uint16_t)val_to_int(&port_val);
+    and_mask = (uint8_t)val_to_int(&and_val);
+
+    while (s_running) {
+        uint8_t v = inb(port);
+        if (((v ^ xor_mask) & and_mask) != 0) {
+            break;
+        }
+        basic_poll_events();
+        if (s_break_pending) {
+            s_break_pending = 0;
+            s_running = 0;
+            break;
+        }
+        if (s_jumped) break;
+    }
+
+    *pos = p;
+    return 0;
+}
+
 static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     uint16_t p = *pos;
 
@@ -8764,6 +9391,12 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == 0xFE && tok[p + 1] == (uint8_t)(TOK_TIMER & 0xFF)) {
         *pos = p;
         return basic_exec_timer(tok, pos);
+    }
+
+    /* STRIG statement (Phase 16) */
+    if (tok[p] == 0xFF && tok[p + 1] == (uint8_t)(TOK_STRIG & 0xFF)) {
+        *pos = p;
+        return basic_exec_strig(tok, pos);
     }
 
     /* TRON statement */
@@ -9221,6 +9854,18 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
     if (tok[p] == TOK_OUT) {
         *pos = p;
         return basic_exec_out(tok, pos);
+    }
+
+    /* CALL statement (Phase 15) */
+    if (tok[p] == TOK_CALL) {
+        *pos = p;
+        return basic_exec_call(tok, pos);
+    }
+
+    /* WAIT statement (Phase 15) */
+    if (tok[p] == TOK_WAIT) {
+        *pos = p;
+        return basic_exec_wait(tok, pos);
     }
 
     /* DEF statement (DEF SEG) (Phase 7) */
@@ -9703,6 +10348,17 @@ static void basic_cmd_run(void) {
             s_key_trap[k].pending = 0;
             s_key_trap[k].in_handler = 0;
         }
+        for (k = 0; k < 8; k++) {
+            s_strig_trap[k].line = 0;
+            s_strig_trap[k].state = 0;
+            s_strig_trap[k].pending = 0;
+            s_strig_trap[k].in_handler = 0;
+        }
+        for (k = 0; k < 4; k++) {
+            s_stick_cache[k] = 0;
+            s_strig_latched[k] = 0;
+        }
+        s_strig_enabled = 0;
     }
     s_key_fifo_head = 0;
     s_key_fifo_count = 0;

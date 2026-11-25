@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/25 13:13:31
+# 86Box v7.0 logfile, created 2026/11/25 14:53:02
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -73,13 +73,45 @@ Keyboard layout set to FR (/KEYMAPS/FR.MAP)
 Running /BOOT.SH...
 [2J[HhobbyOS BASIC Version 1.0 (GW-BASIC Compatible)
 61440 Bytes free
-=== Phase 14 Test Suite ===
-[2J[HPASS: DRAW diamond (P1= 3 )
-PASS: PAINT scanline flood fill (P2= 2 , P_OUT= 0 )
-PASS: GET sprite capture & PUT PSET (P3= 2 )
-PASS: PUT XOR sprite erasure (P4= 0 )
-PASS: DRAW scale & angle (P5= 1 )
-=== ALL PHASE 14 TESTS PASSED ===
+[2J[HhobbyOS Analog Joystick Test
+Port 0x201 - Gameport / SB16
+Press [Q] or [ESC] to Exit
++---------------------------+
++---------------------------+
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
+|                           |
++---------------------------+
++---------------------------+
+[ JOYSTICK A ]
+[ JOYSTICK B ]
+X: 0    Y: 0    
+X: 0    Y: 0    
+Btn 1: [UP]   
+Btn 2: [UP]   
+Triggers: 1= 0  2= 0     
+Btn 1: [UP]   
+Btn 2: [UP]   
+ 
+O
+Ok
 System ready.
 
 hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.

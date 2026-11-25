@@ -159,6 +159,9 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		basic/final.bas:/BASIC/FINAL.BAS \
 		basic/phase13.bas:/BASIC/PHASE13.BAS \
 		basic/phase14.bas:/BASIC/PHASE14.BAS \
+		basic/phase15.bas:/BASIC/PHASE15.BAS \
+		basic/phase16.bas:/BASIC/PHASE16.BAS \
+		basic/joytest.bas:/BASIC/JOYTEST.BAS \
 		build/test80.com:/BIN/TEST80.COM \
 		games/zork1.z3:/GAMES/ZORK1.Z3 \
 		build/sample.cga:/PICS/SAMPLE.CGA \

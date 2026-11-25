@@ -269,6 +269,32 @@
     - **`DIM` Floating-Point Literal Fix**:
       - Fixed dimension evaluation in `basic_exec_dim` using `val_to_int(&d1_val)` and `val_to_int(&d2_val)` instead of `.ival`, properly accepting float constants like `DIM S%(300)`.
     - **Target Verification Suite (`/BASIC/PHASE14.BAS`)**: Comprehensive verification suite testing `DRAW` diamond drawing, `PAINT` interior fill bounded by border without exterior leakage, `GET` sprite capture, `PUT PSET` blitting, `PUT XOR` sprite erasure, and `DRAW` scaling and 90-degree rotation. Verified 100% passed on target Book8088 emulator.
+  - **Phase 15: Low-Level Machine Code & Hardware Interop (`VARPTR`, `CALL`, `WAIT`) (`user/basic.c`, `basic/phase15.bas`)**:
+    - **`VARPTR` Variable & Buffer Address Resolution (`VARPTR(var | #f)`)**:
+      - Evaluates near pointers within `DGROUP` (`DS`) for scalar variables (integers, strings, floats) and file control buffers (`VARPTR(#f)` returning `&s_files[fnum - 1]`).
+      - Evaluates linear byte offsets within `s_basic_seg` for array elements (`VARPTR(arr(i [, j]))`), returning `arr->data_off + linear_idx * elem_size`.
+      - Returns addresses as `BASIC_TYPE_UINT`, preserving full 16-bit unsigned addresses (0..65535) via `val_to_uint` and `soft_to_uint32` without negative sign-extension or 32767 clamping.
+    - **`CALL` Far Subroutine Invocation Engine (`CALL offset [(arg1 [, arg2 ...])]`)**:
+      - Flexible routine target evaluation supporting scalar variables (`CALL ROUTINE`), expressions (`CALL VARPTR(CODE%)`, `CALL &H1000`), or array elements (`CALL CODE%(0)`). Calls target at `s_def_seg:target_offset` (where `s_def_seg` defaults to `DS`).
+      - Authentic GW-BASIC argument passing convention: pushes 16-bit near pointers in `DS` for all arguments from left to right onto the stack.
+      - Transparent Array & Expression Marshaling: Automatically passes pointers in `DS` for scalar variables; stages expressions and array elements through temporary storage in `DS`, with transparent write-back of modified values to array elements upon return from the subroutine.
+      - Assembly Invocation Primitive (`basic_call_far_raw`): Clean inline assembly wrapper using 100% pure 8086 instructions (`push bp/ds/es/si/di`, `mov bp, sp`, `lodsw; push ax; loop`, `call dword ptr [bx]`, `mov sp, bp`, `pop di/si/es/ds/bp`), safely restoring the stack pointer via `mov sp, bp` regardless of whether the routine returns with `RETF` or `RETF 2*n`.
+    - **`WAIT` Port Polling Engine (`WAIT port, and_mask [, xor_mask]`)**:
+      - Suspends execution until input port bits match: `((inb(port) ^ xor_mask) & and_mask) != 0`.
+      - Interleaves non-blocking keyboard polling (`basic_poll_events()`) and break checks (`s_break_pending`), allowing instant, clean termination via `Ctrl+C`.
+    - **Verification Suite (`/BASIC/PHASE15.BAS`)**: Comprehensive verification covering `VARPTR` scalar peek/poke read-modify-write, `VARPTR` array indexing, `VARPTR` file buffer, `CALL` 0-arg far call, `CALL` 1-arg in-place native code modification via pointer (`add word [bx], 100`), `CALL` array element argument with write-back, and `WAIT` port polling. 100% verified passing in headless 86Box emulation on target Book8088.
+  - **Phase 16: Analog Gameport & Joystick (`STICK`, `STRIG`, `STRIG ON/OFF/STOP`, `ON STRIG GOSUB`) (`user/basic.c`, `basic/phase16.bas`)**:
+    - **Gameport Hardware Driver (`0x201`)**: Direct I/O interfacing with standard IBM PC gameport / Sound Blaster joystick port at `0x201`. Detects floating bus / absent gameport hardware safely prior to 555 timer trigger; measures potentiometer resistance timing for axes (bits 0..3) with cycle timeout; samples active-low button state (bits 4..7) without phantom presses.
+    - **`STICK(n)` Axis Coordinate Engine**:
+      - `STICK(0)` samples all 4 axes simultaneously from the hardware, caching values into `s_stick_cache` for coherent snapshot reads.
+      - `STICK(1)` (Joy A, Y), `STICK(2)` (Joy B, X), and `STICK(3)` (Joy B, Y) return cached snapshots from the preceding `STICK(0)` call, matching authentic GW-BASIC behavior. Returns `0` when no joystick is present.
+    - **`STRIG(n)` Button & Trigger Function**:
+      - Odd indices (`1, 3, 5, 7`): Returns `-1` if the button is currently held down, `0` if released.
+      - Even indices (`0, 2, 4, 6`): Returns `-1` if the button was pressed since the last read (latched), clearing latch on read.
+    - **`STRIG` Statements & Event Trapping**:
+      - `STRIG ON`, `STRIG OFF`, `STRIG(n) ON`, `STRIG(n) OFF`, and `STRIG(n) STOP` statements controlling button event monitoring and latching.
+      - `ON STRIG(n) GOSUB <line>` event trapping integrated into `basic_poll_events()`, cleanly delivering asynchronous button press events and resetting handlers on `RETURN`.
+    - **Verification Suite (`/BASIC/PHASE16.BAS`)**: Comprehensive test suite verifying `STICK(0..3)` readout bounds, `STRIG(0..7)` boolean returns, `STRIG ON/OFF/STOP` statements, and `ON STRIG(0) GOSUB` trap declaration and cleanup. 100% verified passing in headless 86Box emulation.
 - **File Manager Function Ribbon & BSS Buffer Initialization Fix (`user/fm.c`)**:
   - Fixed residual characters appearing on row 24 in `FM.BIN` when launched after programs that used conventional memory:
     - Initialized the back-buffer screen cache `s_screen` to blank spaces in `fm_invalidate_cache()` and on startup in `app_main`.
