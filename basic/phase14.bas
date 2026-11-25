@@ -1,0 +1,42 @@
+10 REM Phase 14 Test Suite: PAINT, GET/PUT Sprites, DRAW
+20 PRINT "=== Phase 14 Test Suite ==="
+30 SCREEN 1 : COLOR 0, 1 : CLS
+40 REM Test 1: DRAW diamond
+50 PSET (100, 40), 3
+60 DRAW "C3 E15 F15 G15 H15"
+70 P1 = POINT(115, 55)
+80 IF P1 <> 3 THEN GOTO 500
+90 REM Test 2: PAINT interior of diamond
+100 PAINT (115, 40), 2, 3
+110 P2 = POINT(115, 40)
+120 IF P2 <> 2 THEN GOTO 500
+130 P_OUT = POINT(50, 50)
+140 IF P_OUT <> 0 THEN GOTO 500
+150 REM Test 3: Capture sprite with GET
+160 DIM S%(300)
+170 GET (95, 20)-(135, 60), S%
+180 REM Test 4: Blit sprite with PUT PSET
+190 PUT (180, 20), S%, PSET
+200 P3 = POINT(200, 40)
+210 IF P3 <> 2 THEN GOTO 500
+220 REM Test 5: XOR animation erase
+230 PUT (180, 20), S%, XOR
+240 P4 = POINT(200, 40)
+250 IF P4 <> 0 THEN GOTO 500
+260 REM Test 6: DRAW with scale, angle, and blind move
+270 PSET (50, 120), 1
+280 DRAW "C1 S8 R10 BD10 A1 R10"
+290 P5 = POINT(60, 120)
+300 IF P5 <> 1 THEN GOTO 500
+310 SCREEN 0
+320 PRINT "PASS: DRAW diamond (P1="; P1; ")"
+330 PRINT "PASS: PAINT scanline flood fill (P2="; P2; ", P_OUT="; P_OUT; ")"
+340 PRINT "PASS: GET sprite capture & PUT PSET (P3="; P3; ")"
+350 PRINT "PASS: PUT XOR sprite erasure (P4="; P4; ")"
+360 PRINT "PASS: DRAW scale & angle (P5="; P5; ")"
+370 PRINT "=== ALL PHASE 14 TESTS PASSED ==="
+380 SYSTEM
+500 SCREEN 0
+510 PRINT "=== PHASE 14 TEST FAILED ==="
+520 PRINT "P1="; P1; " P2="; P2; " P_OUT="; P_OUT; " P3="; P3; " P4="; P4; " P5="; P5
+530 SYSTEM

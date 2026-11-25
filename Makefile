@@ -10,7 +10,7 @@ CFLAGS := -0 -fpi87 -ms -s -os -zl -ecc -zq -Iinclude -Ibuild
 CFLAGS_MM := -0 -fpi87 -mm -s -os -zl -ecc -zq -zm -Iinclude -Ibuild
 
 KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mouse.obj build/sound.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
-USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin build/mouse.bin build/play.bin build/volume.bin build/more.bin build/tree.bin build/vidsync.bin build/view.bin build/zcode.bin build/fm.bin build/cpm.bin build/basic.exe
+USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin build/mouse.bin build/play.bin build/volume.bin build/more.bin build/tree.bin build/vidsync.bin build/view.bin build/zcode.bin build/fm.bin build/cpm.bin build/basic.exe build/tetris.bin
 KEYMAPS     := build/us.map build/fr.map build/be.map
 
 all: $(IMG)
@@ -88,7 +88,11 @@ build/sam.mdl: tools/train_sam.py
 	mkdir -p build
 	python3 tools/train_sam.py $@
 
-MUSIC_FILES := build/ode.imf build/wonderin.imf build/keen.imf build/chime.wav
+MUSIC_FILES := build/ode.imf build/wonderin.imf build/keen.imf build/chime.wav build/tetris.imf
+
+build/tetris.imf: tools/gen_tetris_imf.py
+	mkdir -p build
+	python3 tools/gen_tetris_imf.py $@
 
 build/ode.imf: tools/gen_imf.py
 	mkdir -p build
@@ -147,6 +151,7 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		build/fm.bin:/BIN/FM.BIN \
 		build/cpm.bin:/BIN/CPM.BIN \
 		build/basic.exe:/BIN/BASIC.EXE \
+		build/tetris.bin:/BIN/TETRIS.BIN \
 		basic/math.bas:/BASIC/MATH.BAS \
 		basic/sys.bas:/BASIC/SYS.BAS \
 		basic/test1.bas:/BASIC/TEST1.BAS \
@@ -172,6 +177,7 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		build/wonderin.imf:/MUSIC/WONDERIN.IMF \
 		build/keen.imf:/MUSIC/KEEN.IMF \
 		build/chime.wav:/MUSIC/CHIME.WAV \
+		build/tetris.imf:/MUSIC/TETRIS.IMF \
 		build/boot.bin:/BIN/BOOT.BIN \
 		boot.sh:/BOOT.SH \
 		build/us.map:/KEYMAPS/US.MAP \

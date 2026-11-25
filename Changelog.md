@@ -1,5 +1,19 @@
 # Changelog
 
+## Revision 1.0.4 (2026-11-25)
+
+- **hobbyTris Arcade Game (`/BIN/TETRIS.BIN`, `user/tetris.c`, `tools/gen_tetris_imf.py`, `/MUSIC/TETRIS.IMF`)**:
+  - Implemented an authentic, freestanding CGA Mode 4 (320×200, 4-color) Tetris game for hobbyOS targeting Intel 8088 hardware and Book8088.
+  - **Dynamic Low-Intensity Palette Cycling**: Uses low-intensity black-background palettes to ensure 100% visual consistency across both real CGA (CRT/LCD) and EGA/VGA hardware:
+    - Level 0 (Level % 3 == 0): Palette 1 (Cyan / Magenta / Light Gray).
+    - Level 1 (Level % 3 == 1): Palette 0 (Green / Red / Brown).
+    - Level 2 (Level % 3 == 2): Palette 2 (Cyan / Red / Light Gray).
+    - Palettes switch instantly in hardware on level transitions without needing software playfield redraws.
+  - **7-Bag Random Generator**: Modern Fisher-Yates 7-bag piece generation ensuring fair piece distributions and eliminating long droughts of essential tetrominoes.
+  - **Controls**: Responsive non-blocking keyboard controls supporting Left/Right arrows (or A/D/4/6), Up/Space/W/8 for clockwise rotation with wall-kick compensation, Down/S/2 for soft drop (+1 pt/cell), and Enter for hard drop (+2 pts/cell). Includes Pause ('P'), Mute ('M'), and clean quit ('Q' / ESC) restoring 80×25 text mode.
+  - **Audio & Background Music**: Streams *Korobeiniki* (Tetris Type-A theme) via background IMF OPL/PIT timer playback (`/MUSIC/TETRIS.IMF`), paired with non-blocking tone sound effects for piece moves, rotations, hard drops, and line clears.
+  - **Scoring & High Score Persistence**: Classic scoring rules scaled with level multipliers (`score += base_pts * (level + 1)`), line clear animation, and automatic persistent high score saving/loading (`/GAMES/TETRIS.DAT`).
+
 ## Revision 1.0.3 (2026-11-25)
 
 - **GW-BASIC Interpreter `INPUT$` Function & Expression Parsing (`/BIN/BASIC.EXE`, `user/basic.c`)**:
