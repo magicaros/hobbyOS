@@ -255,6 +255,9 @@ static int16_t  s_last_x            = 0;
 static int16_t  s_last_y            = 0;
 static uint8_t  s_gfx_row           = 0;
 static uint8_t  s_gfx_col           = 0;
+static uint8_t  s_draw_angle        = 0;    /* 0 = 0 deg, 1 = 90 deg, 2 = 180 deg, 3 = 270 deg */
+static uint8_t  s_draw_scale        = 4;    /* scale / 4 (default 4 = 1:1) */
+static uint8_t  s_draw_color        = 15;
 static uint8_t  s_play_octave       = 4;
 static uint8_t  s_play_length       = 4;
 static uint8_t  s_play_tempo        = 120;
@@ -311,6 +314,12 @@ static int basic_exec_rmdir(const uint8_t __far *tok, uint16_t *pos);
 static int basic_exec_shell(const uint8_t __far *tok, uint16_t *pos);
 static int basic_exec_date_stmt(const uint8_t __far *tok, uint16_t *pos);
 static int basic_exec_time_stmt(const uint8_t __far *tok, uint16_t *pos);
+
+/* Phase 14 Forward Declarations */
+static int basic_exec_paint(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_get_gfx(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_put_gfx(const uint8_t __far *tok, uint16_t *pos);
+static int basic_exec_draw(const uint8_t __far *tok, uint16_t *pos);
 
 /* --------------------------------------------------------------------------
  * Helper String & Math Functions
@@ -451,7 +460,6 @@ static void basic_gfx_print_str(const char *str, uint8_t color) {
             s_gfx_col = 0;
             s_gfx_row++;
             if (s_gfx_row >= max_rows) s_gfx_row = 0;
-            os_gfx_rect(0, (uint16_t)s_gfx_row * 8, (uint16_t)max_cols * 8, 8, 0, 1);
             continue;
         }
         if (c == '\b') {
@@ -465,7 +473,6 @@ static void basic_gfx_print_str(const char *str, uint8_t color) {
             s_gfx_col = 0;
             s_gfx_row++;
             if (s_gfx_row >= max_rows) s_gfx_row = 0;
-            os_gfx_rect(0, (uint16_t)s_gfx_row * 8, (uint16_t)max_cols * 8, 8, 0, 1);
         }
         {
             static char single[2];
@@ -980,7 +987,11 @@ static uint16_t basic_tokenize(const char *in, uint8_t *out, uint16_t max_out) {
                     if (basic_is_alpha(last_kw_char) || basic_is_digit(last_kw_char)) {
                         if (basic_is_alpha(next_in_char) || basic_is_digit(next_in_char) || next_in_char == '.' || next_in_char == '_' ||
                             next_in_char == '$' || next_in_char == '%' || next_in_char == '!' || next_in_char == '#') {
-                            continue;
+                            if (next_in_char == '$' && basic_strnicmp(&in[ip], "INPUT$", 6) == 0) {
+                                /* INPUT$ is a built-in function, tokenized as TOK_INPUT followed by '$' */
+                            } else {
+                                continue;
+                            }
                         }
                     }
 
@@ -1752,6 +1763,9 @@ static void basic_new(void) {
     s_can_cont = 0;
     s_tron = 0;
     s_auto_mode = 0;
+    s_draw_angle = 0;
+    s_draw_scale = 4;
+    s_draw_color = (s_screen_mode == 1) ? 3 : ((s_screen_mode == 12 || s_screen_mode == 13) ? s_gfx_fg : 1);
     s_cont_line_off = 0;
     s_cont_stmt_pos = 4;
     basic_init_fkeys();
@@ -2234,7 +2248,7 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         basic_val_t n_val;
         int16_t n;
         uint8_t fnum = 0;
-        char *str = basic_alloc_temp_str();
+        char *str;
         int idx = 0;
 
         p += 2; /* skip TOK_INPUT and '$' */
@@ -2246,7 +2260,7 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
         p++;
 
         if (basic_eval_expr(tok, &p, &n_val) != 0) return -1;
-        n = n_val.ival;
+        n = val_to_int(&n_val);
 
         while (tok[p] == ' ' || tok[p] == '\t') p++;
         if (tok[p] == ',') {
@@ -2255,7 +2269,7 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             while (tok[p] == ' ' || tok[p] == '\t') p++;
             if (tok[p] == '#') p++;
             if (basic_eval_expr(tok, &p, &f_val) != 0) return -1;
-            fnum = (uint8_t)f_val.ival;
+            fnum = (uint8_t)val_to_int(&f_val);
         }
         while (tok[p] == ' ' || tok[p] == '\t') p++;
         if (tok[p] == ')') p++;
@@ -2265,6 +2279,7 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
             return -1;
         }
 
+        str = basic_alloc_temp_str();
         if (fnum == 0) {
             while (idx < n) {
                 uint16_t key = basic_getc();
@@ -2281,7 +2296,7 @@ static int eval_primary(const uint8_t __far *tok, uint16_t *pos, basic_val_t *ou
 
         out_val->type = BASIC_TYPE_STR;
         out_val->sval = str;
-        out_val->ival = 0;
+        out_val->ival = idx;
         *pos = p;
         return 0;
     }
@@ -4765,7 +4780,7 @@ static int basic_exec_dim(const uint8_t __far *tok, uint16_t *pos) {
         p++;
 
         if (basic_eval_expr(tok, &p, &d1_val) != 0) return -1;
-        dim1 = (uint16_t)(d1_val.ival + 1);
+        dim1 = (uint16_t)(val_to_int(&d1_val) + 1);
         num_dims = 1;
         dim2 = 1;
 
@@ -4773,7 +4788,7 @@ static int basic_exec_dim(const uint8_t __far *tok, uint16_t *pos) {
         if (tok[p] == ',') {
             p++;
             if (basic_eval_expr(tok, &p, &d2_val) != 0) return -1;
-            dim2 = (uint16_t)(d2_val.ival + 1);
+            dim2 = (uint16_t)(val_to_int(&d2_val) + 1);
             num_dims = 2;
             while (tok[p] == ' ' || tok[p] == '\t') p++;
         }
@@ -5760,6 +5775,7 @@ static int basic_exec_screen(const uint8_t __far *tok, uint16_t *pos) {
             os_gfx_set_mode(0x04);
             s_screen_mode = 1;
             s_gfx_fg = 3;
+            s_draw_color = 3;
             s_last_x = 160;
             s_last_y = 100;
             s_gfx_row = 0;
@@ -5768,6 +5784,7 @@ static int basic_exec_screen(const uint8_t __far *tok, uint16_t *pos) {
             os_gfx_set_mode(0x06);
             s_screen_mode = 2;
             s_gfx_fg = 1;
+            s_draw_color = 1;
             s_last_x = 320;
             s_last_y = 100;
             s_gfx_row = 0;
@@ -5781,6 +5798,7 @@ static int basic_exec_screen(const uint8_t __far *tok, uint16_t *pos) {
             }
             s_screen_mode = 12;
             s_gfx_fg = 15;
+            s_draw_color = 15;
             s_last_x = 320;
             s_last_y = 240;
             s_gfx_row = 0;
@@ -5794,6 +5812,7 @@ static int basic_exec_screen(const uint8_t __far *tok, uint16_t *pos) {
             }
             s_screen_mode = 13;
             s_gfx_fg = 15;
+            s_draw_color = 15;
             s_last_x = 160;
             s_last_y = 100;
             s_gfx_row = 0;
@@ -6148,6 +6167,781 @@ static int basic_exec_circle(const uint8_t __far *tok, uint16_t *pos) {
 
     if (r > 0) {
         basic_draw_circle(xc, yc, r, color);
+    }
+
+    *pos = p;
+    return 0;
+}
+
+/* --------------------------------------------------------------------------
+ * Phase 14: Advanced Graphics (PAINT, GET/PUT Sprites, DRAW)
+ * -------------------------------------------------------------------------- */
+
+#define BASIC_PAINT_STACK_SIZE 512
+static int16_t s_paint_stack_x[BASIC_PAINT_STACK_SIZE];
+static int16_t s_paint_stack_y[BASIC_PAINT_STACK_SIZE];
+
+static void basic_paint_fill(int16_t start_x, int16_t start_y, uint8_t paint_color, uint8_t border_color) {
+    uint16_t max_x = (s_screen_mode == 2 || s_screen_mode == 12) ? 640 : 320;
+    uint16_t max_y = (s_screen_mode == 12) ? 480 : 200;
+    int sp = 0;
+
+    if (start_x < 0 || (uint16_t)start_x >= max_x || start_y < 0 || (uint16_t)start_y >= max_y) return;
+
+    {
+        uint8_t init_c = bios_read_pixel((uint16_t)start_x, (uint16_t)start_y);
+        if (init_c == border_color || init_c == paint_color) return;
+    }
+
+    s_paint_stack_x[sp] = start_x;
+    s_paint_stack_y[sp] = start_y;
+    sp++;
+
+    while (sp > 0) {
+        int16_t cur_x, cur_y;
+        int16_t left_x, right_x;
+        int16_t x;
+
+        if (s_break_pending) break;
+        if (s_running) basic_poll_events();
+
+        sp--;
+        cur_x = s_paint_stack_x[sp];
+        cur_y = s_paint_stack_y[sp];
+
+        if (cur_y < 0 || (uint16_t)cur_y >= max_y) continue;
+        if (bios_read_pixel((uint16_t)cur_x, (uint16_t)cur_y) == border_color ||
+            bios_read_pixel((uint16_t)cur_x, (uint16_t)cur_y) == paint_color) continue;
+
+        /* Scan left */
+        left_x = cur_x;
+        while (left_x > 0) {
+            uint8_t c = bios_read_pixel((uint16_t)(left_x - 1), (uint16_t)cur_y);
+            if (c == border_color || c == paint_color) break;
+            left_x--;
+        }
+
+        /* Scan right */
+        right_x = cur_x;
+        while ((uint16_t)(right_x + 1) < max_x) {
+            uint8_t c = bios_read_pixel((uint16_t)(right_x + 1), (uint16_t)cur_y);
+            if (c == border_color || c == paint_color) break;
+            right_x++;
+        }
+
+        /* Draw horizontal scanline span from left_x to right_x */
+        os_gfx_line((uint16_t)left_x, (uint16_t)cur_y, (uint16_t)right_x, (uint16_t)cur_y, paint_color);
+
+        /* Inspect row above (cur_y - 1) */
+        if (cur_y > 0) {
+            int16_t ny = cur_y - 1;
+            uint8_t in_span = 0;
+            for (x = left_x; x <= right_x; x++) {
+                uint8_t c = bios_read_pixel((uint16_t)x, (uint16_t)ny);
+                if (c != border_color && c != paint_color) {
+                    if (!in_span) {
+                        if (sp < BASIC_PAINT_STACK_SIZE) {
+                            s_paint_stack_x[sp] = x;
+                            s_paint_stack_y[sp] = ny;
+                            sp++;
+                        }
+                        in_span = 1;
+                    }
+                } else {
+                    in_span = 0;
+                }
+            }
+        }
+
+        /* Inspect row below (cur_y + 1) */
+        if ((uint16_t)(cur_y + 1) < max_y) {
+            int16_t ny = cur_y + 1;
+            uint8_t in_span = 0;
+            for (x = left_x; x <= right_x; x++) {
+                uint8_t c = bios_read_pixel((uint16_t)x, (uint16_t)ny);
+                if (c != border_color && c != paint_color) {
+                    if (!in_span) {
+                        if (sp < BASIC_PAINT_STACK_SIZE) {
+                            s_paint_stack_x[sp] = x;
+                            s_paint_stack_y[sp] = ny;
+                            sp++;
+                        }
+                        in_span = 1;
+                    }
+                } else {
+                    in_span = 0;
+                }
+            }
+        }
+    }
+}
+
+static int basic_exec_paint(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t x_val, y_val;
+    int16_t x, y;
+    uint8_t paint_color, border_color;
+    int is_step = 0;
+
+    p += 2; /* skip 2-byte token TOK_PAINT (0xFE, 0x8F) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == TOK_STEP) {
+        is_step = 1;
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+    }
+
+    if (tok[p] != '(') {
+        return basic_error(2, "Syntax error in PAINT (expected '(')\n");
+    }
+    p++;
+
+    if (basic_eval_expr(tok, &p, &x_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') {
+        return basic_error(2, "Syntax error in PAINT (expected ',')\n");
+    }
+    p++;
+    if (basic_eval_expr(tok, &p, &y_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ')') {
+        return basic_error(2, "Syntax error in PAINT (expected ')')\n");
+    }
+    p++;
+
+    x = val_to_int(&x_val);
+    y = val_to_int(&y_val);
+    if (is_step) {
+        x += s_last_x;
+        y += s_last_y;
+    }
+
+    paint_color = (s_screen_mode == 1) ? 3 : ((s_screen_mode == 12 || s_screen_mode == 13) ? s_gfx_fg : 1);
+    border_color = paint_color;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] != ',' && tok[p] != ':' && tok[p] != 0x00) {
+            basic_val_t pc_val;
+            if (basic_eval_expr(tok, &p, &pc_val) != 0) return -1;
+            paint_color = (uint8_t)val_to_int(&pc_val);
+            border_color = paint_color;
+        }
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+            if (tok[p] != ':' && tok[p] != 0x00) {
+                basic_val_t bc_val;
+                if (basic_eval_expr(tok, &p, &bc_val) != 0) return -1;
+                border_color = (uint8_t)val_to_int(&bc_val);
+            }
+        }
+    }
+
+    s_last_x = x;
+    s_last_y = y;
+
+    if (s_screen_mode == 0) {
+        return basic_error(5, "Illegal function call in PAINT\n");
+    }
+
+    basic_paint_fill(x, y, paint_color, border_color);
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_get_gfx(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t x1_val, y1_val, x2_val, y2_val;
+    int16_t x1, y1, x2, y2;
+    int is_step1 = 0, is_step2 = 0;
+    char var_name[BASIC_MAX_VARNAME];
+    basic_array_t *arr;
+    uint16_t elem_offset = 0;
+    uint16_t total_elems, elem_size, array_bytes;
+    uint16_t min_x, max_x, min_y, max_y, w, h;
+    uint16_t bits_per_pixel, width_in_bits, row_bytes, total_bytes;
+    uint8_t __far *arr_ptr;
+
+    p += 2; /* skip TOK_GET (0xFE, 0x89) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == TOK_STEP) {
+        is_step1 = 1;
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+    }
+
+    if (tok[p] != '(') return basic_error(2, "Syntax error in GET (expected '(')\n");
+    p++;
+    if (basic_eval_expr(tok, &p, &x1_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') return basic_error(2, "Syntax error in GET (expected ',')\n");
+    p++;
+    if (basic_eval_expr(tok, &p, &y1_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ')') return basic_error(2, "Syntax error in GET (expected ')')\n");
+    p++;
+
+    x1 = val_to_int(&x1_val);
+    y1 = val_to_int(&y1_val);
+    if (is_step1) { x1 += s_last_x; y1 += s_last_y; }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != '-' && tok[p] != TOK_MINUS) return basic_error(2, "Syntax error in GET (expected '-')\n");
+    p++;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == TOK_STEP) {
+        is_step2 = 1;
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+    }
+
+    if (tok[p] != '(') return basic_error(2, "Syntax error in GET (expected '(')\n");
+    p++;
+    if (basic_eval_expr(tok, &p, &x2_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') return basic_error(2, "Syntax error in GET (expected ',')\n");
+    p++;
+    if (basic_eval_expr(tok, &p, &y2_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ')') return basic_error(2, "Syntax error in GET (expected ')')\n");
+    p++;
+
+    x2 = val_to_int(&x2_val);
+    y2 = val_to_int(&y2_val);
+    if (is_step2) { x2 += x1; y2 += y1; }
+
+    s_last_x = x2;
+    s_last_y = y2;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') return basic_error(2, "Syntax error in GET (expected ',')\n");
+    p++;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+        return basic_error(2, "Syntax error in GET variable\n");
+    }
+
+    arr = basic_find_array(var_name);
+    if (!arr) {
+        arr = basic_create_default_array(var_name, 1);
+        if (!arr) return -1;
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == '(') {
+        basic_val_t i1_val, i2_val;
+        int16_t i1, i2 = 0;
+        p++;
+        if (basic_eval_expr(tok, &p, &i1_val) != 0) return -1;
+        i1 = val_to_int(&i1_val);
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            if (basic_eval_expr(tok, &p, &i2_val) != 0) return -1;
+            i2 = val_to_int(&i2_val);
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+        }
+        if (tok[p] != ')') return basic_error(2, "Syntax error in array subscript (expected ')')\n");
+        p++;
+        if (i1 < 0 || (uint16_t)i1 >= arr->dim1 || (arr->num_dims == 2 && (i2 < 0 || (uint16_t)i2 >= arr->dim2))) {
+            return basic_error(9, "Subscript out of range in GET\n");
+        }
+        {
+            uint16_t linear_idx = (arr->num_dims == 1) ? (uint16_t)i1 : ((uint16_t)i1 * arr->dim2 + (uint16_t)i2);
+            uint16_t sz = (arr->type == BASIC_TYPE_INT) ? 2 : ((arr->type == BASIC_TYPE_FLOAT) ? 4 : BASIC_STR_ELEM_LEN);
+            elem_offset = linear_idx * sz;
+        }
+    }
+
+    if (s_screen_mode == 0) return basic_error(5, "Illegal function call in GET\n");
+
+    min_x = (x1 < x2) ? (uint16_t)x1 : (uint16_t)x2;
+    max_x = (x1 > x2) ? (uint16_t)x1 : (uint16_t)x2;
+    min_y = (y1 < y2) ? (uint16_t)y1 : (uint16_t)y2;
+    max_y = (y1 > y2) ? (uint16_t)y1 : (uint16_t)y2;
+    w = max_x - min_x + 1;
+    h = max_y - min_y + 1;
+
+    if (s_screen_mode == 1) {
+        bits_per_pixel = 2;
+    } else if (s_screen_mode == 2) {
+        bits_per_pixel = 1;
+    } else if (s_screen_mode == 12) {
+        bits_per_pixel = 4;
+    } else if (s_screen_mode == 13) {
+        bits_per_pixel = 8;
+    } else {
+        bits_per_pixel = 2;
+    }
+
+    width_in_bits = w * bits_per_pixel;
+    row_bytes = (width_in_bits + 7) >> 3;
+    total_bytes = 4 + (row_bytes * h);
+
+    total_elems = (arr->num_dims == 1) ? arr->dim1 : (arr->dim1 * arr->dim2);
+    elem_size = (arr->type == BASIC_TYPE_INT) ? 2 : ((arr->type == BASIC_TYPE_FLOAT) ? 4 : BASIC_STR_ELEM_LEN);
+    array_bytes = total_elems * elem_size;
+
+    if (elem_offset + total_bytes > array_bytes) {
+        return basic_error(9, "Subscript out of range (array too small for GET)\n");
+    }
+
+    arr_ptr = (uint8_t __far *)MK_FP(s_basic_seg, arr->data_off + elem_offset);
+    arr_ptr[0] = (uint8_t)(width_in_bits & 0xFF);
+    arr_ptr[1] = (uint8_t)(width_in_bits >> 8);
+    arr_ptr[2] = (uint8_t)(h & 0xFF);
+    arr_ptr[3] = (uint8_t)(h >> 8);
+
+    {
+        uint16_t off = 4;
+        uint16_t ry, rx;
+        for (ry = 0; ry < h; ry++) {
+            uint16_t cur_y = min_y + ry;
+            if (bits_per_pixel == 8) {
+                for (rx = 0; rx < w; rx++) {
+                    arr_ptr[off + rx] = bios_read_pixel(min_x + rx, cur_y);
+                }
+                off += w;
+            } else if (bits_per_pixel == 2) {
+                uint8_t byte_val = 0;
+                uint8_t bit_cnt = 0;
+                for (rx = 0; rx < w; rx++) {
+                    uint8_t c = bios_read_pixel(min_x + rx, cur_y) & 0x03;
+                    byte_val = (byte_val << 2) | c;
+                    bit_cnt += 2;
+                    if (bit_cnt == 8) {
+                        arr_ptr[off++] = byte_val;
+                        byte_val = 0;
+                        bit_cnt = 0;
+                    }
+                }
+                if (bit_cnt > 0) {
+                    byte_val <<= (8 - bit_cnt);
+                    arr_ptr[off++] = byte_val;
+                }
+            } else if (bits_per_pixel == 1) {
+                uint8_t byte_val = 0;
+                uint8_t bit_cnt = 0;
+                for (rx = 0; rx < w; rx++) {
+                    uint8_t c = bios_read_pixel(min_x + rx, cur_y) & 0x01;
+                    byte_val = (byte_val << 1) | c;
+                    bit_cnt++;
+                    if (bit_cnt == 8) {
+                        arr_ptr[off++] = byte_val;
+                        byte_val = 0;
+                        bit_cnt = 0;
+                    }
+                }
+                if (bit_cnt > 0) {
+                    byte_val <<= (8 - bit_cnt);
+                    arr_ptr[off++] = byte_val;
+                }
+            } else if (bits_per_pixel == 4) {
+                uint8_t byte_val = 0;
+                uint8_t bit_cnt = 0;
+                for (rx = 0; rx < w; rx++) {
+                    uint8_t c = bios_read_pixel(min_x + rx, cur_y) & 0x0F;
+                    byte_val = (byte_val << 4) | c;
+                    bit_cnt += 4;
+                    if (bit_cnt == 8) {
+                        arr_ptr[off++] = byte_val;
+                        byte_val = 0;
+                        bit_cnt = 0;
+                    }
+                }
+                if (bit_cnt > 0) {
+                    byte_val <<= (8 - bit_cnt);
+                    arr_ptr[off++] = byte_val;
+                }
+            }
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_put_gfx(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t x_val, y_val;
+    int16_t x, y;
+    int is_step = 0;
+    char var_name[BASIC_MAX_VARNAME];
+    basic_array_t *arr;
+    uint16_t elem_offset = 0;
+    uint8_t action = 4; /* Default = XOR */
+    uint16_t bits_per_pixel, width_in_bits, w, h;
+    uint16_t max_x, max_y;
+    uint8_t mask;
+    uint8_t __far *arr_ptr;
+
+    p += 2; /* skip TOK_PUT (0xFE, 0x88) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (tok[p] == TOK_STEP) {
+        is_step = 1;
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+    }
+
+    if (tok[p] != '(') return basic_error(2, "Syntax error in PUT (expected '(')\n");
+    p++;
+    if (basic_eval_expr(tok, &p, &x_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') return basic_error(2, "Syntax error in PUT (expected ',')\n");
+    p++;
+    if (basic_eval_expr(tok, &p, &y_val) != 0) return -1;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ')') return basic_error(2, "Syntax error in PUT (expected ')')\n");
+    p++;
+
+    x = val_to_int(&x_val);
+    y = val_to_int(&y_val);
+    if (is_step) { x += s_last_x; y += s_last_y; }
+    s_last_x = x;
+    s_last_y = y;
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] != ',') return basic_error(2, "Syntax error in PUT (expected ',')\n");
+    p++;
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (!basic_parse_var_name(tok, &p, var_name, sizeof(var_name))) {
+        return basic_error(2, "Syntax error in PUT variable\n");
+    }
+
+    arr = basic_find_array(var_name);
+    if (!arr) return basic_error(9, "Array not dimensioned in PUT\n");
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == '(') {
+        basic_val_t i1_val, i2_val;
+        int16_t i1, i2 = 0;
+        p++;
+        if (basic_eval_expr(tok, &p, &i1_val) != 0) return -1;
+        i1 = val_to_int(&i1_val);
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == ',') {
+            p++;
+            if (basic_eval_expr(tok, &p, &i2_val) != 0) return -1;
+            i2 = val_to_int(&i2_val);
+            while (tok[p] == ' ' || tok[p] == '\t') p++;
+        }
+        if (tok[p] != ')') return basic_error(2, "Syntax error in array subscript (expected ')')\n");
+        p++;
+        if (i1 < 0 || (uint16_t)i1 >= arr->dim1 || (arr->num_dims == 2 && (i2 < 0 || (uint16_t)i2 >= arr->dim2))) {
+            return basic_error(9, "Subscript out of range in PUT\n");
+        }
+        {
+            uint16_t linear_idx = (arr->num_dims == 1) ? (uint16_t)i1 : ((uint16_t)i1 * arr->dim2 + (uint16_t)i2);
+            uint16_t sz = (arr->type == BASIC_TYPE_INT) ? 2 : ((arr->type == BASIC_TYPE_FLOAT) ? 4 : BASIC_STR_ELEM_LEN);
+            elem_offset = linear_idx * sz;
+        }
+    }
+
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+    if (tok[p] == ',') {
+        p++;
+        while (tok[p] == ' ' || tok[p] == '\t') p++;
+        if (tok[p] == TOK_PSET) { action = 0; p++; }
+        else if (tok[p] == TOK_PRESET) { action = 1; p++; }
+        else if (tok[p] == TOK_AND) { action = 2; p++; }
+        else if (tok[p] == TOK_OR) { action = 3; p++; }
+        else if (tok[p] == TOK_XOR) { action = 4; p++; }
+        else if (basic_strnicmp_far(&tok[p], "PSET", 4) == 0) { action = 0; p += 4; }
+        else if (basic_strnicmp_far(&tok[p], "PRESET", 6) == 0) { action = 1; p += 6; }
+        else if (basic_strnicmp_far(&tok[p], "AND", 3) == 0) { action = 2; p += 3; }
+        else if (basic_strnicmp_far(&tok[p], "OR", 2) == 0) { action = 3; p += 2; }
+        else if (basic_strnicmp_far(&tok[p], "XOR", 3) == 0) { action = 4; p += 3; }
+    }
+
+    if (s_screen_mode == 0) return basic_error(5, "Illegal function call in PUT\n");
+
+    if (s_screen_mode == 1) {
+        bits_per_pixel = 2;
+        mask = 0x03;
+    } else if (s_screen_mode == 2) {
+        bits_per_pixel = 1;
+        mask = 0x01;
+    } else if (s_screen_mode == 12) {
+        bits_per_pixel = 4;
+        mask = 0x0F;
+    } else if (s_screen_mode == 13) {
+        bits_per_pixel = 8;
+        mask = 0xFF;
+    } else {
+        bits_per_pixel = 2;
+        mask = 0x03;
+    }
+
+    arr_ptr = (uint8_t __far *)MK_FP(s_basic_seg, arr->data_off + elem_offset);
+    width_in_bits = (uint16_t)arr_ptr[0] | ((uint16_t)arr_ptr[1] << 8);
+    h = (uint16_t)arr_ptr[2] | ((uint16_t)arr_ptr[3] << 8);
+    w = width_in_bits / bits_per_pixel;
+
+    max_x = (s_screen_mode == 2 || s_screen_mode == 12) ? 640 : 320;
+    max_y = (s_screen_mode == 12) ? 480 : 200;
+
+    {
+        uint16_t off = 4;
+        uint16_t ry, rx;
+        for (ry = 0; ry < h; ry++) {
+            int16_t cur_y = y + (int16_t)ry;
+            if (bits_per_pixel == 8) {
+                for (rx = 0; rx < w; rx++) {
+                    int16_t cur_x = x + (int16_t)rx;
+                    uint8_t sc = arr_ptr[off + rx];
+                    if (cur_x >= 0 && (uint16_t)cur_x < max_x && cur_y >= 0 && (uint16_t)cur_y < max_y) {
+                        uint8_t tc = bios_read_pixel((uint16_t)cur_x, (uint16_t)cur_y);
+                        uint8_t fc;
+                        if (action == 0) fc = sc;
+                        else if (action == 1) fc = (~sc) & mask;
+                        else if (action == 2) fc = tc & sc;
+                        else if (action == 3) fc = tc | sc;
+                        else fc = tc ^ sc;
+                        os_gfx_putpixel((uint16_t)cur_x, (uint16_t)cur_y, fc);
+                    }
+                }
+                off += w;
+            } else if (bits_per_pixel == 2) {
+                uint8_t byte_val = 0;
+                uint8_t bit_cnt = 0;
+                for (rx = 0; rx < w; rx++) {
+                    int16_t cur_x = x + (int16_t)rx;
+                    uint8_t sc;
+                    if (bit_cnt == 0) {
+                        byte_val = arr_ptr[off++];
+                        bit_cnt = 8;
+                    }
+                    sc = (byte_val >> 6) & 0x03;
+                    byte_val <<= 2;
+                    bit_cnt -= 2;
+
+                    if (cur_x >= 0 && (uint16_t)cur_x < max_x && cur_y >= 0 && (uint16_t)cur_y < max_y) {
+                        uint8_t tc = bios_read_pixel((uint16_t)cur_x, (uint16_t)cur_y);
+                        uint8_t fc;
+                        if (action == 0) fc = sc;
+                        else if (action == 1) fc = (~sc) & mask;
+                        else if (action == 2) fc = tc & sc;
+                        else if (action == 3) fc = tc | sc;
+                        else fc = tc ^ sc;
+                        os_gfx_putpixel((uint16_t)cur_x, (uint16_t)cur_y, fc);
+                    }
+                }
+            } else if (bits_per_pixel == 1) {
+                uint8_t byte_val = 0;
+                uint8_t bit_cnt = 0;
+                for (rx = 0; rx < w; rx++) {
+                    int16_t cur_x = x + (int16_t)rx;
+                    uint8_t sc;
+                    if (bit_cnt == 0) {
+                        byte_val = arr_ptr[off++];
+                        bit_cnt = 8;
+                    }
+                    sc = (byte_val >> 7) & 0x01;
+                    byte_val <<= 1;
+                    bit_cnt--;
+
+                    if (cur_x >= 0 && (uint16_t)cur_x < max_x && cur_y >= 0 && (uint16_t)cur_y < max_y) {
+                        uint8_t tc = bios_read_pixel((uint16_t)cur_x, (uint16_t)cur_y);
+                        uint8_t fc;
+                        if (action == 0) fc = sc;
+                        else if (action == 1) fc = (~sc) & mask;
+                        else if (action == 2) fc = tc & sc;
+                        else if (action == 3) fc = tc | sc;
+                        else fc = tc ^ sc;
+                        os_gfx_putpixel((uint16_t)cur_x, (uint16_t)cur_y, fc);
+                    }
+                }
+            } else if (bits_per_pixel == 4) {
+                uint8_t byte_val = 0;
+                uint8_t bit_cnt = 0;
+                for (rx = 0; rx < w; rx++) {
+                    int16_t cur_x = x + (int16_t)rx;
+                    uint8_t sc;
+                    if (bit_cnt == 0) {
+                        byte_val = arr_ptr[off++];
+                        bit_cnt = 8;
+                    }
+                    sc = (byte_val >> 4) & 0x0F;
+                    byte_val <<= 4;
+                    bit_cnt -= 4;
+
+                    if (cur_x >= 0 && (uint16_t)cur_x < max_x && cur_y >= 0 && (uint16_t)cur_y < max_y) {
+                        uint8_t tc = bios_read_pixel((uint16_t)cur_x, (uint16_t)cur_y);
+                        uint8_t fc;
+                        if (action == 0) fc = sc;
+                        else if (action == 1) fc = (~sc) & mask;
+                        else if (action == 2) fc = tc & sc;
+                        else if (action == 3) fc = tc | sc;
+                        else fc = tc ^ sc;
+                        os_gfx_putpixel((uint16_t)cur_x, (uint16_t)cur_y, fc);
+                    }
+                }
+            }
+        }
+    }
+
+    *pos = p;
+    return 0;
+}
+
+static int basic_exec_draw(const uint8_t __far *tok, uint16_t *pos) {
+    uint16_t p = *pos;
+    basic_val_t str_val;
+    const char *s;
+
+    p += 2; /* skip 2-byte token TOK_DRAW (0xFE, 0x92) */
+    while (tok[p] == ' ' || tok[p] == '\t') p++;
+
+    if (basic_eval_expr(tok, &p, &str_val) != 0) return -1;
+    if (str_val.type != BASIC_TYPE_STR || !str_val.sval) {
+        return basic_error(13, "Type mismatch in DRAW\n");
+    }
+
+    if (s_screen_mode == 0) {
+        return basic_error(5, "Illegal function call in DRAW\n");
+    }
+
+    s = str_val.sval;
+    while (*s) {
+        int blind = 0;
+        int no_update = 0;
+        char cmd;
+        int16_t n = 1;
+        int16_t dx = 0, dy = 0;
+        int is_move = 0;
+        int is_rel_move = 0;
+        int16_t mx = 0, my = 0;
+
+        while (*s == ' ' || *s == '\t' || *s == ';') s++;
+        if (!*s) break;
+
+        /* Check B (blind) and N (no-update) prefixes */
+        for (;;) {
+            if (*s == 'B' || *s == 'b') { blind = 1; s++; }
+            else if (*s == 'N' || *s == 'n') { no_update = 1; s++; }
+            else break;
+        }
+        while (*s == ' ' || *s == '\t') s++;
+        if (!*s) break;
+
+        cmd = *s++;
+        if (cmd >= 'a' && cmd <= 'z') cmd = (char)(cmd - 'a' + 'A');
+
+        /* Parse number operand */
+        while (*s == ' ' || *s == '\t') s++;
+        if (cmd == 'M') {
+            /* M [+/-]x, [+/-]y */
+            int sx = 1, sy = 1;
+            is_move = 1;
+            if (*s == '+') { is_rel_move = 1; s++; }
+            else if (*s == '-') { is_rel_move = 1; sx = -1; s++; }
+            while (*s >= '0' && *s <= '9') {
+                mx = mx * 10 + (*s++ - '0');
+            }
+            mx *= sx;
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == ',') s++;
+            while (*s == ' ' || *s == '\t') s++;
+            if (*s == '+') { s++; }
+            else if (*s == '-') { sy = -1; s++; }
+            while (*s >= '0' && *s <= '9') {
+                my = my * 10 + (*s++ - '0');
+            }
+            my *= sy;
+        } else {
+            if (*s >= '0' && *s <= '9') {
+                n = 0;
+                while (*s >= '0' && *s <= '9') {
+                    n = n * 10 + (*s++ - '0');
+                }
+            } else {
+                n = 1;
+            }
+        }
+
+        if (cmd == 'C') {
+            s_draw_color = (uint8_t)n;
+            continue;
+        } else if (cmd == 'S') {
+            if (n < 1) n = 1;
+            s_draw_scale = (uint8_t)n;
+            continue;
+        } else if (cmd == 'A') {
+            s_draw_angle = (uint8_t)(n & 3);
+            continue;
+        } else if (cmd == 'X') {
+            /* Substring execution: skip identifier */
+            while (*s && *s != ';' && *s != ' ') s++;
+            continue;
+        }
+
+        if (is_move) {
+            int16_t target_x, target_y;
+            if (is_rel_move) {
+                target_x = s_last_x + mx;
+                target_y = s_last_y + my;
+            } else {
+                target_x = mx;
+                target_y = my;
+            }
+            if (!blind) {
+                os_gfx_line((uint16_t)s_last_x, (uint16_t)s_last_y, (uint16_t)target_x, (uint16_t)target_y, s_draw_color);
+            }
+            if (!no_update) {
+                s_last_x = target_x;
+                s_last_y = target_y;
+            }
+            continue;
+        }
+
+        /* Directional commands: U, D, L, R, E, F, G, H */
+        if (cmd == 'U') { dy = -n; }
+        else if (cmd == 'D') { dy = n; }
+        else if (cmd == 'L') { dx = -n; }
+        else if (cmd == 'R') { dx = n; }
+        else if (cmd == 'E') { dx = n; dy = -n; }
+        else if (cmd == 'F') { dx = n; dy = n; }
+        else if (cmd == 'G') { dx = -n; dy = n; }
+        else if (cmd == 'H') { dx = -n; dy = -n; }
+        else {
+            continue;
+        }
+
+        /* Apply rotation angle: 0 = 0 deg, 1 = 90 deg, 2 = 180 deg, 3 = 270 deg */
+        if (s_draw_angle == 1) {
+            int16_t t = dx; dx = -dy; dy = t;
+        } else if (s_draw_angle == 2) {
+            dx = -dx; dy = -dy;
+        } else if (s_draw_angle == 3) {
+            int16_t t = dx; dx = dy; dy = -t;
+        }
+
+        /* Apply scale factor: scale / 4 */
+        dx = (int16_t)(((int16_t)dx * s_draw_scale) >> 2);
+        dy = (int16_t)(((int16_t)dy * s_draw_scale) >> 2);
+
+        {
+            int16_t target_x = s_last_x + dx;
+            int16_t target_y = s_last_y + dy;
+            if (!blind) {
+                os_gfx_line((uint16_t)s_last_x, (uint16_t)s_last_y, (uint16_t)target_x, (uint16_t)target_y, s_draw_color);
+            }
+            if (!no_update) {
+                s_last_x = target_x;
+                s_last_y = target_y;
+            }
+        }
     }
 
     *pos = p;
@@ -8387,6 +9181,18 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return basic_exec_circle(tok, pos);
     }
 
+    /* PAINT statement (2-byte token 0xFE, 0x8F) - Phase 14 */
+    if (tok[p] == (uint8_t)(TOK_PAINT >> 8) && tok[p + 1] == (uint8_t)(TOK_PAINT & 0xFF)) {
+        *pos = p;
+        return basic_exec_paint(tok, pos);
+    }
+
+    /* DRAW statement (2-byte token 0xFE, 0x92) - Phase 14 */
+    if (tok[p] == (uint8_t)(TOK_DRAW >> 8) && tok[p + 1] == (uint8_t)(TOK_DRAW & 0xFF)) {
+        *pos = p;
+        return basic_exec_draw(tok, pos);
+    }
+
     /* BEEP statement */
     if (tok[p] == TOK_BEEP) {
         *pos = p;
@@ -8492,14 +9298,26 @@ static int basic_exec_statement(const uint8_t __far *tok, uint16_t *pos) {
         return basic_exec_lset_rset(tok, pos, 1);
     }
 
-    /* PUT statement (2-byte token 0xFE, 0x88) - Phase 11 */
+    /* PUT statement (2-byte token 0xFE, 0x88) - Phase 11 / 14 */
     if (tok[p] == (uint8_t)(TOK_PUT >> 8) && tok[p + 1] == (uint8_t)(TOK_PUT & 0xFF)) {
+        uint16_t chk_p = p + 2;
+        while (tok[chk_p] == ' ' || tok[chk_p] == '\t') chk_p++;
+        if (tok[chk_p] == '(' || tok[chk_p] == TOK_STEP) {
+            *pos = p;
+            return basic_exec_put_gfx(tok, pos);
+        }
         *pos = p;
         return basic_exec_put(tok, pos);
     }
 
-    /* GET statement (2-byte token 0xFE, 0x89) - Phase 11 */
+    /* GET statement (2-byte token 0xFE, 0x89) - Phase 11 / 14 */
     if (tok[p] == (uint8_t)(TOK_GET >> 8) && tok[p + 1] == (uint8_t)(TOK_GET & 0xFF)) {
+        uint16_t chk_p = p + 2;
+        while (tok[chk_p] == ' ' || tok[chk_p] == '\t') chk_p++;
+        if (tok[chk_p] == '(' || tok[chk_p] == TOK_STEP) {
+            *pos = p;
+            return basic_exec_get_gfx(tok, pos);
+        }
         *pos = p;
         return basic_exec_get(tok, pos);
     }
@@ -8891,6 +9709,9 @@ static void basic_cmd_run(void) {
     s_break_pending = 0;
     s_can_cont = 0;
     s_auto_mode = 0;
+    s_draw_angle = 0;
+    s_draw_scale = 4;
+    s_draw_color = (s_screen_mode == 1) ? 3 : ((s_screen_mode == 12 || s_screen_mode == 13) ? s_gfx_fg : 1);
     s_cont_line_off = 0;
     s_cont_stmt_pos = 4;
     s_err_reported = 0;

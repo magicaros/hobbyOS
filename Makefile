@@ -7,7 +7,7 @@ PATH   := $(WATCOM)/binl64:$(PATH)
 86BOX  := /usr/local/bin/86Box
 IMG    := book8088/disk.img
 CFLAGS := -0 -fpi87 -ms -s -os -zl -ecc -zq -Iinclude -Ibuild
-CFLAGS_MM := -0 -fpi87 -mm -s -os -zl -ecc -zq -Iinclude -Ibuild
+CFLAGS_MM := -0 -fpi87 -mm -s -os -zl -ecc -zq -zm -Iinclude -Ibuild
 
 KERNEL_OBJS := build/entry.obj build/console.obj build/gfx.obj build/kbd.obj build/mouse.obj build/sound.obj build/mem.obj build/ems.obj build/xms.obj build/fat16.obj build/syscall.obj build/main.obj
 USER_BINS   := build/hello.bin build/mem.bin build/keyb.bin build/edit.bin build/shell.bin build/forth.bin build/format.bin build/fdisk.bin build/chkdsk.bin build/gfxdemo.bin build/ramdisk.bin build/har.bin build/sam.bin build/mouse.bin build/play.bin build/volume.bin build/more.bin build/tree.bin build/vidsync.bin build/view.bin build/zcode.bin build/fm.bin build/cpm.bin build/basic.exe
@@ -158,6 +158,7 @@ $(IMG): build/boot.bin build/kernel.bin $(USER_BINS) $(KEYMAPS) build/sam.mdl $(
 		basic/random.bas:/BASIC/RANDOM.BAS \
 		basic/final.bas:/BASIC/FINAL.BAS \
 		basic/phase13.bas:/BASIC/PHASE13.BAS \
+		basic/phase14.bas:/BASIC/PHASE14.BAS \
 		build/test80.com:/BIN/TEST80.COM \
 		games/zork1.z3:/GAMES/ZORK1.Z3 \
 		build/sample.cga:/PICS/SAMPLE.CGA \
@@ -183,11 +184,11 @@ run: $(IMG)
 	gdb -batch -ex "target remote :12345" -ex "c"
 
 agent-test: $(IMG)
-	timeout 60s env QT_QPA_PLATFORM=offscreen $(86BOX) -P book8088 > build/run.log 2>&1 & \
+	timeout 90s env QT_QPA_PLATFORM=offscreen $(86BOX) -P book8088 > build/run.log 2>&1 & \
 	PID=$$!; \
 	trap "kill $$PID 2>/dev/null || true" EXIT; \
 	while ! nc -z 127.0.0.1 12345; do sleep 0.1; done; \
 	gdb -batch -ex "set architecture i8086" -ex "target remote :12345" -ex "c"; \
-	sleep 20; \
+	sleep 40; \
 	kill $$PID 2>/dev/null || true; \
 	cat build/run.log

@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/25 00:06:00
+# 86Box v7.0 logfile, created 2026/11/25 13:13:31
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -65,21 +65,22 @@ Line 2 appended via SYS_FILE_APPEND
   - PICS/ <DIR>
   - MODELS/ <DIR>
   - MUSIC/ <DIR>
-  - BOOT.SH (168 bytes)
+  - BOOT.SH (117 bytes)
   - KEYMAPS/ <DIR>
   - DOCS/ <DIR>
 [EXEC] /BIN/HELLO.BIN exited with code 0
 Keyboard layout set to FR (/KEYMAPS/FR.MAP)
 Running /BOOT.SH...
+[2J[HhobbyOS BASIC Version 1.0 (GW-BASIC Compatible)
+61440 Bytes free
+=== Phase 14 Test Suite ===
+[2J[HPASS: DRAW diamond (P1= 3 )
+PASS: PAINT scanline flood fill (P2= 2 , P_OUT= 0 )
+PASS: GET sprite capture & PUT PSET (P3= 2 )
+PASS: PUT XOR sprite erasure (P4= 0 )
+PASS: DRAW scale & angle (P5= 1 )
+=== ALL PHASE 14 TESTS PASSED ===
 System ready.
-Creating archive: /test.har
-  Adding: GAMES/ZORK1.Z3 (86838 -> 77090 bytes, 88% LZ4)
-Archive created: 1 file(s) stored.
-Testing: GAMES/ZORK1.Z3 - OK
-All 1 file(s) tested OK.
-Extracting archive: /test.har to /EXTRACT
-  Extracting: GAMES/ZORK1.Z3 (86838 bytes) - OK
-Extracted 1 file(s).
 
 hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.
 SYS:/> 

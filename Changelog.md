@@ -2,6 +2,13 @@
 
 ## Revision 1.0.3 (2026-11-25)
 
+- **GW-BASIC Interpreter `INPUT$` Function & Expression Parsing (`/BIN/BASIC.EXE`, `user/basic.c`)**:
+  - **Tokenizer Sigil Collision Exception**: In `basic_tokenize()`, Phase 11's keyword suffix check skipped keywords followed by sigils (`$`, `%`, `!`, `#`) to protect variables like `NAME$`. Because GW-BASIC bytecode uniquely encodes `INPUT$` as `TOK_INPUT` (`0x85`) followed by the literal ASCII character `$` (`0x24`), this check skipped tokenization and caused `INPUT$` to be treated as an un-tokenized identifier. Added an explicit tokenizer exception allowing `"INPUT"` to tokenize into `TOK_INPUT` when followed by `'$'`.
+  - **Type-Safe Integer Argument Conversion**: Updated argument evaluation in `eval_primary()` for `INPUT$(n [, #f])` to use `val_to_int(&n_val)` and `(uint8_t)val_to_int(&f_val)` instead of `.ival`, properly accepting numeric literals and expressions that evaluate as `BASIC_TYPE_FLOAT`.
+  - **String Buffer Lifetime & Binary Length Tracking**: Deferred temporary string allocation via `basic_alloc_temp_str()` until after sub-expression evaluation completes (preventing circular buffer slot overwrite by nested expressions) and set `out_val->ival = idx` to ensure explicit length tracking for strings.
+  - **Single-Key Console Pause**: Restored correct behavior in test suites like `basic/test2.bas` and `basic/test3.bas` where `A$ = INPUT$(1)` halts and waits for a single keystroke without echoing to the screen before resuming execution.
+  - **Graphics Mode Newline Row-Wipe Elimination**: In `basic_gfx_print_str()`, removed unintended full-row black rectangle fills (`os_gfx_rect(0, s_gfx_row * 8, max_cols * 8, 8, 0, 1)`) previously executed upon encountering `\n` or column wrap. When `PRINT` statements in graphics modes emit a newline, the cursor coordinates now advance to the next line without overwriting background graphics, preventing a solid 320/640-pixel black bar from slicing across graphics when waiting for input or pausing.
+
 - **HobbyOS Archiver (HAR) Single-Pass Large File Streaming (`/BIN/HAR.BIN`, `user/har.c`)**:
   - Eliminated the temporary staging file `_HARTMP.$$$` previously required when archiving files > 32 KB.
   - Leverages `SYS_FILE_WRITE_OFFSET` (`os_file_write_offset`) to backpatch the 14-byte `har_entry_t` header (updating final CRC-16 and total compressed payload size) after streaming chunks directly into the archive file via `os_file_append()`.
@@ -245,6 +252,23 @@
       - Switched keyboard break mode to `BREAK_MODE_RAW` via `os_set_break_mode(BREAK_MODE_RAW)` on BASIC startup, restoring `BREAK_MODE_NORMAL` on exit.
       - Enables BASIC to intercept and handle `Ctrl+C` natively (`Break in <line>` into REPL, `^C` input line cancel) without the kernel aborting to shell, while preserving `Ctrl+Alt+C` for emergency exit.
     - **Target Verification Suite (`/BASIC/PHASE13.BAS`)**: Comprehensive verification suite covering softkey scrolling across 30 lines, `CSRLIN` clamping to row 24, custom function key strings, toggle with `KEY OFF`/`KEY ON`, `SCREEN 1` & `SCREEN 2` graphics and pixel reading, and VGA mode autodetection with error trapping. Verified 100% passed on target Book8088 emulator.
+  - **Phase 14: Advanced Graphics (`PAINT`, Graphics `GET` / `PUT` Sprites, `DRAW`) & Multi-Segment Toolchain (`Makefile`, `user/basic.c`)**:
+    - **`PAINT` Scanline Flood-Fill Engine (`PAINT [STEP] (x, y) [, [paint_color] [, [border_color]]]`)**:
+      - Stack-safe scanline flood-fill algorithm using a 512-entry static coordinate FIFO in DGROUP, eliminating recursion to strictly prevent stack overflows on the 8088 CPU.
+      - Scans continuous horizontal spans (`left_x..right_x`) bounded by `border_color` (defaults to `paint_color`), draws scanlines via `os_gfx_line`, and pushes candidate spans across adjacent rows `y - 1` and `y + 1`.
+      - Periodically polls events via `basic_poll_events()` for non-blocking `Ctrl+C` breakability during long fills.
+    - **Graphics `GET` & `PUT` Sprite Blitter (`GET/PUT [STEP] (x1, y1)-(x2, y2), array [(idx)] [, ACTION]`)**:
+      - Transparent statement dispatch distinguishing random-access file I/O (`GET/PUT #n, rec`) from graphics sprite operations based on coordinate syntax (`(` or `STEP`).
+      - `GET`: Captures rectangular screen regions into 1D/2D numeric arrays matching authentic GW-BASIC format (first 4 bytes encode width in bits and height in scanlines, followed by packed pixel scanline data according to active mode: 2 bpp for CGA mode 1, 1 bpp for CGA mode 2, 4 bpp for VGA mode 12, 8 bpp for VGA mode 13).
+      - `PUT`: Blits sprites onto the screen supporting all 5 raster operations (`PSET`, `PRESET`, `AND`, `OR`, `XOR`), defaulting to `XOR` for standard retro sprite animation and non-destructive erasure.
+      - Handled tokenized minus separator (`TOK_MINUS` / `'-'`) in coordinate ranges and integrated boundary clipping.
+    - **`DRAW` Macro Interpreter (`DRAW "command_string"`)**:
+      - Micro-language interpreter supporting directional movements (`U`, `D`, `L`, `R`), diagonals (`E`, `F`, `G`, `H`), coordinate moves (`M [+/-]x, [+/-]y`), prefixes `B` (blind move) and `N` (plot without advancing position), color setting (`C n`), scaling (`S n`, `scale = n / 4`), and angle rotation (`A n`, supporting 0, 90, 180, and 270 degree transformations).
+    - **Open Watcom Multi-Segment Compilation (`-zm`)**:
+      - Enabled `-zm` (emit functions in separate code segments) in `CFLAGS_MM` within `Makefile`, overcoming the 64 KB single-segment code ceiling in Medium Model and allowing `BASIC.EXE` to grow freely across unlimited code segments while keeping `DGROUP` unified.
+    - **`DIM` Floating-Point Literal Fix**:
+      - Fixed dimension evaluation in `basic_exec_dim` using `val_to_int(&d1_val)` and `val_to_int(&d2_val)` instead of `.ival`, properly accepting float constants like `DIM S%(300)`.
+    - **Target Verification Suite (`/BASIC/PHASE14.BAS`)**: Comprehensive verification suite testing `DRAW` diamond drawing, `PAINT` interior fill bounded by border without exterior leakage, `GET` sprite capture, `PUT PSET` blitting, `PUT XOR` sprite erasure, and `DRAW` scaling and 90-degree rotation. Verified 100% passed on target Book8088 emulator.
 - **File Manager Function Ribbon & BSS Buffer Initialization Fix (`user/fm.c`)**:
   - Fixed residual characters appearing on row 24 in `FM.BIN` when launched after programs that used conventional memory:
     - Initialized the back-buffer screen cache `s_screen` to blank spaces in `fm_invalidate_cache()` and on startup in `app_main`.
