@@ -11,8 +11,12 @@
     - Attempts zero-copy in-place `mem_resize()` first; if blocked by an occupied neighbor, allocates a new MCB block of `new_paragraphs` under the same process owner, copies the existing paragraphs, frees the old block, and returns the new segment (`0` on failure while preserving the original block).
   - **Largest Contiguous Free Block (`SYS_MEM_AVAIL = 0x32`, `os_mem_max_avail()`)**:
     - Enhanced `SYS_MEM_AVAIL` to return `AX = total free paragraphs` (`os_mem_avail()`) and `DX = largest contiguous free block in paragraphs` (`os_mem_max_avail()`).
+  - **Automatic `.BIN` Process Segment Shrinking, Stack Relocation & `_BSS` Zeroing (`user/crt0.asm`, `Makefile`, `kernel/syscall.c`)**:
+    - Added a zero-length trailing `_END` segment (`clname END`) in `DGROUP` to `user/crt0.asm` and `Makefile` `wlink` rules so `__bss_end` resolves at link time to the exact flat segment offset of the end of `_BSS` without increasing `.BIN` file sizes on disk.
+    - At process startup (`_ustart`), `user/crt0.asm` now copies the 256-byte command-line arguments from `CS:0xFF00` into `__user_args` in `_BSS` (advertised via a 4-byte `'HB'` header at `CS:0x0002` read by `SYS_GET_ARGS`), zeroes all C `_BSS` variables (`__bss_zero_start .. __bss_end`), relocates `SP` to `(__bss_end + 4096) & ~1` (4 KB stack), and invokes `SYS_MEM_RESIZE` (`0x33`) to release unused upper paragraphs back to the MCB arena.
+    - Reduces `SHELL.BIN`'s resident MCB footprint from **64 KB (`1000h` paras) down to 23 KB (`05FAh` paras)** and `MEM.BIN` from **64 KB down to 7 KB (`01DEh` paras)**, increasing free conventional memory during `mem` execution from **446 KB to 543 KB (+97 KB freed)**.
   - **Boot Self-Test Verification (`/BIN/HELLO.BIN`)**:
-    - Added automated boot self-tests in `user/hello.c` verifying in-place MCB shrink, free paragraph reclamation, in-place grow, barrier-forced relocating realloc with payload integrity verification, and `os_mem_max_avail()`.
+    - Added automated boot self-tests in `user/hello.c` verifying in-place MCB shrink, free paragraph reclamation, in-place grow, barrier-forced relocating realloc with payload integrity verification, `os_mem_max_avail()`, and `HELLO.BIN` startup auto-shrinking (`4096 → 526` paragraphs).
 
 - **hobbyPac Arcade Game (`/BIN/PACMAN.BIN`, `user/pacman.c`, `tools/gen_pacman_imf.py`, `/MUSIC/PACMAN.IMF`)**:
   - Implemented an authentic, freestanding CGA Mode 4 (320×200, 4-color) Pac-Man arcade game for hobbyOS targeting Intel 8088 hardware and Book8088.

@@ -641,9 +641,15 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
         break;
     }
 
-    case SYS_GET_ARGS:
-        regs->ax = USER_ARGS_OFFSET;
+    case SYS_GET_ARGS: {
+        const uint16_t __far *hdr = (const uint16_t __far *)MK_FP(regs->cs, 2);
+        if (hdr[0] == 0x4248) {
+            regs->ax = hdr[1];
+        } else {
+            regs->ax = USER_ARGS_OFFSET;
+        }
         break;
+    }
 
     case SYS_FPU_PRESENT:
         regs->ax = (uint16_t)fpu_is_present();

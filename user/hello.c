@@ -115,7 +115,10 @@ int app_main(void) {
                 os_mem_max_avail() > 0 &&
                 os_mem_free(bar_seg) == 0 &&
                 os_mem_free(moved_seg) == 0) {
-                os_puts("[USER APP] MCB alloc/resize/realloc/free verified OK\n");
+                uint16_t self_paras = *((const uint16_t __far *)(((unsigned long)(get_ds() - 1) << 16) | 3));
+                os_puts("[USER APP] MCB alloc/resize/realloc/free verified OK (HELLO.BIN shrunk to ");
+                print_uint(self_paras);
+                os_puts(" paras)\n");
             } else {
                 os_puts("[USER APP] MCB data integrity or free check failed!\n");
                 return 1;

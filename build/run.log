@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/27 17:21:28
+# 86Box v7.0 logfile, created 2026/11/27 17:40:24
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -45,7 +45,7 @@ Allocated 0.62 megabytes of large pages for RAM
 [USER APP] Args: boot-self-test
 [USER APP] CPU detected via INT 0x21: Intel 8088
 [USER APP] Video detected via INT 0x21: IBM CGA (Color 80x25, 0xB800)
-[USER APP] MCB alloc/resize/realloc/free verified OK
+[USER APP] MCB alloc/resize/realloc/free verified OK (HELLO.BIN shrunk to 526 paras)
 [USER APP] EMS alloc/map/free verified OK
 [USER APP] Keymaps (US/FR/BE) & IRQ1 state verified OK
 [USER APP] Break mode syscall (normal/raw) verified OK
@@ -58,20 +58,43 @@ Line 2 appended via SYS_FILE_APPEND
 [USER APP] AmigaDOS device paths (SYS: & HD0A:) verified OK
 [USER APP] RAM disk multi-cluster subdirectory (25 files in RAM:/TESTDIR) verified OK
 [USER APP] FAT16 Root Directory:
-  - KERNEL.BIN (49283 bytes)
+  - KERNEL.BIN (49295 bytes)
   - BIN/ <DIR>
   - BASIC/ <DIR>
   - GAMES/ <DIR>
   - PICS/ <DIR>
   - MODELS/ <DIR>
   - MUSIC/ <DIR>
-  - BOOT.SH (92 bytes)
+  - BOOT.SH (96 bytes)
   - KEYMAPS/ <DIR>
   - DOCS/ <DIR>
 [EXEC] /BIN/HELLO.BIN exited with code 0
 Keyboard layout set to FR (/KEYMAPS/FR.MAP)
 Running /BOOT.SH...
+
+Memory Type        Total       Used       Free
+----------------  --------   --------   --------
+Conventional        640 KB      97 KB     543 KB
+EMS (Lo-tech 2M)   2048 KB       0 KB    2048 KB
+----------------  --------   --------   --------
+Total Memory       2688 KB      97 KB    2591 KB
+
+MCB Chain (0x0060..0x8FFF) & System Map:
+  Seg     Size (Para)    Size (KB)   Status / Owner
+  ------  -----------    ---------   --------------
+  0x0000       0060h         1 KB    IVT & BIOS Data
+  0x0061       05FAh        23 KB    Used (owner 0x0061)
+  0x065C       01DEh         7 KB    Used (owner 0x065C)
+  0x083B       87C5h       543 KB    Free
+  0x9000       1000h        64 KB    Kernel (KERNEL.BIN)
+
+Largest executable program size: 543 KB (34757 paragraphs)
+EMS Pages available:             128 / 128 (16 KB/page at 0xC000)
+XMS Extended Memory:             Not supported (requires 80286+ CPU)
+CPU Architecture:                Intel 8088
+Math Coprocessor:                x87 FPU detected
+Video Adapter:                   IBM CGA (Color 80x25, 0xB800)
 System ready.
 
 hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.
-SYS:/> corrupted double-linked list
+SYS:/> 

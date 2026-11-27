@@ -68,14 +68,14 @@ build/cpm_v20.obj: user/cpm_v20.asm
 	nasm -f obj $< -o $@
 
 build/cpm.bin: build/crt0.obj build/cpm.uobj build/cpm_v20.obj
-	wlink format raw bin name $@ file { build/crt0.obj build/cpm.uobj build/cpm_v20.obj } order clname CODE clname CONST clname DATA clname BSS
+	wlink format raw bin name $@ file { build/crt0.obj build/cpm.uobj build/cpm_v20.obj } order clname CODE clname CONST clname DATA clname BSS clname END
 
 build/test80.com: tools/gen_test80.py
 	mkdir -p build
 	python3 tools/gen_test80.py $@
 
 build/%.bin: build/crt0.obj build/%.uobj
-	wlink format raw bin name $@ file { build/crt0.obj build/$*.uobj } order clname CODE clname CONST clname DATA clname BSS
+	wlink format raw bin name $@ file { build/crt0.obj build/$*.uobj } order clname CODE clname CONST clname DATA clname BSS clname END
 
 build/forth.bin: user/forth.asm
 	mkdir -p build
