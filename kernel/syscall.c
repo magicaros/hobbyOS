@@ -957,7 +957,18 @@ void syscall_dispatch(syscall_regs_t __far *regs) {
 
     case SYS_MEM_AVAIL:
         regs->ax = mem_avail_paragraphs();
+        regs->dx = mem_max_avail_paragraphs();
         break;
+
+    case SYS_MEM_RESIZE:
+        regs->ax = (mem_resize(regs->bx, regs->cx) == 0) ? 0 : 0xFFFF;
+        break;
+
+    case SYS_MEM_REALLOC: {
+        uint16_t owner = (s_current_proc_owner != 0) ? s_current_proc_owner : regs->cs;
+        regs->ax = mem_realloc(regs->bx, regs->cx, owner);
+        break;
+    }
 
     case SYS_EMS_ALLOC: {
         uint16_t owner = (s_current_proc_owner != 0) ? s_current_proc_owner : regs->cs;

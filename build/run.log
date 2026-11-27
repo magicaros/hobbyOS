@@ -1,5 +1,5 @@
 #
-# 86Box v7.0 logfile, created 2026/11/25 14:53:02
+# 86Box v7.0 logfile, created 2026/11/27 17:21:28
 #
 # Emulator path: /usr/local/bin/
 # Global configuration file: /home/magicben/.local/share/86Box/86box_global.cfg
@@ -45,7 +45,7 @@ Allocated 0.62 megabytes of large pages for RAM
 [USER APP] Args: boot-self-test
 [USER APP] CPU detected via INT 0x21: Intel 8088
 [USER APP] Video detected via INT 0x21: IBM CGA (Color 80x25, 0xB800)
-[USER APP] MCB alloc/free verified OK
+[USER APP] MCB alloc/resize/realloc/free verified OK
 [USER APP] EMS alloc/map/free verified OK
 [USER APP] Keymaps (US/FR/BE) & IRQ1 state verified OK
 [USER APP] Break mode syscall (normal/raw) verified OK
@@ -58,61 +58,20 @@ Line 2 appended via SYS_FILE_APPEND
 [USER APP] AmigaDOS device paths (SYS: & HD0A:) verified OK
 [USER APP] RAM disk multi-cluster subdirectory (25 files in RAM:/TESTDIR) verified OK
 [USER APP] FAT16 Root Directory:
-  - KERNEL.BIN (48715 bytes)
+  - KERNEL.BIN (49283 bytes)
   - BIN/ <DIR>
   - BASIC/ <DIR>
   - GAMES/ <DIR>
   - PICS/ <DIR>
   - MODELS/ <DIR>
   - MUSIC/ <DIR>
-  - BOOT.SH (117 bytes)
+  - BOOT.SH (92 bytes)
   - KEYMAPS/ <DIR>
   - DOCS/ <DIR>
 [EXEC] /BIN/HELLO.BIN exited with code 0
 Keyboard layout set to FR (/KEYMAPS/FR.MAP)
 Running /BOOT.SH...
-[2J[HhobbyOS BASIC Version 1.0 (GW-BASIC Compatible)
-61440 Bytes free
-[2J[HhobbyOS Analog Joystick Test
-Port 0x201 - Gameport / SB16
-Press [Q] or [ESC] to Exit
-+---------------------------+
-+---------------------------+
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-|                           |
-+---------------------------+
-+---------------------------+
-[ JOYSTICK A ]
-[ JOYSTICK B ]
-X: 0    Y: 0    
-X: 0    Y: 0    
-Btn 1: [UP]   
-Btn 2: [UP]   
-Triggers: 1= 0  2= 0     
-Btn 1: [UP]   
-Btn 2: [UP]   
- 
-O
-Ok
 System ready.
 
 hobbyOS User-Space Shell (/BIN/SHELL.BIN). Type 'help' for commands.
-SYS:/> 
+SYS:/> corrupted double-linked list

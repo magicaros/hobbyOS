@@ -1,5 +1,50 @@
 # Changelog
 
+## Revision 1.0.5 (2026-11-27)
+
+- **MCB Conventional Memory Paragraph Resize & Realloc (`kernel/mem.c`, `kernel/syscall.c`, `include/hobbyos.h`, `user/hello.c`)**:
+  - **In-Place MCB Block Resize (`SYS_MEM_RESIZE = 0x33`, `os_mem_resize(seg, new_paragraphs)`)**:
+    - Shrinks or grows an allocated MCB block in place without moving `seg` (matching MS-DOS `INT 21h, AH=4Ah`).
+    - When shrinking, absorbs any adjacent free neighbor or splits a new free MCB from the freed tail and runs `mem_coalesce()`.
+    - When growing in place, inspects the immediately following MCB (`next`) and absorbs all or part of it if free and large enough (`cur->size + 1 + next->size >= new_paragraphs`).
+  - **Relocating Realloc (`SYS_MEM_REALLOC = 0x34`, `os_mem_realloc(seg, new_paragraphs)`)**:
+    - Attempts zero-copy in-place `mem_resize()` first; if blocked by an occupied neighbor, allocates a new MCB block of `new_paragraphs` under the same process owner, copies the existing paragraphs, frees the old block, and returns the new segment (`0` on failure while preserving the original block).
+  - **Largest Contiguous Free Block (`SYS_MEM_AVAIL = 0x32`, `os_mem_max_avail()`)**:
+    - Enhanced `SYS_MEM_AVAIL` to return `AX = total free paragraphs` (`os_mem_avail()`) and `DX = largest contiguous free block in paragraphs` (`os_mem_max_avail()`).
+  - **Boot Self-Test Verification (`/BIN/HELLO.BIN`)**:
+    - Added automated boot self-tests in `user/hello.c` verifying in-place MCB shrink, free paragraph reclamation, in-place grow, barrier-forced relocating realloc with payload integrity verification, and `os_mem_max_avail()`.
+
+- **hobbyPac Arcade Game (`/BIN/PACMAN.BIN`, `user/pacman.c`, `tools/gen_pacman_imf.py`, `/MUSIC/PACMAN.IMF`)**:
+  - Implemented an authentic, freestanding CGA Mode 4 (320×200, 4-color) Pac-Man arcade game for hobbyOS targeting Intel 8088 hardware and Book8088.
+  - **Direct CGA VRAM Rendering & 4.77 MHz 8088 Optimization**:
+    - Replaced per-pixel `INT 0x21` (`os_gfx_putpixel` / `os_gfx_rect`) syscalls in the hot loop with direct CGA Mode 4 VRAM (`0xB800:0000` / `0xB800:2000`) byte-packed fills, 6×6 sprite blitting, and byte-aligned 8×8 ROM BIOS font (`0xF000:0xFA6E`) rendering via a 4-bit-to-2bpp nibble expansion table (`CGA_NIBBLE_MASK`).
+    - Decoupled score updates (`update_score_hud()`) from full sidebar redraws so eating dots updates only the score digits in-place without full-panel rectangle clears.
+  - **Hardware BDA Timer Synchronization & Grid-Locked 2-Pixel Sub-Stepping (`0x0040:0x006C`)**:
+    - Synchronized game ticks to the hardware 18.2 Hz BIOS timer tick counter driven by the 8253 PIT, operating at identical deterministic speeds from 4.77 MHz 8088 to 386+ systems.
+    - All entity movements execute in strict 2-pixel sub-steps (`STEP_PX = 2`), guaranteeing even coordinates (`0, 2, 4 mod 6`) across all state transitions (Chase, Frightened, Tunnel, Eyes) so tile-alignment intersection checks (`rem_x == 0 && rem_y == 0`) can never be skipped.
+    - Pac-Man advances at 1.5 sub-steps/tick average (3 px/tick = 54.6 px/s = 9.1 tiles/s), with ghosts scaled at 1.33 sub-steps/tick in chase (8.08 tiles/s), 0.67 sub-steps/tick when frightened/tunnel (4.04 tiles/s), and 3 sub-steps/tick as returning eyes (18.2 tiles/s).
+  - **Dynamic Bonus Fruit Mechanic**: Instead of static central spawning under the ghost pen, bonus fruits (Cherry, Strawberry, Orange, Apple, Melon) spawn dynamically in cleared maze corridors where dots have already been eaten, rewarding players for venturing back across cleared paths on a 10-second countdown with visual blinking before expiration.
+  - **Arcade Ghost AI & Targeting**:
+    - **Blinky (Red)**: Direct pursuit targeting Pac-Man's exact coordinates.
+    - **Pinky (Yellow/White)**: Ambush / interception targeting 4 tiles ahead of Pac-Man.
+    - **Inky (Cyan/Green)**: Quadrant patrol (bottom-right) and semi-random intersection pathfinding.
+    - **Clyde (Orange)**: Distance-dependent tracking (targets Pac-Man when far, retreats to bottom-left corner when near).
+    - **Ghost House & Eye Return**: Staggered dot-counter releases, bouncing in pen, and fast eye-mode return to pen upon being eaten during energizers.
+  - **CGA Hardware Palette Swapping**: Uses instant Port 0x3D9 color register remapping:
+    - Normal Play: Palette 0 High-Intensity (Light Green walls, Light Red ghosts/fruit, Yellow Pac-Man, dots, and score).
+    - Frightened Mode: Swaps immediately to Palette 1 High-Intensity (Light Cyan blue ghosts, flashing High White when timer expires) without needing software maze redraws.
+  - **Audio & Music**: Opening arcade theme synthesized to Id Music Format (`/MUSIC/PACMAN.IMF`) via `tools/gen_pacman_imf.py`, paired with alternating "waka-waka" dot chomping, power pellet, fruit pickup, ghost eaten, and chromatic descending death sound effects on OPL3/PC Speaker.
+  - **Scoring, Prompts & Persistence**:
+    - Framed `"PRESS SPACE TO PLAY"` launch modal and `"GAME OVER / PRESS SPACE"` modal so gameplay only starts when the player is ready, followed by the `"READY!"` banner synchronized with the opening IMF jingle.
+    - Multi-row banner tile restoration (`restore_banner_region()`) cleanly erasing all 8×8 ROM glyph overhang across 6×6 maze tiles.
+    - 10 pts per dot, 50 pts per energizer, 200/400/800/1600 pts per ghost eaten chain, fruit bonuses (100–1000 pts), 3 starting lives, level clear animation, and persistent high score saving/loading (`/GAMES/PACMAN.DAT`).
+  - **Testing**: Integrated non-interactive automated test flag (`pacman /t`) running for 36 BDA ticks and cleanly exiting, verified 100% passed in headless 86Box testing.
+
+- **hobbyTris Direct VRAM Optimization, OPL SFX Key-Off Fix & Launch Modal (`/BIN/TETRIS.BIN`, `user/tetris.c`)**:
+  - **Direct CGA VRAM Block & Font Rendering**: Replaced 64-pixel `os_gfx_rect` / `os_gfx_putpixel` syscalls per 8×8 tetromino block with direct 16-byte CGA VRAM writes (`draw_block()`) and byte-aligned ROM BIOS font blitting (`cga_text_aligned()`), eliminating line-clear and soft-drop redraw lag on 4.77 MHz 8088 CPUs.
+  - **OPL Channel 2 SFX Key-Off & Tick-Synchronized SFX Timer**: Fixed a bug where `sfx_update()` ran on every CPU spin loop and called `os_sound_tone(0, 0, 2)` (which `sound_stop()` ignores while background IMF music is playing, leaving OPL Channel 2 droning indefinitely after the first sound effect). `sfx_update_tick()` now advances strictly once per 18.2 Hz BDA tick and explicitly clears OPL register `0xB2` (`os_sound_opl_write(0xB2, 0x00)`).
+  - **Launch, Pause & Game Over Modals**: Added framed `"PRESS SPACE / TO PLAY"`, `"[PAUSED] / PRESS P/SPC"`, and `"GAME OVER / PRESS SPACE"` modal dialogs allowing players to start when ready and restart after Game Over without exiting to the shell.
+
 ## Revision 1.0.4 (2026-11-25)
 
 - **hobbyTris Arcade Game (`/BIN/TETRIS.BIN`, `user/tetris.c`, `tools/gen_tetris_imf.py`, `/MUSIC/TETRIS.IMF`)**:

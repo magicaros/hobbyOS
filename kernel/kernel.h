@@ -187,8 +187,11 @@ int16_t     sound_bg_get_status(os_sound_bg_status_t __far *st);
 void     mem_init(void);
 uint16_t mem_alloc(uint16_t paragraphs, uint16_t owner);
 int      mem_free(uint16_t seg);
+int      mem_resize(uint16_t seg, uint16_t new_paragraphs);
+uint16_t mem_realloc(uint16_t seg, uint16_t new_paragraphs, uint16_t owner);
 void     mem_free_by_owner(uint16_t owner);
 uint16_t mem_avail_paragraphs(void);
+uint16_t mem_max_avail_paragraphs(void);
 
 /* Lo-tech 2MB EMS Manager (kernel/ems.c) */
 int      ems_init(void);

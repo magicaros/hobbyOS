@@ -119,6 +119,8 @@ typedef signed long    int32_t;
 #define SYS_MEM_ALLOC    0x30
 #define SYS_MEM_FREE     0x31
 #define SYS_MEM_AVAIL    0x32
+#define SYS_MEM_RESIZE   0x33
+#define SYS_MEM_REALLOC  0x34
 
 #define SYS_EMS_ALLOC    0x40
 #define SYS_EMS_FREE     0x41
@@ -728,7 +730,25 @@ uint16_t os_mem_avail(void);
 #pragma aux os_mem_avail = \
     "mov ah, 0x32" \
     "int 0x21" \
-    value [ax];
+    value [ax] modify [dx];
+
+uint16_t os_mem_max_avail(void);
+#pragma aux os_mem_max_avail = \
+    "mov ah, 0x32" \
+    "int 0x21" \
+    value [dx] modify [ax];
+
+int os_mem_resize(uint16_t seg, uint16_t new_paragraphs);
+#pragma aux os_mem_resize = \
+    "mov ah, 0x33" \
+    "int 0x21" \
+    parm [bx] [cx] value [ax];
+
+uint16_t os_mem_realloc(uint16_t seg, uint16_t new_paragraphs);
+#pragma aux os_mem_realloc = \
+    "mov ah, 0x34" \
+    "int 0x21" \
+    parm [bx] [cx] value [ax];
 
 int os_ems_alloc(void);
 #pragma aux os_ems_alloc = \

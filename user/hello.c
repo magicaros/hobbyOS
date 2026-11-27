@@ -66,14 +66,59 @@ int app_main(void) {
         os_putc('\n');
     }
 
-    /* Test MCB conventional memory allocation & deallocation via INT 0x21 */
+    /* Test MCB conventional memory allocation, resize, realloc & deallocation via INT 0x21 */
     {
         uint16_t blk_seg = os_mem_alloc(64); /* 1 KB (64 paragraphs) */
         if (blk_seg != 0) {
             volatile uint16_t __far *p = (volatile uint16_t __far *)(((unsigned long)blk_seg << 16) | 0);
+            volatile uint16_t __far *p_tail = (volatile uint16_t __far *)(((unsigned long)(blk_seg + 15) << 16) | 14);
+            uint16_t avail_before_shrink = os_mem_avail();
+            uint16_t avail_after_shrink;
+            uint16_t bar_seg;
+            uint16_t moved_seg;
+
             *p = 0xCAFE;
-            if (*p == 0xCAFE && os_mem_free(blk_seg) == 0) {
-                os_puts("[USER APP] MCB alloc/free verified OK\n");
+            *p_tail = 0x1234;
+
+            /* 1. Test in-place shrink (64 -> 16 paragraphs) */
+            if (os_mem_resize(blk_seg, 16) != 0) {
+                os_puts("[USER APP] MCB resize shrink failed!\n");
+                return 1;
+            }
+            avail_after_shrink = os_mem_avail();
+
+            /* 2. Test in-place grow back (16 -> 32 paragraphs) into free neighbor */
+            if (os_mem_resize(blk_seg, 32) != 0) {
+                os_puts("[USER APP] MCB resize in-place grow failed!\n");
+                return 1;
+            }
+
+            /* 3. Allocate a barrier block immediately after blk_seg to force relocating realloc */
+            bar_seg = os_mem_alloc(8);
+            /* In-place resize should now fail because bar_seg blocks growth */
+            if (os_mem_resize(blk_seg, 64) == 0) {
+                os_puts("[USER APP] MCB resize unexpectedly grew past barrier!\n");
+                return 1;
+            }
+            /* Relocating realloc should allocate a new 64-para block, copy data, and free old blk_seg */
+            moved_seg = os_mem_realloc(blk_seg, 64);
+            if (moved_seg == 0 || moved_seg == blk_seg) {
+                os_puts("[USER APP] MCB relocating realloc failed!\n");
+                return 1;
+            }
+
+            p = (volatile uint16_t __far *)(((unsigned long)moved_seg << 16) | 0);
+            p_tail = (volatile uint16_t __far *)(((unsigned long)(moved_seg + 15) << 16) | 14);
+
+            if (*p == 0xCAFE && *p_tail == 0x1234 &&
+                avail_after_shrink > avail_before_shrink &&
+                os_mem_max_avail() > 0 &&
+                os_mem_free(bar_seg) == 0 &&
+                os_mem_free(moved_seg) == 0) {
+                os_puts("[USER APP] MCB alloc/resize/realloc/free verified OK\n");
+            } else {
+                os_puts("[USER APP] MCB data integrity or free check failed!\n");
+                return 1;
             }
         }
     }

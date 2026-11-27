@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  *
  * hobbyTris - Authentic CGA Mode 4 Tetris for hobbyOS
- * Features dynamic low-intensity palette swapping per level (Palettes 1, 0, 2),
- * background OPL/IMF music, sound effects, 7-bag piece generation, and high scores.
+ * Features direct CGA VRAM rendering for 4.77 MHz 8088 performance,
+ * hardware BDA timer synchronization (18.2 Hz), dynamic low-intensity
+ * palette swapping per level (Palettes 1, 0, 2), background OPL/IMF music,
+ * sound effects, 7-bag piece generation, and persistent high scores.
  */
 
 #include "../include/hobbyos.h"
@@ -32,7 +34,12 @@
 #define KEY_ENTER       0x0D
 #define KEY_SPACE       0x20
 
+#define CGA_VRAM_SEG    0xB800
+#define BIOS_FONT_SEG   0xF000
+#define BIOS_FONT_OFF   0xFA6E
+
 #define FP_HERE(p)      ((void __far *)(((unsigned long)get_ds() << 16) | (uint16_t)(p)))
+#define GET_TICKS()     (*((volatile uint16_t __far *)MK_FP(0x0040, 0x006C)))
 
 /* --------------------------------------------------------------------------
  * Tetrominoes (7 Pieces, 4 Rotations, 4 Blocks)
@@ -61,6 +68,16 @@ static const point_t PIECES[7][4][4] = {
 
 /* Color mapped to each tetromino (1, 2, or 3) */
 static const uint8_t PIECE_COLOR[7] = { 1, 1, 2, 3, 1, 2, 2 };
+
+/* Expands a 4-bit font nibble into a 4-pixel (8-bit) 2bpp CGA mask */
+static const uint8_t CGA_NIBBLE_MASK[16] = {
+    0x00, 0x03, 0x0C, 0x0F,
+    0x30, 0x33, 0x3C, 0x3F,
+    0xC0, 0xC3, 0xCC, 0xCF,
+    0xF0, 0xF3, 0xFC, 0xFF
+};
+
+static const uint8_t CGA_COLOR_FILL[4] = { 0x00, 0x55, 0xAA, 0xFF };
 
 /* --------------------------------------------------------------------------
  * Game State
@@ -157,19 +174,23 @@ static void u16_to_str(uint16_t val, char *buf) {
 }
 
 /* --------------------------------------------------------------------------
- * Audio Management
+ * Audio Management (Tick-Synchronized SFX + OPL Channel 2 Key-Off)
  * -------------------------------------------------------------------------- */
 
-static void sfx_play(uint16_t freq, uint16_t frames) {
+static void sfx_play(uint16_t freq, uint16_t ticks) {
     if (!s_sound_on) return;
     os_sound_tone(freq, 0, 2); /* Channel 2 for non-blocking SFX */
-    s_sfx_timer = frames;
+    s_sfx_timer = ticks;
 }
 
-static void sfx_update(void) {
+static void sfx_update_tick(void) {
     if (s_sfx_timer > 0) {
         s_sfx_timer--;
         if (s_sfx_timer == 0) {
+            /* Explicitly key-off OPL channel 2 (0xB2) because os_sound_stop()
+             * preserves OPL channels while background IMF music is active.
+             */
+            os_sound_opl_write(0xB2, 0x00);
             os_sound_tone(0, 0, 2);
         }
     }
@@ -189,27 +210,30 @@ static void init_music(void) {
             if (os_file_read("/MUSIC/TETRIS.IMF", (void __far *)MK_FP(s_imf_seg, 0), s_imf_size) == 0) {
                 os_file_read("SYS:MUSIC/TETRIS.IMF", (void __far *)MK_FP(s_imf_seg, 0), s_imf_size);
             }
-            if (s_sound_on) {
-                os_sound_bg_play(560, 1, s_imf_size, (const void __far *)MK_FP(s_imf_seg, 0), "TETRIS");
-            }
         }
+    }
+}
+
+static void start_bg_music(void) {
+    if (s_sound_on && s_imf_seg != 0 && s_imf_size > 0) {
+        os_sound_bg_play(560, 1, s_imf_size, (const void __far *)MK_FP(s_imf_seg, 0), "TETRIS");
     }
 }
 
 static void toggle_sound(void) {
     s_sound_on = !s_sound_on;
     if (s_sound_on) {
-        if (s_imf_seg != 0 && s_imf_size > 0) {
-            os_sound_bg_play(560, 1, s_imf_size, (const void __far *)MK_FP(s_imf_seg, 0), "TETRIS");
-        }
+        start_bg_music();
     } else {
         os_sound_bg_stop();
+        os_sound_opl_write(0xB2, 0x00);
         os_sound_stop();
     }
 }
 
 static void stop_all_audio(void) {
     os_sound_bg_stop();
+    os_sound_opl_write(0xB2, 0x00);
     os_sound_stop();
     if (s_imf_seg != 0) {
         os_mem_free(s_imf_seg);
@@ -228,6 +252,10 @@ static void load_high_score(void) {
         if (val > 0 && val < 10000000UL) {
             s_high_score = val;
         }
+    } else if (os_file_read("SYS:GAMES/TETRIS.DAT", (void __far *)FP_HERE(&val), sizeof(val)) == sizeof(val)) {
+        if (val > 0 && val < 10000000UL) {
+            s_high_score = val;
+        }
     }
 }
 
@@ -239,8 +267,85 @@ static void save_high_score(void) {
 }
 
 /* --------------------------------------------------------------------------
- * Graphical Rendering
+ * Fast Direct CGA Mode 4 VRAM Rendering Primitives (Zero INT 0x21 Overhead)
  * -------------------------------------------------------------------------- */
+
+static __inline uint16_t cga_row_offset(uint16_t y) {
+    uint16_t half = y >> 1;
+    uint16_t off  = (half << 6) + (half << 4); /* (y / 2) * 80 */
+    if (y & 1) off += 0x2000;
+    return off;
+}
+
+static void cga_fill_rect_fast(int16_t x, int16_t y, int16_t w, int16_t h, uint8_t color) {
+    volatile uint8_t __far *vram = (volatile uint8_t __far *)MK_FP(CGA_VRAM_SEG, 0);
+    uint8_t fill = CGA_COLOR_FILL[color & 3];
+    int16_t r, c;
+
+    if (w <= 0 || h <= 0) return;
+
+    for (r = 0; r < h; r++) {
+        int16_t py = y + r;
+        uint16_t row_off;
+        int16_t x0 = x;
+        int16_t x1 = x + w - 1;
+        int16_t b0, b1;
+
+        if ((uint16_t)py >= 200) continue;
+        row_off = cga_row_offset((uint16_t)py);
+
+        b0 = x0 >> 2;
+        b1 = x1 >> 2;
+
+        if (b0 == b1) {
+            uint8_t mask = 0;
+            for (c = (x0 & 3); c <= (x1 & 3); c++) {
+                mask |= (uint8_t)(0xC0 >> (c << 1));
+            }
+            vram[row_off + b0] = (uint8_t)((vram[row_off + b0] & ~mask) | (fill & mask));
+        } else {
+            if (x0 & 3) {
+                uint8_t mask = (uint8_t)(0xFF >> ((x0 & 3) << 1));
+                vram[row_off + b0] = (uint8_t)((vram[row_off + b0] & ~mask) | (fill & mask));
+                b0++;
+            }
+            if ((x1 & 3) != 3) {
+                uint8_t mask = (uint8_t)(0xFF << ((3 - (x1 & 3)) << 1));
+                vram[row_off + b1] = (uint8_t)((vram[row_off + b1] & ~mask) | (fill & mask));
+                b1--;
+            }
+            for (c = b0; c <= b1; c++) {
+                vram[row_off + c] = fill;
+            }
+        }
+    }
+}
+
+/* Fast byte-aligned 8x8 ROM BIOS text writer (x must be a multiple of 4).
+ * Overwrites background to black in-place so no clear rectangle is needed.
+ */
+static void cga_text_aligned(int16_t x, int16_t y, const char *str, uint8_t color, uint8_t pad_chars) {
+    volatile uint8_t __far *vram = (volatile uint8_t __far *)MK_FP(CGA_VRAM_SEG, 0);
+    const uint8_t __far *rom_font = (const uint8_t __far *)MK_FP(BIOS_FONT_SEG, BIOS_FONT_OFF);
+    uint8_t cmask = CGA_COLOR_FILL[color & 3];
+    uint16_t byte_x = (uint16_t)x >> 2;
+    uint8_t count = 0;
+
+    while (*str || count < pad_chars) {
+        uint8_t ch = *str ? (uint8_t)(*str++) : ' ';
+        const uint8_t __far *glyph = &rom_font[(uint16_t)(ch & 0x7F) << 3];
+        uint8_t row;
+
+        for (row = 0; row < 8; row++) {
+            uint8_t bits = glyph[row];
+            uint16_t off = cga_row_offset((uint16_t)(y + row)) + byte_x;
+            vram[off]     = (uint8_t)(CGA_NIBBLE_MASK[bits >> 4] & cmask);
+            vram[off + 1] = (uint8_t)(CGA_NIBBLE_MASK[bits & 0x0F] & cmask);
+        }
+        byte_x += 2;
+        count++;
+    }
+}
 
 static void apply_palette(uint16_t lvl) {
     uint8_t p = (uint8_t)(lvl % 3);
@@ -252,16 +357,29 @@ static void apply_palette(uint16_t lvl) {
     os_gfx_set_palette(hw_pal, 0, 0);
 }
 
+/* Direct VRAM 8x8 block writer (px is always a multiple of 4 = 2 bytes per row) */
 static void draw_block(uint16_t px, uint16_t py, uint8_t color) {
+    volatile uint8_t __far *vram = (volatile uint8_t __far *)MK_FP(CGA_VRAM_SEG, 0);
+    uint16_t byte_x = px >> 2;
+    uint8_t r;
+
     if (color == 0) {
-        os_gfx_rect(px, py, BLOCK_SIZE, BLOCK_SIZE, 0, 1);
+        for (r = 0; r < 8; r++) {
+            uint16_t off = cga_row_offset(py + r) + byte_x;
+            vram[off]     = 0x00;
+            vram[off + 1] = 0x00;
+        }
     } else {
-        /* Outer border in block color */
-        os_gfx_rect(px, py, BLOCK_SIZE, BLOCK_SIZE, color, 0);
-        /* Inner 6x6 fill */
-        os_gfx_rect(px + 1, py + 1, BLOCK_SIZE - 2, BLOCK_SIZE - 2, color, 1);
-        /* 1px top-left highlight bevel */
-        os_gfx_putpixel(px + 1, py + 1, (color == 3) ? 0 : 3);
+        uint8_t fill = CGA_COLOR_FILL[color & 3];
+        uint8_t hi   = (color == 3) ? 0 : 3;
+        /* Row 1 has the 1px highlight bevel at x_offset = 1 (bits 5..4 of first byte) */
+        uint8_t row1_b0 = (uint8_t)((fill & ~0x30) | (hi << 4));
+
+        for (r = 0; r < 8; r++) {
+            uint16_t off = cga_row_offset(py + r) + byte_x;
+            vram[off]     = (r == 1) ? row1_b0 : fill;
+            vram[off + 1] = fill;
+        }
     }
 }
 
@@ -285,7 +403,7 @@ static void render_piece(int8_t type, int8_t rot, int8_t x, int8_t y, uint8_t co
 static void render_next_box(void) {
     uint8_t i;
     /* Clear preview box interior */
-    os_gfx_rect(150, 38, 36, 36, 0, 1);
+    cga_fill_rect_fast(150, 38, 36, 36, 0);
     for (i = 0; i < 4; i++) {
         int8_t bx = PIECES[s_next_type][0][i].x;
         int8_t by = PIECES[s_next_type][0][i].y;
@@ -298,67 +416,86 @@ static void render_next_box(void) {
 static void update_hud_text(void) {
     char buf[16];
 
-    /* Score */
-    os_gfx_rect(130, 96, 64, 8, 0, 1);
+    /* Score (x=132 is a multiple of 4 for fast byte-aligned ROM font blit) */
     u32_to_str(s_score, buf);
-    os_gfx_text(130, 96, buf, 3);
+    cga_text_aligned(132, 96, buf, 3, 7);
 
     /* Level */
-    os_gfx_rect(130, 122, 64, 8, 0, 1);
     u16_to_str(s_level, buf);
-    os_gfx_text(130, 122, buf, 3);
+    cga_text_aligned(132, 122, buf, 3, 7);
 
     /* Lines */
-    os_gfx_rect(130, 148, 64, 8, 0, 1);
     u16_to_str(s_lines, buf);
-    os_gfx_text(130, 148, buf, 3);
+    cga_text_aligned(132, 148, buf, 3, 7);
 
     /* High Score */
-    os_gfx_rect(130, 174, 64, 8, 0, 1);
     u32_to_str((s_score > s_high_score) ? s_score : s_high_score, buf);
-    os_gfx_text(130, 174, buf, 3);
+    cga_text_aligned(132, 174, buf, 3, 7);
+}
+
+static void render_playfield_grid(void) {
+    int8_t r, c;
+    for (r = 0; r < GRID_H; r++) {
+        for (c = 0; c < GRID_W; c++) {
+            draw_field_cell(c, r, s_grid[r][c]);
+        }
+    }
 }
 
 static void render_full_screen(void) {
-    int8_t r, c;
-
     os_gfx_clear(0);
 
     /* Outer playfield framing */
     os_gfx_rect(FIELD_X - 2, FIELD_Y - 2, FIELD_PX_W + 4, FIELD_PX_H + 4, 3, 0);
     os_gfx_rect(FIELD_X - 1, FIELD_Y - 1, FIELD_PX_W + 2, FIELD_PX_H + 2, 1, 0);
 
-    /* Title & UI Headers */
-    os_gfx_text(130, 18,  "hobbyTris", 3);
-    os_gfx_text(148, 28,  "NEXT", 1);
+    /* Title & UI Headers (x coordinates multiple of 4) */
+    cga_text_aligned(132, 18,  "hobbyTris", 3, 0);
+    cga_text_aligned(148, 28,  "NEXT", 1, 0);
     os_gfx_rect(148, 36, 40, 40, 1, 0);
 
-    os_gfx_text(130, 84,  "SCORE", 2);
-    os_gfx_text(130, 110, "LEVEL", 2);
-    os_gfx_text(130, 136, "LINES", 2);
-    os_gfx_text(130, 162, "HIGH",  1);
+    cga_text_aligned(132, 84,  "SCORE", 2, 0);
+    cga_text_aligned(132, 110, "LEVEL", 2, 0);
+    cga_text_aligned(132, 136, "LINES", 2, 0);
+    cga_text_aligned(132, 162, "HIGH",  1, 0);
 
     /* Key controls legend with CP437 arrows */
-    os_gfx_text(210, 84,  "CONTROLS", 1);
-    os_gfx_text(210, 98,  "\x1B/\x1A Move", 3);
-    os_gfx_text(210, 110, "\x18/Spc Rot", 3);
-    os_gfx_text(210, 122, "\x19     Soft", 3);
-    os_gfx_text(210, 134, "Enter Drop", 3);
-    os_gfx_text(210, 148, "P     Pause", 1);
-    os_gfx_text(210, 160, "M     Mute", 1);
-    os_gfx_text(210, 172, "Esc/Q Quit", 1);
+    cga_text_aligned(212, 84,  "CONTROLS", 1, 0);
+    cga_text_aligned(212, 98,  "\x1B/\x1A Move", 3, 0);
+    cga_text_aligned(212, 110, "\x18/Spc Rot", 3, 0);
+    cga_text_aligned(212, 122, "\x19     Soft", 3, 0);
+    cga_text_aligned(212, 134, "Enter Drop", 3, 0);
+    cga_text_aligned(212, 148, "P     Pause", 1, 0);
+    cga_text_aligned(212, 160, "M     Mute", 1, 0);
+    cga_text_aligned(212, 172, "Esc/Q Quit", 1, 0);
 
-    /* Draw existing playfield cells */
-    for (r = 0; r < GRID_H; r++) {
-        for (c = 0; c < GRID_W; c++) {
-            if (s_grid[r][c] != 0) {
-                draw_field_cell(c, r, s_grid[r][c]);
-            }
-        }
-    }
-
+    render_playfield_grid();
     render_next_box();
     update_hud_text();
+}
+
+/* Draws a centered modal prompt box over the playfield */
+static void draw_prompt_box(const char *line1, uint8_t color1, const char *line2, uint8_t color2) {
+    int16_t bx = 16; /* Centered around playfield X=28..108, multiple of 4 */
+    int16_t by = FIELD_Y + 64;
+    int16_t bw = 104;
+    int16_t bh = 28;
+
+    cga_fill_rect_fast(bx, by, bw, bh, 0);
+    os_gfx_rect(bx, by, bw, bh, 3, 0);
+    os_gfx_rect(bx + 2, by + 2, bw - 4, bh - 4, 1, 0);
+
+    cga_text_aligned(bx + 8, by + 5,  line1, color1, 0);
+    cga_text_aligned(bx + 8, by + 15, line2, color2, 0);
+}
+
+static void clear_prompt_box(void) {
+    /* Erase left and right overhang outside playfield border, restore border and playfield */
+    cga_fill_rect_fast(16, FIELD_Y + 64, FIELD_X - 2 - 16, 28, 0);
+    cga_fill_rect_fast(FIELD_X + FIELD_PX_W + 2, FIELD_Y + 64, 120 - (FIELD_X + FIELD_PX_W + 2), 28, 0);
+    os_gfx_rect(FIELD_X - 2, FIELD_Y - 2, FIELD_PX_W + 4, FIELD_PX_H + 4, 3, 0);
+    os_gfx_rect(FIELD_X - 1, FIELD_Y - 1, FIELD_PX_W + 2, FIELD_PX_H + 2, 1, 0);
+    render_playfield_grid();
 }
 
 /* --------------------------------------------------------------------------
@@ -419,11 +556,10 @@ static void clear_completed_lines(void) {
 
     sfx_play((cleared == 4) ? 880 : 587, 4);
 
-    /* Short visual pause for line clear flash */
+    /* Short visual pause for line clear flash (2 hardware BDA ticks) */
     {
-        uint16_t start_tick = *((volatile uint16_t __far *)MK_FP(0x0040, 0x006C));
-        while ((uint16_t)(*((volatile uint16_t __far *)MK_FP(0x0040, 0x006C)) - start_tick) < 2) {
-            os_gfx_vsync();
+        uint16_t start_tick = GET_TICKS();
+        while ((uint16_t)(GET_TICKS() - start_tick) < 2) {
         }
     }
 
@@ -444,12 +580,8 @@ static void clear_completed_lines(void) {
         }
     }
 
-    /* Redraw full playfield */
-    for (r = 0; r < GRID_H; r++) {
-        for (c = 0; c < GRID_W; c++) {
-            draw_field_cell(c, r, s_grid[r][c]);
-        }
-    }
+    /* Redraw playfield via fast direct VRAM block writer */
+    render_playfield_grid();
 
     /* Scoring: 1=40, 2=100, 3=300, 4=1200 * (level + 1) */
     {
@@ -478,23 +610,32 @@ static void clear_completed_lines(void) {
  * -------------------------------------------------------------------------- */
 
 int app_main(void) {
+    const char *args = os_get_args();
     int running = 1;
-    int game_over = 0;
     int paused = 0;
+    uint8_t auto_test = 0;
+    uint16_t test_ticks = 0;
     uint16_t last_tick;
+    uint16_t last_sfx_tick;
+
+    if (args) {
+        while (*args == ' ') args++;
+        if (*args == '/' || *args == '-') {
+            if (args[1] == 't' || args[1] == 'T') auto_test = 1;
+        }
+    }
 
     /* Initialize PRNG from system BDA timer */
-    s_prng_seed = *((volatile uint16_t __far *)MK_FP(0x0040, 0x006C));
+    s_prng_seed = GET_TICKS();
     if (s_prng_seed == 0) s_prng_seed = 0xA55A;
 
     load_high_score();
 
     /* Switch to CGA Mode 4 (320x200 4-color) */
     os_gfx_set_mode(OS_MODE_CGA_320x200);
-    apply_palette(0);
-
     init_music();
 
+new_game:
     /* Reset game grid */
     {
         int8_t r, c;
@@ -509,6 +650,9 @@ int app_main(void) {
     s_lines = 0;
     s_level = 0;
     s_bag_idx = 7;
+    paused = 0;
+
+    apply_palette(0);
 
     s_cur_type  = next_bag_piece();
     s_cur_rot   = 0;
@@ -518,16 +662,52 @@ int app_main(void) {
     s_next_type = next_bag_piece();
 
     render_full_screen();
+
+    /* Wait for player to press SPACE before starting gameplay */
+    if (!auto_test) {
+        draw_prompt_box("PRESS SPACE", 3, "  TO PLAY  ", 1);
+        for (;;) {
+            if (os_kbhit()) {
+                uint16_t k = os_getc();
+                uint8_t ch = (uint8_t)(k & 0xFF);
+                if (ch == KEY_ESC || ch == 'q' || ch == 'Q') {
+                    running = 0;
+                    goto cleanup;
+                }
+                if (ch == 'm' || ch == 'M') {
+                    toggle_sound();
+                }
+                if (ch == KEY_SPACE || ch == KEY_ENTER) {
+                    break;
+                }
+            }
+        }
+        clear_prompt_box();
+    }
+
+    start_bg_music();
     render_piece(s_cur_type, s_cur_rot, s_cur_x, s_cur_y, PIECE_COLOR[s_cur_type]);
 
-    last_tick = *((volatile uint16_t __far *)MK_FP(0x0040, 0x006C));
+    last_tick = GET_TICKS();
+    last_sfx_tick = last_tick;
 
     while (running) {
-        uint16_t now = *((volatile uint16_t __far *)MK_FP(0x0040, 0x006C));
+        uint16_t now = GET_TICKS();
         uint16_t dt = now - last_tick;
         uint16_t drop_interval = get_drop_ticks_for_level(s_level);
 
-        sfx_update();
+        /* Advance SFX timer strictly once per 18.2 Hz hardware tick */
+        if (now != last_sfx_tick) {
+            last_sfx_tick = now;
+            sfx_update_tick();
+            if (auto_test) {
+                test_ticks++;
+                if (test_ticks >= 36) {
+                    running = 0;
+                    break;
+                }
+            }
+        }
 
         /* Process keyboard inputs non-blockingly */
         while (os_kbhit()) {
@@ -537,23 +717,26 @@ int app_main(void) {
 
             if (ch == KEY_ESC || ch == 'q' || ch == 'Q') {
                 running = 0;
-                break;
+                goto cleanup;
             }
 
             if (ch == 'p' || ch == 'P') {
                 paused = !paused;
                 if (paused) {
-                    os_gfx_text(FIELD_X + 16, FIELD_Y + 76, "[PAUSED]", 3);
+                    draw_prompt_box(" [PAUSED]  ", 3, "PRESS P/SPC", 1);
                 } else {
-                    /* Redraw playfield region covered by [PAUSED] */
-                    int8_t pr, pc;
-                    for (pr = 9; pr <= 11; pr++) {
-                        for (pc = 0; pc < GRID_W; pc++) {
-                            draw_field_cell(pc, pr, s_grid[pr][pc]);
-                        }
-                    }
+                    clear_prompt_box();
                     render_piece(s_cur_type, s_cur_rot, s_cur_x, s_cur_y, PIECE_COLOR[s_cur_type]);
+                    last_tick = GET_TICKS();
                 }
+                continue;
+            }
+
+            if (paused && (ch == KEY_SPACE || ch == KEY_ENTER)) {
+                paused = 0;
+                clear_prompt_box();
+                render_piece(s_cur_type, s_cur_rot, s_cur_x, s_cur_y, PIECE_COLOR[s_cur_type]);
+                last_tick = GET_TICKS();
                 continue;
             }
 
@@ -562,7 +745,7 @@ int app_main(void) {
                 continue;
             }
 
-            if (paused || game_over) continue;
+            if (paused) continue;
 
             /* Move Left */
             if (sc == SC_LEFT || ch == 'a' || ch == 'A' || ch == '4') {
@@ -631,8 +814,7 @@ int app_main(void) {
             }
         }
 
-        if (paused || game_over) {
-            os_gfx_vsync();
+        if (paused) {
             continue;
         }
 
@@ -669,21 +851,40 @@ int app_main(void) {
 
                 /* Check for Game Over condition */
                 if (!can_place(s_cur_type, s_cur_rot, s_cur_x, s_cur_y)) {
-                    game_over = 1;
                     render_piece(s_cur_type, s_cur_rot, s_cur_x, s_cur_y, PIECE_COLOR[s_cur_type]);
-                    os_gfx_text(FIELD_X + 8, FIELD_Y + 76, "GAME OVER", 3);
                     save_high_score();
                     update_hud_text();
-                    sfx_play(110, 8);
+                    sfx_play(110, 6);
+                    draw_prompt_box(" GAME OVER ", 2, "PRESS SPACE", 3);
+                    for (;;) {
+                        uint16_t cur_t = GET_TICKS();
+                        if (cur_t != last_sfx_tick) {
+                            last_sfx_tick = cur_t;
+                            sfx_update_tick();
+                        }
+                        if (os_kbhit()) {
+                            uint16_t k = os_getc();
+                            uint8_t ch = (uint8_t)(k & 0xFF);
+                            if (ch == KEY_ESC || ch == 'q' || ch == 'Q') {
+                                running = 0;
+                                goto cleanup;
+                            }
+                            if (ch == 'm' || ch == 'M') {
+                                toggle_sound();
+                            }
+                            if (ch == KEY_SPACE || ch == KEY_ENTER) {
+                                goto new_game;
+                            }
+                        }
+                    }
                 } else {
                     render_piece(s_cur_type, s_cur_rot, s_cur_x, s_cur_y, PIECE_COLOR[s_cur_type]);
                 }
             }
         }
-
-        os_gfx_vsync();
     }
 
+cleanup:
     save_high_score();
     stop_all_audio();
 
